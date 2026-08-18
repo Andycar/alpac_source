@@ -1,0 +1,19 @@
+{
+  "id": "mikai",
+  "name": "Mikai",
+  "version": "1.0.0",
+  "author": "lampame",
+  "description": "mikai.me — украинские озвучки аниме (api.mikai.me/v1).",
+  "entry": "index.js",
+  "content_types": ["serial", "movie"],
+  "quality": "FHD",
+  "languages": ["uk", "ja"],
+  "ukrainian": true,
+  "anime": true,
+  "tags": ["ukrainian", "anime"],
+  "repository": "https://github.com/lampame/lampac-ukraine/tree/main/LME.Mikai",
+  "config_schema": [
+    {"key": "host", "label": "Хост API", "type": "string", "default": "https://api.mikai.me/v1"},
+    {"key": "proxyStreams", "label": "Проксировать стримы", "type": "bool", "default": true}
+  ]
+}

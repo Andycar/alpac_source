@@ -1,0 +1,21 @@
+{
+  "id": "starlight",
+  "name": "StarLight",
+  "version": "1.0.0",
+  "author": "lampame",
+  "description": "Украинский стриминг StarLight (teleportal.ua) — сериалы и шоу украинского ТВ.",
+  "entry": "index.js",
+  "content_types": ["movie", "serial"],
+  "quality": "FHD",
+  "languages": ["uk", "ru"],
+  "ukrainian": true,
+  "tags": ["ukrainian", "tv"],
+  "repository": "https://github.com/lampame/lampac-ukraine/tree/main/LME.StarLight",
+  "config_schema": [
+    {"key": "host", "label": "Хост", "type": "string", "default": "https://tp-back.starlight.digital"},
+    {"key": "playerAPI", "label": "Player API", "type": "string", "default": "https://vcms-api2.starlight.digital/player-api"},
+    {"key": "referer", "label": "Referer", "type": "string", "default": "https://teleportal.ua/"},
+    {"key": "lang", "label": "Язык", "type": "string", "default": "ua"},
+    {"key": "proxyStreams", "label": "Проксировать стримы", "type": "bool", "default": true}
+  ]
+}

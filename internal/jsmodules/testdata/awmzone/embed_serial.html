@@ -1,0 +1,74 @@
+<html>
+
+<head>
+    <title>Чужой дед</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet"
+        integrity="sha384-QWTKZyjpPEjISv5WaRU9OFeRpok6YctnYmDr5pNlyT2bRjXh0JMhjY6hW+ALEwIH" crossorigin="anonymous">
+    <style>
+        body {
+            background: #000;
+        }
+    </style>
+        <script src="/types/cinema/template/players/videodb/playerjs.com/playerjs-22.0.3-2.js"></script>
+        
+<!-- Livewire Styles --><style >[wire\:loading][wire\:loading], [wire\:loading\.delay][wire\:loading\.delay], [wire\:loading\.list-item][wire\:loading\.list-item], [wire\:loading\.inline-block][wire\:loading\.inline-block], [wire\:loading\.inline][wire\:loading\.inline], [wire\:loading\.block][wire\:loading\.block], [wire\:loading\.flex][wire\:loading\.flex], [wire\:loading\.table][wire\:loading\.table], [wire\:loading\.grid][wire\:loading\.grid], [wire\:loading\.inline-flex][wire\:loading\.inline-flex] {display: none;}[wire\:loading\.delay\.none][wire\:loading\.delay\.none], [wire\:loading\.delay\.shortest][wire\:loading\.delay\.shortest], [wire\:loading\.delay\.shorter][wire\:loading\.delay\.shorter], [wire\:loading\.delay\.short][wire\:loading\.delay\.short], [wire\:loading\.delay\.default][wire\:loading\.delay\.default], [wire\:loading\.delay\.long][wire\:loading\.delay\.long], [wire\:loading\.delay\.longer][wire\:loading\.delay\.longer], [wire\:loading\.delay\.longest][wire\:loading\.delay\.longest] {display: none;}[wire\:offline][wire\:offline] {display: none;}[wire\:dirty]:not(textarea):not(input):not(select) {display: none;}:root {--livewire-progress-bar-color: #2299dd;}[x-cloak] {display: none !important;}[wire\:cloak] {display: none !important;}dialog#livewire-error::backdrop {background-color: rgba(0, 0, 0, .6);}</style>
+</head>
+
+<body data-bs-theme="dark">
+    
+    <div wire:key="lw-3907671591-0" wire:snapshot="{&quot;data&quot;:{&quot;players&quot;:[[],{&quot;keys&quot;:[1,2,3,4,5,6],&quot;class&quot;:&quot;Illuminate\\Database\\Eloquent\\Collection&quot;,&quot;modelClass&quot;:&quot;App\\Models\\Cinema\\Player&quot;,&quot;s&quot;:&quot;elcl&quot;}],&quot;domainMovieId&quot;:17544,&quot;domainMovie&quot;:[[],{&quot;key&quot;:17544,&quot;class&quot;:&quot;cinema\\app\\models\\eloquent\\DomainMovie&quot;,&quot;relations&quot;:[&quot;movie&quot;,&quot;movie.kinopoisk&quot;,&quot;movie.mainPlayer&quot;,&quot;cinemaDomain&quot;,&quot;cinemaDomain.mainPlayer&quot;],&quot;s&quot;:&quot;elmdl&quot;}],&quot;movieEpisode&quot;:null,&quot;domain&quot;:[[],{&quot;key&quot;:&quot;turboserial.com&quot;,&quot;class&quot;:&quot;App\\Models\\Domain&quot;,&quot;relations&quot;:[&quot;clientRedirectTo&quot;,&quot;template&quot;,&quot;cinemaDomain&quot;,&quot;mirrorOf&quot;,&quot;turbo&quot;,&quot;turbo.dubbing&quot;],&quot;s&quot;:&quot;elmdl&quot;}],&quot;template&quot;:&quot;livewire.cinema.players.embed&quot;,&quot;country&quot;:&quot;DE&quot;,&quot;isRealBot&quot;:false,&quot;isEmbed&quot;:true,&quot;activePlayer&quot;:[[],{&quot;key&quot;:1,&quot;class&quot;:&quot;App\\Models\\Cinema\\Player&quot;,&quot;s&quot;:&quot;elmdl&quot;}],&quot;onePlayer&quot;:false,&quot;availablePlayers&quot;:[[],{&quot;keys&quot;:[1,2,3,4,5],&quot;class&quot;:&quot;Illuminate\\Database\\Eloquent\\Collection&quot;,&quot;modelClass&quot;:&quot;App\\Models\\Cinema\\Player&quot;,&quot;s&quot;:&quot;elcl&quot;}]},&quot;memo&quot;:{&quot;id&quot;:&quot;kS8jy8r0eNhc6MrlyGGG&quot;,&quot;name&quot;:&quot;cinema.players&quot;,&quot;path&quot;:&quot;embed-players\/17544&quot;,&quot;method&quot;:&quot;GET&quot;,&quot;release&quot;:&quot;a-a-a&quot;,&quot;children&quot;:{&quot;lw-1706776640-0-0&quot;:[&quot;div&quot;,&quot;LXbAXL1Wu5I0j6chi5TB&quot;]},&quot;scripts&quot;:[],&quot;assets&quot;:[],&quot;errors&quot;:[],&quot;locale&quot;:&quot;ru&quot;,&quot;islands&quot;:[]},&quot;checksum&quot;:&quot;f7a3c538065ab6d735310a710b969b51b68da8b15dbf9dd384b141bda7635621&quot;}" wire:effects="{&quot;partials&quot;:[]}" wire:id="kS8jy8r0eNhc6MrlyGGG" wire:name="cinema.players">
+    <!--[if BLOCK]><![endif]-->        <ul class="nav nav-tabs" style="margin: 2px 2px 0 2px;">
+            <!--[if BLOCK]><![endif]-->                <li class="nav-item">
+                    <a wire:click="setActivePlayer('videodb')" style="color: #fff;"
+                        class="nav-link active">Плеер 1</a>
+                </li>
+                            <li class="nav-item">
+                    <a wire:click="setActivePlayer('veoveo')" style="color: #fff;"
+                        class="nav-link ">Плеер 2</a>
+                </li>
+                            <li class="nav-item">
+                    <a wire:click="setActivePlayer('allohatv')" style="color: #fff;"
+                        class="nav-link ">Плеер 3</a>
+                </li>
+                            <li class="nav-item">
+                    <a wire:click="setActivePlayer('hdvb')" style="color: #fff;"
+                        class="nav-link ">Плеер 4</a>
+                </li>
+                            <li class="nav-item">
+                    <a wire:click="setActivePlayer('collaps')" style="color: #fff;"
+                        class="nav-link ">Плеер 5</a>
+                </li>
+            <!--[if ENDBLOCK]><![endif]-->        </ul>
+    <!--[if ENDBLOCK]><![endif]-->
+    <!--[if BLOCK]><![endif]-->        <div class="box visible" id="firstTab">
+            <!--[if BLOCK]><![endif]--><!--[if ENDBLOCK]><![endif]-->            <!--[if BLOCK]><![endif]-->                <div wire:key="lw-1706776640-0-0" wire:snapshot="{&quot;data&quot;:{&quot;playerjsVersion&quot;:&quot;22.0.3-2&quot;,&quot;translation&quot;:null,&quot;videodb&quot;:[[],{&quot;key&quot;:855588,&quot;class&quot;:&quot;cinema\\app\\models\\eloquent\\Videodb&quot;,&quot;s&quot;:&quot;elmdl&quot;}],&quot;domainMovie&quot;:[[],{&quot;key&quot;:17544,&quot;class&quot;:&quot;cinema\\app\\models\\eloquent\\DomainMovie&quot;,&quot;relations&quot;:[&quot;movie&quot;,&quot;movie.kinopoisk&quot;,&quot;movie.mainPlayer&quot;,&quot;cinemaDomain&quot;,&quot;cinemaDomain.mainPlayer&quot;],&quot;s&quot;:&quot;elmdl&quot;}],&quot;movieEpisode&quot;:null},&quot;memo&quot;:{&quot;id&quot;:&quot;LXbAXL1Wu5I0j6chi5TB&quot;,&quot;name&quot;:&quot;cinema.players.videodb&quot;,&quot;path&quot;:&quot;embed-players\/17544&quot;,&quot;method&quot;:&quot;GET&quot;,&quot;release&quot;:&quot;a-a-a&quot;,&quot;attributes&quot;:{&quot;country&quot;:&quot;DE&quot;},&quot;children&quot;:[],&quot;scripts&quot;:[&quot;2591566157-1&quot;],&quot;assets&quot;:[&quot;2591566157-0&quot;],&quot;errors&quot;:[],&quot;locale&quot;:&quot;ru&quot;,&quot;islands&quot;:[]},&quot;checksum&quot;:&quot;41b5645a4e575743ee2fc275018948affdac6403cb39990f99dbb78e34859214&quot;}" wire:effects="{&quot;partials&quot;:[],&quot;scripts&quot;:{&quot;2591566157-1&quot;:&quot;        &lt;script&gt;\n            new Playerjs(JSON.parse(atob(&#039;eyJpZCI6InBsYXllciIsInRpdGxlIjoiXHUwNDI0XHUwNDM4XHUwNDNiXHUwNDRjXHUwNDNjICZsYXF1bztcdTA0MjdcdTA0NDNcdTA0MzZcdTA0M2VcdTA0MzkgXHUwNDM0XHUwNDM1XHUwNDM0JnJhcXVvOyAoMjAxNyAgXHUwNDMzLikiLCJmaWxlIjpbeyJpZCI6IlMxRTEiLCJ0aXRsZSI6Ilx1MDQyMVx1MDQzNVx1MDQ0MFx1MDQzOFx1MDQ0ZiAxIiwiZmlsZSI6IiMyZTlDZTBZRFF1TkN6MExqUXZkQ3cwTHZSak5DOTBZdlF1WDFvZEhSd2N6b3ZMMlwvXC9ZbWxpWVdsaWIySmhOa2JpNWhkMjE2YjI1bE1TNXdjbTh2ZEhaelpYSnBaWE12T0dGak16TXdNV1UyXC9cL2NHOXpiM05wYTJ4dmRXND1NVEUyTVRRMlptTXpOalZpT1dObE1qQTJNV0V3WVRrMU1UWmlcL1wvWkhaaFpHOXNZbTlsWW1FPU1qbGpaaTh6TVRReE5UWmtNakJsWWpneFkyVmhZelZoTUdObU1HRTRaRGd5TkRjMlpEb3lNREkyTURVeU16QTBMMmhzY3k1dE0zVTRPdz09In0seyJpZCI6IlMxRTIiLCJ0aXRsZSI6Ilx1MDQyMVx1MDQzNVx1MDQ0MFx1MDQzOFx1MDQ0ZiAyIiwiZmlsZSI6IiMyZTlDZTBZRFF1TkN6MExqUXZkQ3cwTHZSak5DOTBZdlF1WDFvZEhSd2N6b3ZMMk5rYmk1aGQyMTZiXC9cL1ltbGlZV2xpYjJKaDI1bE1TNXdjbTh2ZEhaelpYSnBaWE12TmpNMU1UZ3paamhsWXpJNVpXRTNPREExWXpJeVlUazNNemRpTm1aak5XSmhOR1JpTUdFM09TOWhPVGt5WXprXC9cL2NHOXpiM05wYTJ4dmRXND0yWkRJNFpXSXhaRGd4WWpJM1lcL1wvWkhaaFpHOXNZbTlsWW1FPWpFMFltSXhOekkyTkdZeE9Ub3lNREkyTURVeU16QTBMMmhzY3k1dE0zVTRPdz09In1dLCJwb3N0ZXIiOiJcL3N0b3JhZ2VcL2ltYWdlc1wvdzEwMDBcL2NpbmVtYVwvaW1hZ2VzXC9wbGF5ZXItYmdcL2hibzIuanBnIiwicGxzdGFydCI6bnVsbCwiY29udGVudF90eXBlIjoibW92aWUiLCJkZWZhdWx0X3F1YWxpdHkiOiIzNjBwIiwiY29udHJvbF9zdGFydCI6eyJpY29uIjoiPHN2ZyB3aWR0aD0nMjBweCcgaGVpZ2h0PScyMHB4JyB2ZXJzaW9uPScxLjEnIHhtbG5zPSdodHRwOlwvXC93d3cudzMub3JnXC8yMDAwXC9zdmcnIHhtbG5zOnhsaW5rPSdodHRwOlwvXC93d3cudzMub3JnXC8xOTk5XC94bGluayc+IDxnIGZpbGwtcnVsZT1cIm5vbnplcm9cIiB0cmFuc2Zvcm09XCJ0cmFuc2xhdGUoMCwgMClcIj48cGF0aCBkPVwiTTkuODA5OTM0NDgsMCBDNC40MTQ0NzA1MiwwIDAsNC41IDAsMTAgQzAsMTUuNSA0LjQxNDQ3MDUyLDIwIDkuODA5OTM0NDgsMjAgQzE1LjIwNTM5ODQsMjAgMTkuNjE5ODY5LDE1LjUgMTkuNjE5ODY5LDEwIEMxOS42MTk4NjksNC41IDE1LjIwNTM5ODQsMCA5LjgwOTkzNDQ4LDAgTDkuODA5OTM0NDgsMCBMOS44MDk5MzQ0OCwwIFogTTcuODQ3OTQ3NTksMTQuNSBMNy44NDc5NDc1OSw1LjUgTDEzLjczMzkwODMsMTAgTDcuODQ3OTQ3NTksMTQuNSBMNy44NDc5NDc1OSwxNC41IFpcIiBmaWxsPVwiIzAwMDAwMFwiPjxcL3BhdGg+PFwvZz48XC9zdmc+XG4ifSwiY29udHJvbF9wYXVzZSI6eyJpY29uIjoiPHN2ZyB3aWR0aD0nMjBweCcgaGVpZ2h0PScyMHB4JyB2ZXJzaW9uPScxLjEnIHhtbG5zPSdodHRwOlwvXC93d3cudzMub3JnXC8yMDAwXC9zdmcnIHhtbG5zOnhsaW5rPSdodHRwOlwvXC93d3cudzMub3JnXC8xOTk5XC94bGluayc+IDxnIGZpbGwtcnVsZT1cIm5vbnplcm9cIiBmaWxsPVwiIzAwMDAwMFwiIHRyYW5zZm9ybT1cInRyYW5zbGF0ZSgwLCAwKVwiPjxwYXRoIGQ9XCJNMTAsMCBDNC41LDAgMCw0LjUgMCwxMCBDMCwxNS41IDQuNSwyMCAxMCwyMCBDMTUuNSwyMCAyMCwxNS41IDIwLDEwIEMyMCw0LjUgMTUuNSwwIDEwLDAgTDEwLDAgTDEwLDAgWiBNOSwxNCBMNywxNCBMNyw2IEw5LDYgTDksMTQgTDksMTQgWiBNMTMsMTQgTDExLDE0IEwxMSw2IEwxMyw2IEwxMywxNCBMMTMsMTQgWlwiIGZpbGw9XCIjMDAwMDAwXCI+PFwvcGF0aD48XC9nPjxcL3N2Zz5cbiJ9fQ==&#039;)));\n\n            \/\/ https:\/\/mc.yandex.ru\/metrika\/tag.js\n            \/\/ https:\/\/cdn.jsdelivr.net\/npm\/yandex-metrica-watch\/tag.js\n            \/\/ Yandex.Metrika counter\n            (function(m, e, t, r, i, k, a) {\n                m[i] = m[i] || function() {\n                    (m[i].a = m[i].a || []).push(arguments)\n                };\n                m[i].l = 1 * new Date();\n                k = e.createElement(t), a = e.getElementsByTagName(t)[0], k.async = 1, k.src = r, a.parentNode.insertBefore(\n                    k, a)\n            })\n            (window, document, \&quot;script\&quot;, \&quot;https:\/\/mc.yandex.ru\/metrika\/tag.js\&quot;, \&quot;ym\&quot;);\n\n            ym(56489905, \&quot;init\&quot;, {\n                clickmap: true,\n                trackLinks: true,\n                accurateTrackBounce: true,\n                webvisor: false\n            });\n        &lt;\/script&gt;\n        &quot;}}" wire:id="LXbAXL1Wu5I0j6chi5TB" wire:name="cinema.players.videodb">
+    <div id="player"></div>
+
+    <style>
+        #player {
+            min-height: 420px !important;
+            width: 100%;
+            height: 100%;
+        }
+    </style>
+
+        
+        
+    
+    
+
+    <noscript>
+        <div><img src="https://mc.yandex.ru/watch/56489905" style="position:absolute; left:-9999px;" alt="" />
+        </div>
+    </noscript>
+</div>
+            <!--[if ENDBLOCK]><![endif]-->        </div>
+    <!--[if ENDBLOCK]><![endif]--></div>
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"
+        integrity="sha384-YvpcrYf0tY3lHB60NNkmXc5s9fDVZLESaAA55NDzOxhy9GkcIdslK1eN7N6jIeHz" crossorigin="anonymous">
+    </script>
+<script src="https://turboserial.com/livewire-0a2caaf3/livewire.min.js?id=ab6b028c"   data-csrf="1n0bfg6wkSyvNgI31sa9GmaizCQsvi44GWstauly" data-module-url="https://turboserial.com/livewire-0a2caaf3" data-update-uri="https://turboserial.com/livewire-0a2caaf3/update" data-navigate-once="true"></script>
+</body>
+
+</html>

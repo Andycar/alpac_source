@@ -1,0 +1,21 @@
+{
+  "id": "sakhtv",
+  "name": "SakhTV",
+  "version": "1.0.0",
+  "author": "lampac-go",
+  "description": "SakhTV (sakh.tv) — российский Pro-провайдер; ровно тот же сетевой профиль, что и официальное Android TV приложение (X-App-Id=5, X-Force-Code=1, SakhTVAndroid/<ver>/<device>/Android <release> UA).",
+  "entry": "index.js",
+  "content_types": ["movie", "serial"],
+  "quality": "FHD",
+  "languages": ["ru"],
+  "tags": ["ru", "premium"],
+  "config_schema": [
+    {"key": "host",    "label": "API хост",  "type": "string", "default": "https://api.sakh.tv"},
+    {"key": "login",   "label": "Логин",     "type": "string", "default": "", "placeholder": "username"},
+    {"key": "passwd",  "label": "Пароль",    "type": "secret", "default": "", "secret": true},
+    {"key": "token",   "label": "Готовый токен (UUID)", "type": "secret", "default": "", "secret": true,
+     "description": "Если задан — login/passwd не используются. Если пуст — токен будет получен через /v2/users/login."},
+    {"key": "app_id",  "label": "X-App-Id",  "type": "string", "default": "5",
+     "description": "ID платформы как в APK: 5=AndroidTV, 1=web, 2=android-phone. Серверный фильтр контента может различаться."}
+  ]
+}

@@ -1,0 +1,18 @@
+{
+  "id": "kinoukr",
+  "name": "KinoUKR",
+  "version": "1.0.0",
+  "author": "lampame",
+  "description": "kinoukr.tv — украинский источник с ashdi/tortuga плеерами. Использует xfsearch-bypass для Cloudflare.",
+  "entry": "index.js",
+  "content_types": ["movie", "serial"],
+  "quality": "FHD",
+  "languages": ["uk", "ru"],
+  "ukrainian": true,
+  "tags": ["ukrainian"],
+  "repository": "https://github.com/lampame/lampac-ukraine",
+  "config_schema": [
+    {"key": "host", "label": "Хост", "type": "string", "default": "https://kinoukr.tv"},
+    {"key": "proxyStreams", "label": "Проксировать стримы", "type": "bool", "default": true}
+  ]
+}

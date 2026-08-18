@@ -1,0 +1,23 @@
+{
+  "id": "krasview",
+  "name": "Krasview (hlamer/smartkino/sersoap)",
+  "version": "1.0.0",
+  "author": "lampame",
+  "description": "Сеть зеркал hlamer.ru/krasview.ru/smartkino.ru/sersoap.ru/zseek.ru. Поиск по title+year, парсинг video_Init('BASE64...') → DASH/HLS на media*.krasview.ru. Multi-audio внутри одного потока.",
+  "entry": "index.js",
+  "content_types": ["movie", "serial"],
+  "quality": "FHD",
+  "languages": ["ru"],
+  "tags": ["krasview", "hlamer", "ugc", "kinopoisk-fallback"],
+  "default_balancer": "krasview",
+  "config_schema": [
+    {"key": "searchHost", "label": "Поиск host", "type": "string", "default": "https://hlamer.ru"},
+    {"key": "movieHost",  "label": "Movie host",  "type": "string", "default": "https://smartkino.ru"},
+    {"key": "serialHost", "label": "Serial host", "type": "string", "default": "https://sersoap.ru"},
+    {"key": "streamReferer", "label": "Referer для CDN (анти-hotlink)", "type": "string", "default": "https://smartkino.ru/", "description": "media*.krasview.ru без правильного Referer отдаёт 403"},
+    {"key": "preferHLS",  "label": "Использовать HLS (.m3u8) вместо DASH (.mpd)", "type": "bool", "default": true},
+    {"key": "proxyStreams", "label": "Проксировать стримы", "type": "bool", "default": true},
+    {"key": "matchYearTolerance", "label": "Допуск по году в матчинге (±лет)", "type": "int", "default": 1},
+    {"key": "cacheTTL", "label": "Кэш ответов (сек)", "type": "int", "default": 1800}
+  ]
+}

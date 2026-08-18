@@ -1,0 +1,38 @@
+{
+  "id": "turbo_proxy_pac",
+  "name": "Turbo CDN routing (PAC)",
+  "version": "1.0.0",
+  "author": "lampac-go",
+  "module_type": "env_preset",
+  "description": "PAC-файл для Chrome/Chromium: маршрутизирует запросы к obrut.show / superdupercdn / kinescopecdn / zonasearch и пр. через указанный SOCKS5-балансер lampac-go. Применяется браузером плеера через --proxy-pac-url=file:///opt/lampac/pac/turbo-proxy.pac.",
+  "tags": ["preset", "pac", "chrome", "turbo"],
+  "params": [
+    {
+      "key": "socks_port",
+      "label": "SOCKS5 порт балансера Turbo",
+      "type": "int",
+      "default": 40007,
+      "min": 1024,
+      "max": 65535,
+      "description": "Порт SOCKS5 для балансера Turbo в lampac-go ProxyCore (Settings → ProxyCore → Turbo)."
+    },
+    {
+      "key": "socks_host",
+      "label": "SOCKS5 хост",
+      "type": "string",
+      "default": "127.0.0.1",
+      "description": "Обычно 127.0.0.1. Меняйте только если балансер на отдельном хосте."
+    }
+  ],
+  "files": [
+    {
+      "src": "turbo-proxy.pac",
+      "dst": "{{lampac_root}}/pac/turbo-proxy.pac",
+      "mode": "0644",
+      "template": true
+    }
+  ],
+  "ports": [],
+  "post_install": [],
+  "requires_root": false
+}

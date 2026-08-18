@@ -1,0 +1,18 @@
+{
+  "id": "kinoteatrkg",
+  "name": "Kinoteatr.kg",
+  "version": "1.0.0",
+  "author": "lampac-go",
+  "description": "kinoteatr.kg — поиск по названию, прямой mp4 (60 FPS). Каталог преимущественно фильмы.",
+  "entry": "index.js",
+  "content_types": ["movie"],
+  "quality": "1080p",
+  "languages": ["ru"],
+  "tags": ["russian", "mp4"],
+  "config_schema": [
+    {"key": "host", "label": "Адрес сайта", "type": "string", "default": "https://kinoteatr.kg", "description": "Базовый домен"},
+    {"key": "socks_proxy", "label": "SOCKS5 для обхода гео/DNS-блока (host:port)", "type": "string", "default": "", "placeholder": "127.0.0.1:40007", "description": "kinoteatr.kg часто недоступен с датацентр/чужих гео (DNS-blackhole, гео-блок). Впишите SOCKS5 (без авторизации / по IP-whitelist), доступный до сайта — все запросы к сайту (search/view) пойдут через него. ВАЖНО: для проксирования САМОГО mp4-стрима через тот же прокси настройте серверный config.toml: [[proxy.direct.entries]] uri=\"socks5://<host:port>\" balancers=[\"kinoteatrkg\"]."},
+    {"key": "proxyStreams", "label": "Проксировать стримы", "type": "bool", "default": true, "description": "Сайт часто гео/DNS-недоступен с устройств — поток идёт через сервер"},
+    {"key": "cacheTTL", "label": "Кэш ссылок (сек)", "type": "int", "default": 3600, "description": "mp4-пути статичны, можно держать дольше"}
+  ]
+}

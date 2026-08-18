@@ -1,0 +1,18 @@
+{
+  "id": "botinok",
+  "name": "Botinok.porn",
+  "version": "0.1.0",
+  "author": "lampac-go",
+  "description": "SISI JS-источник для botinok.porn. Каталог-обёртка над xvideos.com: список через категории /c/{slug}/?p=N, видео-страницы /rolik/{id}/ ведут на xvideos.com/embedframe/, откуда тянем HLS/MP4. Поиск на сайте отсутствует.",
+  "icon": "👢",
+  "tags": ["sisi", "tube", "ru"],
+  "languages": ["ru"],
+  "quality": "720p",
+  "default_transport": "default",
+  "default_balancer": "botinok",
+  "host_defaults": "https://botinok.porn",
+  "config_schema": [
+    { "key": "site_host", "label": "Хост сайта", "type": "string", "default": "botinok.porn" },
+    { "key": "user_agent", "label": "User-Agent", "type": "string", "default": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36" }
+  ]
+}

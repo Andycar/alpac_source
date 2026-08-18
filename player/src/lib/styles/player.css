@@ -1,0 +1,1372 @@
+/* Lampac Web Player — Premium Dark Theme */
+
+.lwp-root {
+  position: fixed;
+  inset: 0;
+  z-index: 999999;
+  background: #000;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  color: #fff;
+  user-select: none;
+  -webkit-user-select: none;
+  overflow: hidden;
+  outline: none;
+}
+
+.lwp-root * {
+  box-sizing: border-box;
+}
+
+/* Hide cursor when controls are hidden */
+.lwp-root:not(.lwp-controls-visible) {
+  cursor: none;
+}
+
+.lwp-root:not(.lwp-controls-visible) .lwp-video {
+  cursor: none;
+}
+
+/* Video stage — wraps active <video> + zero-gap preload sibling. */
+.lwp-video-stage {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+}
+
+/* Video element */
+.lwp-video {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  background: #000;
+}
+
+/* Preloaded next-episode video sits on top of active during crossfade. */
+.lwp-video-next {
+  z-index: 2;
+  pointer-events: none;
+}
+
+/* Gradient overlays for controls readability */
+.lwp-gradient-top {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 120px;
+  background: linear-gradient(to bottom, rgba(0, 0, 0, 0.7) 0%, transparent 100%);
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.3s ease;
+}
+
+.lwp-gradient-bottom {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  height: 180px;
+  background: linear-gradient(to top, rgba(0, 0, 0, 0.85) 0%, transparent 100%);
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.3s ease;
+}
+
+.lwp-controls-visible .lwp-gradient-top,
+.lwp-controls-visible .lwp-gradient-bottom {
+  opacity: 1;
+}
+
+/* Top bar */
+.lwp-top-bar {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  padding: 16px 20px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  z-index: 3;
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(-10px);
+  transition: opacity 0.3s ease, transform 0.3s ease;
+}
+
+.lwp-controls-visible .lwp-top-bar {
+  opacity: 1;
+  pointer-events: auto;
+  transform: translateY(0);
+}
+
+.lwp-back-btn {
+  background: none;
+  border: none;
+  color: #fff;
+  cursor: pointer;
+  padding: 8px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.2s;
+}
+
+.lwp-back-btn:hover {
+  background: rgba(255, 255, 255, 0.15);
+}
+
+.lwp-title {
+  font-size: 18px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  text-shadow: 0 1px 4px rgba(0, 0, 0, 0.6);
+}
+
+.lwp-episode-info {
+  font-size: 14px;
+  color: rgba(255, 255, 255, 0.7);
+  margin-left: 4px;
+}
+
+/* Bottom controls */
+.lwp-bottom {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  padding: 0 16px 16px;
+  z-index: 6;
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(10px);
+  transition: opacity 0.3s ease, transform 0.3s ease;
+}
+
+.lwp-controls-visible .lwp-bottom {
+  opacity: 1;
+  pointer-events: auto;
+  transform: translateY(0);
+}
+
+/* Timeline / Seek bar */
+.lwp-timeline {
+  position: relative;
+  height: 20px;
+  display: flex;
+  align-items: center;
+  cursor: pointer;
+  margin-bottom: 8px;
+}
+
+.lwp-timeline-track {
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 4px;
+  background: rgba(255, 255, 255, 0.2);
+  border-radius: 2px;
+  overflow: hidden;
+  transition: height 0.15s ease;
+}
+
+.lwp-timeline:hover .lwp-timeline-track {
+  height: 6px;
+}
+
+.lwp-timeline-buffered {
+  position: absolute;
+  left: 0;
+  top: 0;
+  height: 100%;
+  background: rgba(255, 255, 255, 0.3);
+  border-radius: 2px;
+  transition: width 0.3s ease;
+}
+
+.lwp-timeline-progress {
+  position: absolute;
+  left: 0;
+  top: 0;
+  height: 100%;
+  background: #e50914;
+  border-radius: 2px;
+}
+
+.lwp-timeline-thumb {
+  position: absolute;
+  top: 50%;
+  width: 14px;
+  height: 14px;
+  background: #e50914;
+  border-radius: 50%;
+  transform: translate(-50%, -50%) scale(0);
+  transition: transform 0.15s ease;
+  box-shadow: 0 0 6px rgba(229, 9, 20, 0.5);
+}
+
+.lwp-timeline:hover .lwp-timeline-thumb {
+  transform: translate(-50%, -50%) scale(1);
+}
+
+/* Chapter tick markers (Wave 1 B2) */
+.lwp-chapter-tick {
+  position: absolute;
+  top: 50%;
+  width: 2px;
+  height: 14px;
+  background: rgba(255, 255, 255, 0.85);
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+  border-radius: 1px;
+  box-shadow: 0 0 4px rgba(0, 0, 0, 0.6);
+  z-index: 2;
+}
+
+/* Sprite thumbnail (Wave 1 B2) */
+.lwp-thumbnail-sprite {
+  background-color: #000;
+  border-radius: 4px;
+  display: block;
+}
+
+/* Control buttons row */
+.lwp-controls-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.lwp-controls-left {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.lwp-controls-center {
+  flex: 1;
+}
+
+.lwp-controls-right {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.lwp-btn {
+  background: none;
+  border: none;
+  color: #fff;
+  cursor: pointer;
+  padding: 8px;
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.2s, transform 0.1s;
+  min-width: 40px;
+  min-height: 40px;
+}
+
+.lwp-btn:hover,
+.lwp-btn:focus-visible {
+  background: rgba(255, 255, 255, 0.15);
+  outline: 2px solid rgba(255, 255, 255, 0.6);
+  outline-offset: 2px;
+}
+
+.lwp-btn:active {
+  transform: scale(0.95);
+}
+
+.lwp-quality-badge:focus-visible {
+  outline: 2px solid rgba(255, 255, 255, 0.6);
+  outline-offset: 2px;
+}
+
+.lwp-btn svg {
+  width: 24px;
+  height: 24px;
+  fill: currentColor;
+}
+
+/* Time display */
+.lwp-time {
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  color: rgba(255, 255, 255, 0.9);
+  padding: 0 8px;
+  white-space: nowrap;
+}
+
+/* Volume slider */
+.lwp-volume-group {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.lwp-volume-slider {
+  width: 0;
+  opacity: 0;
+  transition: width 0.2s ease, opacity 0.2s ease;
+  -webkit-appearance: none;
+  appearance: none;
+  height: 4px;
+  background: rgba(255, 255, 255, 0.3);
+  border-radius: 2px;
+  outline: none;
+  cursor: pointer;
+}
+
+.lwp-volume-group:hover .lwp-volume-slider {
+  width: 80px;
+  opacity: 1;
+}
+
+.lwp-volume-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 12px;
+  height: 12px;
+  background: #fff;
+  border-radius: 50%;
+  cursor: pointer;
+}
+
+/* Quality badge */
+.lwp-quality-badge {
+  font-size: 11px;
+  font-weight: 700;
+  padding: 2px 6px;
+  border: 1px solid rgba(255, 255, 255, 0.5);
+  border-radius: 3px;
+  letter-spacing: 0.5px;
+  cursor: pointer;
+  transition: background 0.2s;
+}
+
+.lwp-quality-badge:hover {
+  background: rgba(255, 255, 255, 0.15);
+}
+
+/* Menu backdrop — full-screen tap target to close menus */
+.lwp-menu-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 5;
+  background: transparent;
+}
+
+/* Menus (quality, audio, subtitles, settings) */
+.lwp-menu {
+  position: absolute;
+  bottom: 70px;
+  right: 16px;
+  background: rgba(20, 20, 20, 0.95);
+  border-radius: 12px;
+  padding: 8px 0;
+  min-width: 220px;
+  max-height: 400px;
+  overflow-y: auto;
+  z-index: 10;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+  /* Animation applied in Phase 7 section via lwp-menu-slide-up */
+}
+
+.lwp-menu-title {
+  padding: 8px 16px 4px;
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: rgba(255, 255, 255, 0.5);
+}
+
+.lwp-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 16px;
+  cursor: pointer;
+  transition: background 0.15s;
+  font-size: 14px;
+}
+
+.lwp-menu-item svg {
+  width: 22px;
+  height: 22px;
+  min-width: 22px;
+  min-height: 22px;
+  flex-shrink: 0;
+}
+
+.lwp-menu-item:hover,
+.lwp-menu-item:focus-visible {
+  background: rgba(255, 255, 255, 0.1);
+  outline: 2px solid rgba(255, 255, 255, 0.5);
+  outline-offset: -2px;
+}
+
+.lwp-chip:focus-visible {
+  outline: 2px solid rgba(255, 255, 255, 0.6);
+  outline-offset: 2px;
+}
+
+.lwp-menu-item.active {
+  color: #e50914;
+}
+
+.lwp-menu-item .lwp-check {
+  width: 16px;
+  height: 16px;
+  opacity: 0;
+}
+
+.lwp-menu-item.active .lwp-check {
+  opacity: 1;
+}
+
+/* Spinner (triple-ring, see Phase 7 section for ring styles) */
+.lwp-spinner {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 48px;
+  height: 48px;
+  z-index: 2;
+  pointer-events: none;
+}
+
+@keyframes lwp-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* Seek indicator (touch double-tap) — GestureOverlay */
+.lwp-seek-indicator {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 20px 28px;
+  background: rgba(0, 0, 0, 0.6);
+  border-radius: 50%;
+  font-size: 14px;
+  font-weight: 600;
+  animation: lwp-seek-fade 0.6s ease forwards;
+  pointer-events: none;
+  z-index: 5;
+}
+
+.lwp-seek-left {
+  left: 15%;
+}
+
+.lwp-seek-right {
+  right: 15%;
+}
+
+@keyframes lwp-seek-fade {
+  0% {
+    opacity: 0;
+    transform: translateY(-50%) scale(0.8);
+  }
+  30% {
+    opacity: 1;
+    transform: translateY(-50%) scale(1);
+  }
+  100% {
+    opacity: 0;
+    transform: translateY(-50%) scale(1.1);
+  }
+}
+
+/* Gesture volume/brightness indicator */
+.lwp-gesture-indicator {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 16px 20px;
+  background: rgba(0, 0, 0, 0.7);
+  border-radius: 12px;
+  pointer-events: none;
+  z-index: 5;
+  animation: lwp-fade-in 0.15s ease;
+}
+
+.lwp-gesture-bar {
+  width: 6px;
+  height: 80px;
+  background: rgba(255, 255, 255, 0.2);
+  border-radius: 3px;
+  position: relative;
+  overflow: hidden;
+}
+
+.lwp-gesture-bar-fill {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  background: #e50914;
+  border-radius: 3px;
+  transition: height 0.05s ease;
+}
+
+.lwp-gesture-indicator span {
+  font-size: 12px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+@keyframes lwp-fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+/* Transcoding badge (TopBar) */
+.lwp-transcoding-badge {
+  font-size: 10px;
+  font-weight: 700;
+  padding: 2px 8px;
+  background: rgba(229, 9, 20, 0.3);
+  color: #e50914;
+  border: 1px solid rgba(229, 9, 20, 0.5);
+  border-radius: 4px;
+  letter-spacing: 1px;
+  animation: lwp-pulse 2s ease-in-out infinite;
+}
+
+@keyframes lwp-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+
+/* Settings menu chip row */
+.lwp-settings-menu {
+  min-width: 280px;
+}
+
+.lwp-chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  padding: 4px 12px 8px;
+  gap: 4px;
+}
+
+.lwp-chip {
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  color: rgba(255, 255, 255, 0.8);
+  cursor: pointer;
+  font-size: 13px;
+  padding: 6px 10px;
+  border-radius: 6px;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.lwp-chip:hover {
+  background: rgba(255, 255, 255, 0.15);
+}
+
+.lwp-chip.active {
+  background: rgba(229, 9, 20, 0.3);
+  color: #e50914;
+  border-color: rgba(229, 9, 20, 0.5);
+}
+
+.lwp-color-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  border: 1px solid rgba(255, 255, 255, 0.3);
+  flex-shrink: 0;
+}
+
+.lwp-menu-divider {
+  height: 1px;
+  background: rgba(255, 255, 255, 0.1);
+  margin: 8px 16px;
+}
+
+/* Episode drawer */
+.lwp-drawer-backdrop {
+  position: absolute;
+  inset: 0;
+  z-index: 9;
+  background: rgba(0, 0, 0, 0.3);
+  animation: lwp-fade-in 0.2s ease;
+}
+
+.lwp-episodes {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 360px;
+  max-width: 85vw;
+  background: rgba(15, 15, 15, 0.95);
+  z-index: 10;
+  overflow-y: auto;
+  animation: lwp-slide-in 0.3s cubic-bezier(0.22, 1, 0.36, 1);
+  padding: 20px;
+}
+
+@keyframes lwp-slide-in {
+  from {
+    transform: translateX(100%);
+  }
+  to {
+    transform: translateX(0);
+  }
+}
+
+.lwp-episodes-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 16px;
+}
+
+.lwp-episodes-title {
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.lwp-season-header {
+  padding: 12px 0 6px;
+  font-size: 13px;
+  font-weight: 600;
+  color: rgba(255, 255, 255, 0.5);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  margin-bottom: 4px;
+}
+
+.lwp-episode-item {
+  padding: 12px;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: background 0.2s;
+  margin-bottom: 4px;
+  font-size: 14px;
+}
+
+.lwp-episode-item:hover {
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.lwp-episode-item.active {
+  background: rgba(229, 9, 20, 0.2);
+  border-left: 3px solid #e50914;
+}
+
+.lwp-episode-subtitle {
+  color: rgba(255, 255, 255, 0.5);
+  margin-left: 8px;
+}
+
+/* Custom scrollbar */
+.lwp-episodes::-webkit-scrollbar,
+.lwp-menu::-webkit-scrollbar {
+  width: 6px;
+}
+
+.lwp-episodes::-webkit-scrollbar-track,
+.lwp-menu::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.lwp-episodes::-webkit-scrollbar-thumb,
+.lwp-menu::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.15);
+  border-radius: 3px;
+}
+
+.lwp-episodes::-webkit-scrollbar-thumb:hover,
+.lwp-menu::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.3);
+}
+
+/* Stats overlay */
+.lwp-stats-overlay {
+  position: absolute;
+  top: 60px;
+  left: 16px;
+  max-width: 420px;
+  max-height: calc(100% - 120px);
+  background: rgba(0, 0, 0, 0.85);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 8px;
+  z-index: 20;
+  overflow-y: auto;
+  animation: lwp-fade-in 0.2s ease;
+  font-family: 'SF Mono', 'Menlo', 'Consolas', 'DejaVu Sans Mono', monospace;
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.9);
+  pointer-events: auto;
+}
+
+.lwp-stats-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px 8px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.lwp-stats-title {
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  color: rgba(255, 255, 255, 0.7);
+}
+
+.lwp-stats-close {
+  background: none;
+  border: none;
+  color: rgba(255, 255, 255, 0.5);
+  cursor: pointer;
+  padding: 4px;
+  border-radius: 4px;
+  transition: all 0.15s;
+  display: flex;
+  align-items: center;
+}
+
+.lwp-stats-close:hover {
+  color: #fff;
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.lwp-stats-body {
+  padding: 6px 0;
+}
+
+.lwp-stats-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  padding: 3px 14px;
+  gap: 16px;
+  line-height: 1.5;
+}
+
+.lwp-stats-row:hover {
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.lwp-stats-key {
+  color: rgba(255, 255, 255, 0.5);
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.lwp-stats-value {
+  color: #4fc3f7;
+  text-align: right;
+  word-break: break-all;
+  font-variant-numeric: tabular-nums;
+}
+
+.lwp-stats-overlay::-webkit-scrollbar {
+  width: 4px;
+}
+
+.lwp-stats-overlay::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.lwp-stats-overlay::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.15);
+  border-radius: 2px;
+}
+
+/* Responsive: Mobile */
+@media (max-width: 600px) {
+  .lwp-top-bar {
+    padding: 12px 12px;
+  }
+
+  .lwp-title {
+    font-size: 15px;
+  }
+
+  .lwp-bottom {
+    padding: 0 10px 10px;
+  }
+
+  .lwp-btn {
+    min-width: 36px;
+    min-height: 36px;
+    padding: 6px;
+  }
+
+  .lwp-btn svg {
+    width: 20px;
+    height: 20px;
+  }
+
+  .lwp-time {
+    font-size: 12px;
+    padding: 0 4px;
+  }
+
+  .lwp-menu {
+    right: 8px;
+    left: 8px;
+    min-width: auto;
+  }
+
+  .lwp-settings-menu {
+    min-width: auto;
+  }
+
+  .lwp-episodes {
+    width: 100%;
+    max-width: 100%;
+  }
+
+  .lwp-quality-badge {
+    font-size: 10px;
+    padding: 1px 4px;
+  }
+
+  .lwp-volume-group .lwp-volume-slider {
+    display: none;
+  }
+
+  .lwp-transcoding-badge {
+    font-size: 9px;
+  }
+}
+
+/* Responsive: very small screens */
+@media (max-width: 400px) {
+  .lwp-controls-row {
+    gap: 0;
+  }
+
+  .lwp-btn {
+    min-width: 32px;
+    min-height: 32px;
+    padding: 4px;
+  }
+
+  .lwp-btn svg {
+    width: 18px;
+    height: 18px;
+  }
+}
+
+/* ==================== Per-source quality badge ==================== */
+.lwp-source-badge {
+  font-size: 10px;
+  font-weight: 500;
+  color: rgba(255, 255, 255, 0.45);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.lwp-remembered {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #4fc3f7;
+  margin-left: 6px;
+  vertical-align: middle;
+}
+
+/* ==================== Skip Intro button ==================== */
+.lwp-skip-btn {
+  position: absolute;
+  bottom: 100px;
+  right: 24px;
+  background: rgba(255, 255, 255, 0.12);
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  color: #fff;
+  padding: 10px 22px;
+  border-radius: 4px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  z-index: 6;
+  animation: lwp-fade-in 0.3s ease;
+  transition: background 0.2s, transform 0.15s;
+  user-select: none;
+}
+.lwp-skip-btn:hover {
+  background: rgba(255, 255, 255, 0.22);
+  transform: scale(1.03);
+}
+.lwp-skip-btn svg {
+  width: 16px;
+  height: 16px;
+  fill: currentColor;
+  vertical-align: -2px;
+  margin-left: 6px;
+}
+
+/* ==================== Audio boost slider ==================== */
+.lwp-boost-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 12px 10px;
+}
+.lwp-boost-row input[type="range"] {
+  flex: 1;
+  height: 4px;
+  -webkit-appearance: none;
+  appearance: none;
+  background: rgba(255, 255, 255, 0.2);
+  border-radius: 2px;
+  outline: none;
+  cursor: pointer;
+}
+.lwp-boost-row input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #e50914;
+  cursor: pointer;
+}
+.lwp-boost-row input[type="range"]::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #e50914;
+  border: none;
+  cursor: pointer;
+}
+.lwp-boost-label {
+  font-size: 13px;
+  color: rgba(255, 255, 255, 0.7);
+  min-width: 40px;
+  text-align: right;
+}
+
+/* ==================== Thumbnail preview ==================== */
+.lwp-thumbnail-preview {
+  position: absolute;
+  bottom: 36px;
+  transform: translateX(-50%);
+  border: 2px solid rgba(255, 255, 255, 0.25);
+  border-radius: 4px;
+  overflow: hidden;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.7);
+  pointer-events: none;
+  z-index: 11;
+  animation: lwp-fade-in 0.15s ease;
+}
+.lwp-thumbnail-preview canvas {
+  display: block;
+  width: 160px;
+  height: 90px;
+}
+
+/* ==================== Cast button ==================== */
+.lwp-cast-active svg {
+  fill: #4fc3f7 !important;
+}
+
+/* =====================================================
+   Phase 7: Premium Player v2 — "Конфетка"
+   ===================================================== */
+
+/* ==================== 7.1 Play/Pause Overlay ==================== */
+.lwp-play-overlay {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%) scale(0.8);
+  width: 72px;
+  height: 72px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.5);
+  border-radius: 50%;
+  z-index: 6;
+  pointer-events: none;
+  animation: lwp-pop 0.45s cubic-bezier(0.34, 1.56, 0.64, 1) forwards;
+}
+
+.lwp-play-overlay svg {
+  width: 36px;
+  height: 36px;
+  fill: #fff;
+}
+
+@keyframes lwp-pop {
+  0% {
+    transform: translate(-50%, -50%) scale(0.8);
+    opacity: 0.8;
+  }
+  40% {
+    transform: translate(-50%, -50%) scale(1.15);
+    opacity: 1;
+  }
+  100% {
+    transform: translate(-50%, -50%) scale(1.3);
+    opacity: 0;
+  }
+}
+
+/* ==================== 7.1 Volume OSD ==================== */
+.lwp-volume-osd {
+  position: absolute;
+  top: 40px;
+  right: 40px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 14px;
+  background: rgba(0, 0, 0, 0.65);
+  border-radius: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  z-index: 7;
+  pointer-events: none;
+  animation: lwp-osd-in 0.2s ease;
+}
+
+@keyframes lwp-osd-in {
+  from {
+    opacity: 0;
+    transform: translateY(-6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* ==================== 7.1 Improved Spinner (triple ring) ==================== */
+.lwp-spinner-ring-1,
+.lwp-spinner-ring-2,
+.lwp-spinner-ring-3 {
+  position: absolute;
+  border-radius: 50%;
+  border: 3px solid transparent;
+}
+
+.lwp-spinner-ring-1 {
+  width: 48px;
+  height: 48px;
+  border-top-color: var(--lwp-accent, #e50914);
+  animation: lwp-spin 0.8s linear infinite;
+}
+
+.lwp-spinner-ring-2 {
+  width: 38px;
+  height: 38px;
+  top: 5px;
+  left: 5px;
+  border-right-color: rgba(255, 255, 255, 0.3);
+  animation: lwp-spin 1.2s linear infinite reverse;
+}
+
+.lwp-spinner-ring-3 {
+  width: 28px;
+  height: 28px;
+  top: 10px;
+  left: 10px;
+  border-bottom-color: var(--lwp-accent, #e50914);
+  opacity: 0.5;
+  animation: lwp-spin 1.6s linear infinite;
+}
+
+/* Override the old single-ring spinner */
+.lwp-spinner {
+  width: 48px;
+  height: 48px;
+}
+
+/* ==================== 7.2 Menu Spring Transitions ==================== */
+.lwp-menu {
+  animation: lwp-menu-slide-up 0.25s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+@keyframes lwp-menu-slide-up {
+  from {
+    opacity: 0;
+    transform: translateY(12px) scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+/* Active checkmark spring */
+.lwp-menu-item.active .lwp-check {
+  animation: lwp-check-spring 0.3s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
+@keyframes lwp-check-spring {
+  from {
+    transform: scale(0.5);
+    opacity: 0;
+  }
+  to {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+
+/* Episode drawer spring slide */
+.lwp-episodes {
+  animation: lwp-drawer-slide 0.3s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+@keyframes lwp-drawer-slide {
+  from { transform: translateX(100%); }
+  to { transform: translateX(0); }
+}
+
+/* Active episode glow */
+.lwp-episode-item.active {
+  box-shadow: inset 0 0 20px rgba(229, 9, 20, 0.08);
+}
+
+/* ==================== 7.3 Adaptive Theme CSS Variables ==================== */
+.lwp-root {
+  --lwp-accent: #4fc3f7;
+  --lwp-accent-dark: #0277bd;
+  --lwp-accent-light: #81d4fa;
+}
+
+/* ==================== 7.5 Speed Boost Badge ==================== */
+.lwp-speed-badge {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -70px);
+  padding: 8px 18px;
+  background: rgba(0, 0, 0, 0.65);
+  border-radius: 20px;
+  font-size: 15px;
+  font-weight: 700;
+  z-index: 7;
+  pointer-events: none;
+  animation: lwp-osd-in 0.2s ease;
+  letter-spacing: 0.5px;
+}
+
+/* ==================== 7.6 Next Episode Overlay ==================== */
+.lwp-next-overlay {
+  position: absolute;
+  bottom: 100px;
+  right: 24px;
+  z-index: 8;
+  animation: lwp-fade-in 0.3s ease;
+}
+
+.lwp-next-content {
+  background: rgba(15, 15, 15, 0.9);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 16px;
+  padding: 20px 24px;
+  min-width: 240px;
+}
+
+.lwp-next-label {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: rgba(255, 255, 255, 0.5);
+  margin-bottom: 6px;
+}
+
+.lwp-next-title {
+  font-size: 15px;
+  font-weight: 600;
+  margin-bottom: 14px;
+  line-height: 1.4;
+}
+
+.lwp-next-episode-title {
+  color: rgba(255, 255, 255, 0.7);
+  font-weight: 400;
+  margin-left: 6px;
+}
+
+.lwp-next-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.lwp-next-play {
+  position: relative;
+  width: 52px;
+  height: 52px;
+  background: none;
+  border: none;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+}
+
+.lwp-next-ring {
+  position: absolute;
+  inset: 0;
+}
+
+.lwp-next-play-icon {
+  fill: #fff;
+  z-index: 1;
+}
+
+.lwp-next-cancel {
+  background: rgba(255, 255, 255, 0.1);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  color: rgba(255, 255, 255, 0.8);
+  padding: 8px 16px;
+  border-radius: 6px;
+  font-size: 13px;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.lwp-next-cancel:hover {
+  background: rgba(255, 255, 255, 0.2);
+}
+
+.lwp-next-countdown {
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.4);
+  margin-top: 8px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ==================== 7.7 Subtitle Presets ==================== */
+.lwp-sub-netflix span,
+.lwp-sub-netflix div[style] {
+  color: #fff !important;
+  font-weight: 600 !important;
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.8), 0 0 8px rgba(0, 0, 0, 0.5) !important;
+  background-color: transparent !important;
+}
+
+.lwp-sub-cinema span,
+.lwp-sub-cinema div[style] {
+  color: #ffff00 !important;
+  font-weight: 400 !important;
+  font-size: 120% !important;
+  text-shadow: 0 2px 4px rgba(0, 0, 0, 0.9) !important;
+  background-color: transparent !important;
+}
+
+.lwp-sub-contrast span,
+.lwp-sub-contrast div[style] {
+  color: #fff !important;
+  background-color: rgba(0, 0, 0, 0.75) !important;
+  padding: 2px 6px !important;
+}
+
+.lwp-sub-minimal span,
+.lwp-sub-minimal div[style] {
+  color: rgba(255, 255, 255, 0.85) !important;
+  font-size: 85% !important;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.6) !important;
+  background-color: transparent !important;
+}
+
+/* ==================== 7.8 Mobile Touch Optimization ==================== */
+@keyframes lwp-seek-ripple {
+  0% {
+    opacity: 0;
+    transform: translateY(-50%) scale(0.6);
+  }
+  20% {
+    opacity: 1;
+    transform: translateY(-50%) scale(1);
+  }
+  100% {
+    opacity: 0;
+    transform: translateY(-50%) scale(1.2);
+  }
+}
+
+/* Larger touch targets for touch devices */
+@media (hover: none) and (pointer: coarse) {
+  .lwp-btn {
+    min-width: 48px;
+    min-height: 48px;
+    padding: 10px;
+  }
+
+  .lwp-timeline {
+    height: 32px;
+  }
+
+  .lwp-timeline-track {
+    height: 6px;
+  }
+
+  .lwp-timeline-thumb {
+    width: 18px;
+    height: 18px;
+    transform: translate(-50%, -50%) scale(1);
+  }
+
+  .lwp-quality-badge {
+    padding: 4px 8px;
+    font-size: 12px;
+  }
+}
+
+/* Mobile: bottom sheet menus */
+@media (max-width: 600px) {
+  .lwp-menu {
+    bottom: 0;
+    left: 0;
+    right: 0;
+    border-radius: 16px 16px 0 0;
+    max-height: 60vh;
+    animation: lwp-sheet-up 0.3s cubic-bezier(0.22, 1, 0.36, 1);
+  }
+
+  @keyframes lwp-sheet-up {
+    from { transform: translateY(100%); }
+    to { transform: translateY(0); }
+  }
+
+  .lwp-next-overlay {
+    bottom: 80px;
+    right: 12px;
+    left: 12px;
+  }
+
+  .lwp-next-content {
+    min-width: auto;
+  }
+}

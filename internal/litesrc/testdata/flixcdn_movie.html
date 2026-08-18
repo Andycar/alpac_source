@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="robots" content="noindex" />
+  <title>player</title>
+  <link rel="stylesheet" href="/player/css/player.css?v=a0d40641ffed">
+  <script src="/player/js/jquery.min.js?v=668b046d12db"></script>
+  <script src="/player/js/hls.js?v=a97e68ac11af"></script>
+  
+  <script src="https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit" async defer></script>
+  
+
+  <script async src="https://www.googletagmanager.com/gtag/js?id=G-ECHML7LBXL"></script>
+  <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag() {
+          dataLayer.push(arguments);
+      }
+      gtag('js', new Date());
+      gtag('config', 'G-ECHML7LBXL');
+  </script>
+</head>
+<body class="player-page">
+  <div class="wrap">
+    <div class="controls" id="controls"></div>
+    <div id="player" class="player"></div>
+    <div class="hint" id="hint"></div>
+    
+    <div id="turnstile-container" style="position:absolute;left:-9999px;top:-9999px;width:1px;height:1px;overflow:hidden"></div>
+    
+  </div>
+  <script>
+    window.__PLAYER_PAYLOAD__ = {"autoplay":0,"captcha_required":true,"cloudflare_captcha_public":"0x4AAAAAACzlxlherCYWG1ar","cover_url":"https://picasso.factorios.live/videos/63234/34e35739e4b204a3d83c1679e1727ed2","domain":"hdplayer.click","episode":null,"files":"","force_cdn":"","id":63234,"is_serial":false,"media":"","player_stat_url":"buh.factorios.live","player_view":"player","season":null,"start":0,"translate":74,"translateTitle":"Профессиональный (многоголосый закадровый) (HDrezka Studio)","translate_was_set_by_user":false,"translations":[{"id":29,"title":"[EN] Original (English)"},{"id":74,"title":"Профессиональный (многоголосый закадровый) (HDrezka Studio)"},{"id":179,"title":"Авторский (одноголосый закадровый) (Чадов Михаил)"},{"id":99,"title":"Авторский (одноголосый закадровый) (Сербин Юрий)"},{"id":71,"title":"Полное дублирование (Невафильм | Нева-1)"},{"id":1219,"title":"[PT] Полное дублирование (Portugues)"}],"translations_episodes":"","type":"movie","unapproved_domain":"true","version":"1.0.2","video":""};
+    window.__PLAYER_PAYLOAD__.cover_url += "@h400";
+  </script>
+  
+  <script src="/player/js/player.bundle.js?v=318db559c8e3"></script>
+  
+</body>
+</html>

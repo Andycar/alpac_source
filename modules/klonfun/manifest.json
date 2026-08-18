@@ -1,0 +1,18 @@
+{
+  "id": "klonfun",
+  "name": "Klon.fun",
+  "version": "1.0.0",
+  "author": "lampame",
+  "description": "klon.fun — украинский источник фильмов и сериалов с украинской озвучкой.",
+  "entry": "index.js",
+  "content_types": ["movie", "serial"],
+  "quality": "FHD",
+  "languages": ["uk", "ru"],
+  "ukrainian": true,
+  "tags": ["ukrainian"],
+  "repository": "https://github.com/lampame/lampac-ukraine/tree/main/LME.KlonFUN",
+  "config_schema": [
+    {"key": "host", "label": "Хост", "type": "string", "default": "https://klon.fun"},
+    {"key": "proxyStreams", "label": "Проксировать стримы", "type": "bool", "default": true}
+  ]
+}

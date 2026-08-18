@@ -1,0 +1,30 @@
+# Binaries
+/lampac-go
+/lampac-go.exe
+/dist/
+/bin/
+/build/
+
+# Runtime state (created next to the binary)
+/cache/
+/database/
+/config_backups/
+/tmp_rtprobe/
+*.log
+
+# Local configuration (contains tokens/secrets) — copy config.example.toml instead
+/config.toml
+/current.conf
+/init.json
+/current.json
+
+# User-installed content
+/custom_balancers/
+/wasm_modules/
+
+# Node
+node_modules/
+
+# OS / editor
+.DS_Store
+*.swp

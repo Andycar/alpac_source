@@ -1,0 +1,18 @@
+{
+  "id": "awmzone",
+  "name": "Turboserial (awmzone)",
+  "version": "1.0.0",
+  "author": "lampac-go",
+  "description": "turboserial.com — поиск по названию, плеер videodb с CDN awmzone (HLS, мультиозвучка, фильмы и сериалы). ВНИМАНИЕ: CDN awmzone жёстко режет datacenter-IP (фильм → 404, сериал → 403). Нужен residential CIS-прокси: впишите его в socks_proxy ниже (тогда через него пойдут search/embed — IP, получивший токен), И в серверный config.toml [[proxy.direct.entries]] balancers=[\"awmzone\"] (тогда через тот же прокси пойдёт стрим). Без residential-прокси работать НЕ будет.",
+  "entry": "index.js",
+  "content_types": ["movie", "serial"],
+  "quality": "1080p",
+  "languages": ["ru"],
+  "tags": ["russian", "dubbing", "hls"],
+  "config_schema": [
+    {"key": "host", "label": "Адрес сайта", "type": "string", "default": "https://turboserial.com", "description": "Базовый домен (меняется при блокировках зеркал)"},
+    {"key": "socks_proxy", "label": "Residential SOCKS5 (host:port)", "type": "string", "default": "", "placeholder": "127.0.0.1:40007", "description": "CDN awmzone банит datacenter-IP. Впишите адрес residential CIS SOCKS5 (без авторизации / по IP-whitelist) — все запросы к сайту (search/embed) пойдут через него, чтобы токен CDN был выдан на тот же IP, с которого потом тянется стрим. ВАЖНО: для проксирования САМОГО стрима через тот же прокси настройте серверный config.toml: [[proxy.direct.entries]] uri=\"socks5://<host:port>\" balancers=[\"awmzone\"]."},
+    {"key": "proxyStreams", "label": "Проксировать стримы", "type": "bool", "default": true, "description": "CDN awmzone требует Referer/Origin — без прокси плеер может не загрузиться"},
+    {"key": "cacheTTL", "label": "Кэш ссылок (сек)", "type": "int", "default": 1200, "description": "Токен CDN живёт ~1 час; держим кэш ниже этого порога"}
+  ]
+}

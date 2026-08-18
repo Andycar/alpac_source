@@ -1,0 +1,36 @@
+{
+  "id": "scts",
+  "name": "SCTS",
+  "version": "1.0.0",
+  "author": "lampac-go",
+  "description": "Sakhalin Cable TV — community-каталог. Тянет slim-JSON по URL, отдаёт прямые ссылки на открытый CDN dl.yama.scts.tv без проксей. Сервер не пропускает через себя видеотрафик.",
+  "entry": "index.js",
+  "content_types": ["movie", "serial"],
+  "quality": "FHD",
+  "languages": ["ru"],
+  "tags": ["ru", "community"],
+  "config_schema": [
+    {
+      "key": "catalog_url",
+      "label": "URL slim-каталога",
+      "type": "string",
+      "default": "https://hub.alcopa.cc/scts/scts-slim.json.gz",
+      "placeholder": "https://example.com/scts-slim.json.gz",
+      "description": "Сжатый thin-каталог (~2.2 МБ gzip). Поддерживается .json и .json.gz."
+    },
+    {
+      "key": "refresh_hours",
+      "label": "Обновлять кэш (часов)",
+      "type": "number",
+      "default": 24,
+      "description": "Через сколько часов перечитать каталог. 0 = только при перезагрузке модуля."
+    },
+    {
+      "key": "use_proxy",
+      "label": "Стрим через /proxy/",
+      "type": "bool",
+      "default": false,
+      "description": "По умолчанию URL в slim-каталоге уже указывают на HTTPS-CDN (hub.alcopa.cc/cdn/scts/...) — прокси через lampac-сервер не нужен. Включите только если ваш URL в catalog_url ведёт на HTTP-каталог (старая версия / свой источник)."
+    }
+  ]
+}

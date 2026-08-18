@@ -1,0 +1,15 @@
+[Unit]
+Description=FlixCDN Turnstile solver (для lampac-go)
+After=network.target
+
+[Service]
+Type=simple
+User={{lampac_user}}
+Environment=DISPLAY=:{{display_num}}
+ExecStartPre=/usr/bin/Xvfb :{{display_num}} -screen 0 1280x720x24 -nolisten tcp &
+ExecStart=/usr/bin/python3 {{lampac_root}}/pac/flixcdn_solver.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

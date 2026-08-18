@@ -1,0 +1,65 @@
+[Unit]
+# Reference launcher for the persistent "turbo" headless Chrome that lampac-go
+# connects to over DevTools (ws://127.0.0.1:9222) for the kinomix / turbo
+# resolves (internal/httpapi/turbo.go, vibix.go).
+#
+# WHY THIS EXISTS: that Chrome runs with a persistent --user-data-dir
+# (/tmp/turbo-chrome-pac) and keeps navigating to a VIDEO CDN (kinescopecdn).
+# Chrome's HTTP disk cache, media cache and Service-Worker CacheStorage all
+# accumulate there with no bound — on production this grew to 40 GB and filled
+# the disk. The lampac-go tmp-janitor intentionally leaves this dir alone
+# (it's a persistent profile owned by this launcher), so the cap MUST live
+# here. This unit bounds it three ways:
+#   1. --disk-cache-size / --media-cache-size hard-cap the HTTP/media caches.
+#   2. --disk-cache-dir puts that cache on its own path (easy to wipe / tmpfs).
+#   3. RuntimeMaxSec + the ExecStartPre wipe reset the (otherwise unbounded)
+#      Service-Worker CacheStorage every 24 h. kinomix.web.app needs no login
+#      state, so a daily profile-cache reset is harmless.
+#
+# Adapt: chromium path (chromium / chromium-browser / google-chrome), the user,
+# and the PAC path to your install. Then:
+#   sudo cp turbo-chrome.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now turbo-chrome
+After=network.target
+
+[Service]
+Type=simple
+User={{lampac_user}}
+
+# Create the dirs and reclaim any prior cache balloon on every (re)start.
+ExecStartPre=-/bin/mkdir -p /tmp/turbo-chrome-pac /tmp/turbo-chrome-cache
+ExecStartPre=-/bin/sh -c 'rm -rf /tmp/turbo-chrome-cache/* ; find /tmp/turbo-chrome-pac -maxdepth 3 -type d \( -name Cache -o -name "Code Cache" -o -name GPUCache -o -name "Service Worker" -o -name "DawnGraphiteCache" -o -name "DawnWebGPUCache" -o -name GraphiteDawnCache \) -exec rm -rf {} + 2>/dev/null'
+
+ExecStart=/usr/bin/chromium \
+  --headless=new \
+  --no-sandbox \
+  --disable-gpu \
+  --disable-dev-shm-usage \
+  --remote-debugging-address=127.0.0.1 \
+  --remote-debugging-port=9222 \
+  --user-data-dir=/tmp/turbo-chrome-pac \
+  --disk-cache-dir=/tmp/turbo-chrome-cache \
+  --disk-cache-size=134217728 \
+  --media-cache-size=134217728 \
+  --disable-application-cache \
+  --disable-back-forward-cache \
+  --proxy-pac-url=file://{{lampac_root}}/pac/turbo-proxy.pac \
+  about:blank
+
+# Force a clean restart every 6 h so the ExecStartPre wipe caps Service-Worker
+# CacheStorage growth (which --disk-cache-size does NOT cover). kinomix needs no
+# login state, so restarts are free; lampac-go reconnects to :9222 automatically.
+Restart=always
+RestartSec=5
+RuntimeMaxSec=21600
+
+# RAM ceiling — defense in depth. The historical leak was lampac-go tabs not being
+# closed on the remote browser (fixed via chromedp.Cancel in turbo.go/vibix.go):
+# one video-playing renderer per resolve accumulated until the box OOM'd. With the
+# cap, any future leak gets THIS unit killed+restarted by systemd (5 s downtime)
+# instead of eating the host's RAM.
+MemoryHigh=1536M
+MemoryMax=2G
+
+[Install]
+WantedBy=multi-user.target

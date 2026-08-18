@@ -1,0 +1,19 @@
+{
+  "id": "animeon",
+  "name": "AnimeON",
+  "version": "1.0.0",
+  "author": "lampame",
+  "description": "animeon.club — аниме с украинской озвучкой (фандаби).",
+  "entry": "index.js",
+  "content_types": ["serial", "movie"],
+  "quality": "FHD",
+  "languages": ["uk", "ja"],
+  "ukrainian": true,
+  "anime": true,
+  "tags": ["ukrainian", "anime"],
+  "repository": "https://github.com/lampame/lampac-ukraine/tree/main/LME.AnimeON",
+  "config_schema": [
+    {"key": "host", "label": "Хост", "type": "string", "default": "https://animeon.club"},
+    {"key": "proxyStreams", "label": "Проксировать стримы", "type": "bool", "default": true}
+  ]
+}

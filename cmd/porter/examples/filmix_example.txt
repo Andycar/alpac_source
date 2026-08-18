@@ -1,0 +1,209 @@
+// Standalone balancer: filmix (category: api)
+// Pattern: JSON API with token auth, search + movie player_links
+// API: /api/v2/search?story={title}&token={token} → [{id, title, year}]
+// Movie: /api/v2/post/{id}?token={token} → {player_links: {movie: [{link, translation}]}}
+package main
+
+import (
+	"encoding/json"
+	"flag"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"net/url"
+	"regexp"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+)
+
+const balancerName = "filmix"
+var defaultHost = "https://filmixapp.cyou"
+
+var reIDFromURL = regexp.MustCompile(`/([0-9]+)-`)
+
+type searchItem struct {
+	ID    int    `json:"id"`
+	Title string `json:"title"`
+	Year  int    `json:"year"`
+}
+type postResponse struct {
+	PlayerLinks struct {
+		Movie []struct {
+			Link        string `json:"link"`
+			Translation string `json:"translation"`
+		} `json:"movie"`
+	} `json:"player_links"`
+}
+
+// --- Cache ---
+type cacheItem struct { value any; expiresAt time.Time }
+type simpleCache struct { mu sync.RWMutex; items map[string]cacheItem }
+func newCache() *simpleCache { return &simpleCache{items: make(map[string]cacheItem)} }
+func (c *simpleCache) get(key string) (any, bool) {
+	c.mu.RLock(); defer c.mu.RUnlock()
+	item, ok := c.items[key]
+	if !ok || time.Now().After(item.expiresAt) { return nil, false }
+	return item.value, true
+}
+func (c *simpleCache) set(key string, value any, ttl time.Duration) {
+	c.mu.Lock(); c.items[key] = cacheItem{value: value, expiresAt: time.Now().Add(ttl)}; c.mu.Unlock()
+}
+
+type server struct {
+	client   *http.Client
+	host     string
+	mainHost string
+	token    string
+	cache    *simpleCache
+}
+
+func main() {
+	port := flag.Int("port", 50100, "HTTP listen port")
+	mainHost := flag.String("main-host", "", "main lampac-go server")
+	host := flag.String("host", "", "upstream host override")
+	token := flag.String("token", "", "API token")
+	flag.Parse()
+
+	upstreamHost := defaultHost
+	if *host != "" { upstreamHost = strings.TrimRight(*host, "/") }
+
+	s := &server{
+		client:   &http.Client{Timeout: 20 * time.Second},
+		host:     upstreamHost,
+		mainHost: *mainHost,
+		token:    *token,
+		cache:    newCache(),
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", s.handle)
+	addr := fmt.Sprintf("127.0.0.1:%d", *port)
+	log.Printf("filmix: listening on %s", addr)
+	log.Fatal(http.ListenAndServe(addr, mux))
+}
+
+func (s *server) handle(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	if q.Get("checksearch") == "true" || q.Get("checksearch") == "1" {
+		s.handleCheckSearch(w, r)
+		return
+	}
+	s.index(w, r)
+}
+
+func (s *server) handleCheckSearch(w http.ResponseWriter, r *http.Request) {
+	title := strings.TrimSpace(r.URL.Query().Get("title"))
+	if title == "" || s.token == "" {
+		respondJSON(w, map[string]any{"rch": false})
+		return
+	}
+	items := s.search(title)
+	respondJSON(w, map[string]any{"rch": len(items) > 0})
+}
+
+func (s *server) search(query string) []searchItem {
+	cacheKey := "search:" + query
+	if cached, ok := s.cache.get(cacheKey); ok { return cached.([]searchItem) }
+
+	apiURL := s.host + "/api/v2/search?" + url.Values{
+		"story": {query}, "token": {s.token},
+	}.Encode()
+
+	body, err := s.fetch(apiURL, "")
+	if err != nil { return nil }
+
+	var items []searchItem
+	if json.Unmarshal([]byte(body), &items) != nil { return nil }
+
+	if len(items) > 0 { s.cache.set(cacheKey, items, 20*time.Minute) }
+	return items
+}
+
+func (s *server) index(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	rjson := q.Get("rjson") == "true" || q.Get("rjson") == "1"
+	title := strings.TrimSpace(q.Get("title"))
+	origTitle := strings.TrimSpace(q.Get("original_title"))
+
+	items := s.search(title)
+	if len(items) == 0 && origTitle != "" { items = s.search(origTitle) }
+	if len(items) == 0 {
+		respondEmpty(w, rjson)
+		return
+	}
+
+	// Get movie details
+	item := items[0]
+	postURL := fmt.Sprintf("%s/api/v2/post/%d?token=%s", s.host, item.ID, s.token)
+	body, err := s.fetch(postURL, "")
+	if err != nil {
+		respondEmpty(w, rjson)
+		return
+	}
+
+	var post postResponse
+	if json.Unmarshal([]byte(body), &post) != nil {
+		respondEmpty(w, rjson)
+		return
+	}
+
+	if len(post.PlayerLinks.Movie) == 0 {
+		respondEmpty(w, rjson)
+		return
+	}
+
+	data := make([]map[string]any, 0)
+	for _, m := range post.PlayerLinks.Movie {
+		if m.Link == "" { continue }
+		data = append(data, map[string]any{
+			"method": "play", "url": m.Link, "stream": m.Link,
+			"name": m.Translation, "title": joinName(title, origTitle),
+		})
+	}
+
+	if rjson {
+		respondJSON(w, map[string]any{"type": "movie", "data": data})
+		return
+	}
+	var sb strings.Builder
+	sb.WriteString(`<div class="videos__line">`)
+	for _, row := range data {
+		sb.WriteString(`<div class="videos__item videos__movie selector" data-json='` + escapeAttr(row) + `'>`)
+		sb.WriteString(`<div class="videos__item-imgbox videos__movie-imgbox"></div>`)
+		sb.WriteString(`<div class="videos__item-title">` + fmt.Sprint(row["name"]) + `</div></div>`)
+	}
+	sb.WriteString(`</div>`)
+	respondHTML(w, sb.String())
+}
+
+func (s *server) fetch(target, referer string) (string, error) {
+	req, _ := http.NewRequest(http.MethodGet, target, nil)
+	req.Header.Set("User-Agent", "Dalvik/2.1.0 (Linux; U; Android 12; Pixel 5)")
+	if referer != "" { req.Header.Set("Referer", referer) }
+	resp, err := s.client.Do(req)
+	if err != nil { return "", err }
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 { return "", fmt.Errorf("status %d", resp.StatusCode) }
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	return string(body), nil
+}
+
+func respondJSON(w http.ResponseWriter, v any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	json.NewEncoder(w).Encode(v)
+}
+func respondHTML(w http.ResponseWriter, html string) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Write([]byte(html))
+}
+func respondEmpty(w http.ResponseWriter, rjson bool) {
+	if rjson { respondJSON(w, map[string]any{"type": "empty", "data": []any{}}); return }
+	respondHTML(w, "")
+}
+func joinName(t, o string) string { if o != "" && o != t { return t + " / " + o }; return t }
+func escapeAttr(v any) string { b, _ := json.Marshal(v); return strings.ReplaceAll(string(b), "'", "&#39;") }
+
+var _ = reIDFromURL
+var _ = strconv.Atoi

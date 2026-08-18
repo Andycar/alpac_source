@@ -1,0 +1,18 @@
+{
+  "id": "ashdi",
+  "name": "Ashdi",
+  "version": "1.0.0",
+  "author": "lampame",
+  "description": "Ashdi (ashdi.vip) — украинская озвучка. Использует wormhole-API (imdb_id) без токена.",
+  "entry": "index.js",
+  "content_types": ["movie", "serial"],
+  "quality": "FHD",
+  "languages": ["uk"],
+  "ukrainian": true,
+  "tags": ["ukrainian", "dubbing"],
+  "repository": "https://github.com/lampame/lampac-ukraine",
+  "config_schema": [
+    {"key": "wormholeHost", "label": "Wormhole URL", "type": "string", "default": "https://wormhole.lampame.v6.rocks"},
+    {"key": "proxyStreams", "label": "Проксировать стримы", "type": "bool", "default": true}
+  ]
+}

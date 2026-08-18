@@ -1,0 +1,236 @@
+// Standalone balancer: collaps (category: embed)
+// Pattern: embed page at /embed/kp/{kinopoiskID} returns JS with HLS/DASH URLs
+// Supports: movie + serial (seasons/episodes from JSON array)
+package main
+
+import (
+	"encoding/json"
+	"flag"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"net/url"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+)
+
+const balancerName = "collaps"
+var defaultHost = "https://api.variyt.ws"
+
+var (
+	reHLS    = regexp.MustCompile(`(?i)hls\s*:\s*"([^"]+)"`)
+	reSeasons = regexp.MustCompile(`(?is)seasons\s*:\s*(\[.+?\])\s*[,;]`)
+)
+
+type embedSeason struct {
+	Season   int            `json:"season"`
+	Episodes []embedEpisode `json:"episodes"`
+}
+type embedEpisode struct {
+	Episode string `json:"episode"`
+	HLS     string `json:"hls"`
+}
+
+// --- Cache ---
+type cacheItem struct { value any; expiresAt time.Time }
+type simpleCache struct { mu sync.RWMutex; items map[string]cacheItem }
+func newCache() *simpleCache { return &simpleCache{items: make(map[string]cacheItem)} }
+func (c *simpleCache) get(key string) (any, bool) {
+	c.mu.RLock(); defer c.mu.RUnlock()
+	item, ok := c.items[key]
+	if !ok || time.Now().After(item.expiresAt) { return nil, false }
+	return item.value, true
+}
+func (c *simpleCache) set(key string, value any, ttl time.Duration) {
+	c.mu.Lock(); c.items[key] = cacheItem{value: value, expiresAt: time.Now().Add(ttl)}; c.mu.Unlock()
+}
+
+type server struct {
+	client   *http.Client
+	host     string
+	mainHost string
+	token    string
+	cache    *simpleCache
+}
+
+func main() {
+	port := flag.Int("port", 50100, "HTTP listen port")
+	mainHost := flag.String("main-host", "", "main lampac-go server")
+	host := flag.String("host", "", "upstream host override")
+	token := flag.String("token", "", "API token")
+	flag.Parse()
+
+	upstreamHost := defaultHost
+	if *host != "" { upstreamHost = strings.TrimRight(*host, "/") }
+
+	s := &server{
+		client:   &http.Client{Timeout: 20 * time.Second},
+		host:     upstreamHost,
+		mainHost: *mainHost,
+		token:    *token,
+		cache:    newCache(),
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", s.handle)
+	addr := fmt.Sprintf("127.0.0.1:%d", *port)
+	log.Printf("collaps: listening on %s", addr)
+	log.Fatal(http.ListenAndServe(addr, mux))
+}
+
+func (s *server) handle(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	if q.Get("checksearch") == "true" || q.Get("checksearch") == "1" {
+		s.handleCheckSearch(w, r)
+		return
+	}
+	s.index(w, r)
+}
+
+func (s *server) handleCheckSearch(w http.ResponseWriter, r *http.Request) {
+	kpID := strings.TrimSpace(r.URL.Query().Get("kinopoisk_id"))
+	if kpID == "" {
+		respondJSON(w, map[string]any{"rch": false})
+		return
+	}
+	embedURL := s.host + "/embed/kp/" + kpID
+	body, err := s.fetch(embedURL, "")
+	if err != nil || body == "" {
+		respondJSON(w, map[string]any{"rch": false})
+		return
+	}
+	has := reHLS.MatchString(body) || reSeasons.MatchString(body)
+	respondJSON(w, map[string]any{"rch": has})
+}
+
+func (s *server) index(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	rjson := q.Get("rjson") == "true" || q.Get("rjson") == "1"
+	kpID := strings.TrimSpace(q.Get("kinopoisk_id"))
+	title := strings.TrimSpace(q.Get("title"))
+	origTitle := strings.TrimSpace(q.Get("original_title"))
+	seasonStr := q.Get("s")
+	season := -1
+	if seasonStr != "" { season, _ = strconv.Atoi(seasonStr) }
+
+	if kpID == "" {
+		respondEmpty(w, rjson)
+		return
+	}
+
+	embedURL := s.host + "/embed/kp/" + kpID
+	body, err := s.fetch(embedURL, "")
+	if err != nil || body == "" {
+		respondEmpty(w, rjson)
+		return
+	}
+
+	// Check if serial (has seasons JSON)
+	if m := reSeasons.FindStringSubmatch(body); len(m) >= 2 {
+		var seasons []embedSeason
+		if json.Unmarshal([]byte(m[1]), &seasons) == nil && len(seasons) > 0 {
+			s.handleSerial(w, r, rjson, seasons, season, title, origTitle)
+			return
+		}
+	}
+
+	// Movie: extract HLS
+	if m := reHLS.FindStringSubmatch(body); len(m) >= 2 {
+		s.writeMovieOutput(w, rjson, m[1], title, origTitle)
+		return
+	}
+
+	respondEmpty(w, rjson)
+}
+
+func (s *server) writeMovieOutput(w http.ResponseWriter, rjson bool, streamURL, title, origTitle string) {
+	row := map[string]any{
+		"method": "play", "url": streamURL, "stream": streamURL,
+		"name": title, "title": joinName(title, origTitle),
+	}
+	if rjson {
+		respondJSON(w, map[string]any{"type": "movie", "data": []map[string]any{row}})
+		return
+	}
+	respondHTML(w, `<div class="videos__line"><div class="videos__item videos__movie selector" data-json='`+escapeAttr(row)+`'><div class="videos__item-imgbox videos__movie-imgbox"></div><div class="videos__item-title">`+title+`</div></div></div>`)
+}
+
+func (s *server) handleSerial(w http.ResponseWriter, r *http.Request, rjson bool, seasons []embedSeason, season int, title, origTitle string) {
+	if season < 0 {
+		// Show season list
+		data := make([]map[string]any, 0)
+		for _, s := range seasons {
+			data = append(data, map[string]any{
+				"method": "link", "id": s.Season,
+				"url":  r.URL.Path + "?" + url.Values{"kinopoisk_id": {r.URL.Query().Get("kinopoisk_id")}, "title": {title}, "original_title": {origTitle}, "s": {strconv.Itoa(s.Season)}}.Encode(),
+				"name": fmt.Sprintf("%d сезон", s.Season),
+			})
+		}
+		respondJSON(w, map[string]any{"type": "season", "data": data})
+		return
+	}
+	// Show episodes
+	for _, s := range seasons {
+		if s.Season != season { continue }
+		data := make([]map[string]any, 0)
+		for _, ep := range s.Episodes {
+			if ep.HLS == "" { continue }
+			epNum, _ := strconv.Atoi(ep.Episode)
+			data = append(data, map[string]any{
+				"method": "play", "url": ep.HLS, "stream": ep.HLS,
+				"s": season, "e": epNum,
+				"name": fmt.Sprintf("%s серия", ep.Episode),
+				"title": joinName(title, origTitle) + fmt.Sprintf(" (s%02de%02d)", season, epNum),
+			})
+		}
+		respondJSON(w, map[string]any{"type": "episode", "data": data})
+		return
+	}
+	respondEmpty(w, rjson)
+}
+
+// --- HTTP helpers ---
+func (s *server) fetch(target, referer string) (string, error) {
+	req, err := http.NewRequest(http.MethodGet, target, nil)
+	if err != nil { return "", err }
+	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36")
+	if referer != "" { req.Header.Set("Referer", referer) }
+	if s.token != "" { req.Header.Set("X-Token", s.token) }
+	resp, err := s.client.Do(req)
+	if err != nil { return "", err }
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 { return "", fmt.Errorf("status %d", resp.StatusCode) }
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	return string(body), nil
+}
+
+func respondJSON(w http.ResponseWriter, v any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	json.NewEncoder(w).Encode(v)
+}
+func respondHTML(w http.ResponseWriter, html string) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Write([]byte(html))
+}
+func respondEmpty(w http.ResponseWriter, rjson bool) {
+	if rjson { respondJSON(w, map[string]any{"type": "empty", "data": []any{}}); return }
+	respondHTML(w, "")
+}
+func joinName(title, orig string) string {
+	if orig != "" && orig != title { return title + " / " + orig }
+	return title
+}
+func escapeAttr(v any) string {
+	b, _ := json.Marshal(v)
+	s := string(b)
+	s = strings.ReplaceAll(s, "'", "&#39;")
+	return s
+}
+
+// suppress unused imports
+var _ = sort.Ints

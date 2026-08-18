@@ -1,0 +1,29 @@
+{
+  "id": "_template",
+  "name": "SISI JS template",
+  "version": "0.1.0",
+  "author": "lampac-go",
+  "description": "Шаблон goja-модуля для 18+ источника. Скопируйте каталог под новым id и поправьте DEFAULT_HOST + buildListURL под целевой сайт.",
+  "icon": "🍑",
+  "tags": ["sisi", "template"],
+  "languages": ["ru"],
+  "quality": "720p",
+  "default_transport": "default",
+  "host_defaults": "https://example.com",
+  "config_schema": [
+    {
+      "key": "site_host",
+      "label": "Хост сайта",
+      "type": "string",
+      "default": "example.com",
+      "description": "Можно переопределить, если основной домен переехал на зеркало."
+    },
+    {
+      "key": "user_agent",
+      "label": "User-Agent",
+      "type": "string",
+      "default": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+      "description": "Подставляется во все запросы к сайту."
+    }
+  ]
+}

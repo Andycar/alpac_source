@@ -1,0 +1,29 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "web-client",
+      "runtimeExecutable": "/Users/kirillz/.nvm/versions/node/v20.20.2/bin/node",
+      "runtimeArgs": [
+        "/Users/kirillz/Downloads/ddd-client/web/node_modules/vite/bin/vite.js",
+        "/Users/kirillz/Downloads/ddd-client/web",
+        "--port",
+        "5183",
+        "--strictPort"
+      ],
+      "port": 5183
+    },
+    {
+      "name": "dist-static",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": [
+        "-m",
+        "http.server",
+        "8123",
+        "--directory",
+        "/Users/kirillz/Downloads/ddd-client/web/dist"
+      ],
+      "port": 8123
+    }
+  ]
+}

@@ -1,0 +1,1604 @@
+(function () {
+  'use strict';
+
+  var Defined = {
+    use_api: 'lampac',
+    localhost: '{localhost}/sisi',
+    framework: ''
+  };
+
+  var luid = Lampa.Storage.get('lampac_unic_id', '');
+  if (!luid) {
+    luid = Lampa.Utils.uid(8).toLowerCase();
+    Lampa.Storage.set('lampac_unic_id', luid);
+  }
+
+  Lampa.Lang.add({
+    lampac_sisiname: {
+      ru: 'Клубничка',
+      en: 'Strawberry',
+      uk: 'Полуничка',
+      zh: '草莓'
+    }
+  });
+
+  var network = new Lampa.Reguest();
+  var preview_timer, preview_video;
+
+  function sourceTitle(title) {
+    return Lampa.Utils.capitalizeFirstLetter(title.split('.')[0]);
+  }
+
+  function isVIP(element) {
+    return /vip.mp4/.test(element.video);
+  }
+
+  {rch_websoket}
+
+  function modal(text) {
+    var id = Lampa.Storage.get('sisi_unic_id', '').toLowerCase();
+    var controller = Lampa.Controller.enabled().name;
+    var content = "<div class=\"about\">\n<div>" + (text || 'Добавьте идентификатор устройства в init.conf') + "</div>\n<div class=\"about__contacts\">\n<div>\n<small>unic_id</small><br>\n" + luid + "\n</div>\n\n<div>\n<small>box_mac</small><br>\n" + id + "\n</div>\n</div>\n</div>";
+    // "<div class=\"about\">\n<div>\u042D\u0442\u043E \u0432\u0438\u0434\u0435\u043E \u0434\u043E\u0441\u0442\u0443\u043F\u043D\u043E \u0441 VIP \u043F\u043E\u0434\u043F\u0438\u0441\u043A\u043E\u0439. \u0414\u043B\u044F \u043F\u043E\u0434\u043A\u043B\u044E\u0447\u0435\u043D\u0438\u044F VIP \u043F\u043E\u0434\u043F\u0438\u0441\u043A\u0438, \u043F\u0435\u0440\u0435\u0439\u0434\u0438\u0442\u0435 \u043D\u0430 \u0441\u0430\u0439\u0442 \u043A\u043E\u0442\u043E\u0440\u044B\u0439 \u0443\u043A\u0430\u0437\u0430\u043D \u043D\u0438\u0436\u0435 \u0438 \u0443\u043A\u0430\u0436\u0438\u0442\u0435 \u0432\u0430\u0448 ID</div>\n<div class=\"about__contacts\">\n<div>\n                <small>\u0421\u0430\u0439\u0442</small><br>\n{vip_site}\n</div>\n\n<div>\n<small>\u0412\u0430\u0448 ID</small><br>\n".concat(id, "\n</div>\n</div>\n</div>");
+    Lampa.Modal.open({
+      title: 'Доступ ограничен',
+      html: $(content),
+      size: 'medium', // small|medium
+      onBack: function onBack() {
+        Lampa.Modal.close();
+        Lampa.Controller.toggle(controller);
+      }
+    });
+  }
+
+  function qualityDefault(qualitys) {
+    var preferably = Lampa.Storage.get('video_quality_default', '1080') + 'p';
+    var url = '';
+
+    if (qualitys && typeof qualitys === 'object') {
+      for (var q in qualitys) {
+        var candidate = qualitys[q];
+        if (q.indexOf(preferably) == 0 && typeof candidate === 'string' && candidate) url = candidate;
+      }
+
+      if (!url) {
+        var keys = Lampa.Arrays.getKeys(qualitys);
+        for (var i = 0; i < keys.length; i++) {
+          var fallback = qualitys[keys[i]];
+          if (typeof fallback === 'string' && fallback) {
+            url = fallback;
+            break;
+          }
+        }
+      }
+    }
+
+    return url || '';
+  }
+
+  function play(element) {
+    var controller_enabled = Lampa.Controller.enabled().name;
+
+    if (isVIP(element)) {
+      return modal();
+    }
+
+    if ({historySave} && !element.history_uid && element.bookmark && Lampa.Storage.field('sisi_history')) {
+      network.silent(Api.account(Defined.localhost + '/history/add'), function (e) { }, function () { }, JSON.stringify(element), {
+        headers: {
+          'Content-Type': 'application/json'
+        }
+      });
+    }
+
+    if (element.json) {
+      Lampa.Loading.start(function () {
+        network.clear();
+        Lampa.Loading.stop();
+      });
+      if (!element.video) {
+        Lampa.Noty.show(Lampa.Lang.translate('torrent_parser_nofiles'));
+        Lampa.Loading.stop();
+        return;
+      }
+      Api.account(element.video + '&json=true');
+      Api.qualitys(element.video, function (data) {
+        if (data.error) {
+          Lampa.Noty.show(Lampa.Lang.translate('torrent_parser_nofiles'));
+          Lampa.Loading.stop();
+          return;
+        }
+
+        var qualitys = data.qualitys || data;
+        var recomends = data.recomends || [];
+        Lampa.Loading.stop();
+
+        for (var i in qualitys) {
+          qualitys[i] = Api.account(qualitys[i], true);
+        }
+
+        var defaultURL = qualityDefault(qualitys);
+        var reserveURL = data.qualitys_proxy ? qualityDefault(data.qualitys_proxy) : '';
+        var safeDefaultURL = defaultURL ? Api.account(defaultURL, true) : '';
+        var safeReserveURL = reserveURL ? Api.account(reserveURL, true) : '';
+        if (!safeDefaultURL) {
+          Lampa.Noty.show(Lampa.Lang.translate('torrent_parser_nofiles'));
+          return;
+        }
+
+        var video = {
+          title: element.name,
+          url: safeDefaultURL,
+          url_reserve: safeReserveURL || false,
+          quality: qualitys,
+          headers: data.headers_stream
+        };
+        if (!video.url) {
+          Lampa.Noty.show(Lampa.Lang.translate('torrent_parser_nofiles'));
+          return;
+        }
+        Lampa.Player.play(video);
+
+        if (recomends.length) {
+          recomends.forEach(function (a) {
+            a.title = Lampa.Utils.shortText(a.name, 50);
+            a.icon = '<img class="size-youtube" src="' + a.picture + '" />';
+            a.template = 'selectbox_icon';
+
+            a.url = function (call) {
+              if (a.json) {
+                Api.qualitys(a.video, function (data) {
+                  a.quality = data.qualitys || {};
+                  var relURL = qualityDefault(a.quality);
+                  a.url = relURL ? Api.account(relURL, true) : '';
+                  if (data.qualitys_proxy) {
+                    var relReserveURL = qualityDefault(data.qualitys_proxy);
+                    if (relReserveURL) a.url_reserve = Api.account(relReserveURL, true);
+                  }
+                  call();
+                });
+              } else {
+                a.url = a.video;
+                call();
+              }
+            };
+          });
+          Lampa.Player.playlist(recomends);
+        } else {
+          Lampa.Player.playlist([video]);
+        }
+
+        Lampa.Player.callback(function () {
+          Lampa.Controller.toggle(controller_enabled);
+        });
+      }, function () {
+        Lampa.Noty.show(Lampa.Lang.translate('torrent_parser_nofiles'));
+        Lampa.Loading.stop();
+      });
+    } else {
+      if (element.qualitys) {
+        for (var i in element.qualitys) {
+          element.qualitys[i] = Api.account(element.qualitys[i], true);
+        }
+      }
+
+      var video = {
+        title: element.name,
+        url: Api.account(qualityDefault(element.qualitys) || element.video || '', true),
+        url_reserve: Api.account(qualityDefault(element.qualitys_proxy) || element.video_reserve || '', true),
+        quality: element.qualitys
+      };
+      if (!video.url) {
+        Lampa.Noty.show(Lampa.Lang.translate('torrent_parser_nofiles'));
+        return;
+      }
+      Lampa.Player.play(video);
+      Lampa.Player.playlist([video]);
+      Lampa.Player.callback(function () {
+        Lampa.Controller.toggle(controller_enabled);
+      });
+    }
+  }
+
+  function fixCards(json) {
+    json.forEach(function (m) {
+      m.background_image = m.picture;
+      m.poster = m.picture;
+      m.img = m.picture;
+      m.name = Lampa.Utils.capitalizeFirstLetter(m.name).replace(/\&(.*?);/g, '');
+    });
+  }
+
+  function hidePreview() {
+    clearTimeout(preview_timer);
+
+    if (preview_video) {
+      var vid = preview_video.find('video')
+
+      var pausePromise;
+
+      try {
+        pausePromise = vid.pause()
+      }
+      catch (e) { }
+
+      if (pausePromise !== undefined) {
+        pausePromise.then(function () {
+
+        })
+          .catch(function (e) {
+
+          });
+      }
+      preview_video.addClass('hide');
+      preview_video = false;
+    }
+  }
+
+  function preview(target, element) {
+    hidePreview();
+    preview_timer = setTimeout(function () {
+      if (!element.preview || !Lampa.Storage.field('sisi_preview')) return;
+      var video = target.find('video');
+      var container = target.find('.sisi-video-preview');
+
+      if (!video) {
+        video = document.createElement('video');
+        container = document.createElement('div');
+        container.addClass('sisi-video-preview');
+        container.style.position = 'absolute';
+        container.style.width = '100%';
+        container.style.height = '100%';
+        container.style.left = '0';
+        container.style.top = '0';
+        container.style.overflow = 'hidden';
+        container.style.borderRadius = '1em';
+        video.style.position = 'absolute';
+        video.style.width = '100%';
+        video.style.height = '100%';
+        video.style.left = '0';
+        video.style.top = '0';
+        video.style.objectFit = 'cover';
+        container.append(video);
+        target.find('.card__view').append(container);
+        video.src = element.preview; // 'https://thumb-v4.xhcdn.com/a/og0z25CtaTIZXgzkV7qJ8Q/023/463/094/526x298.44.t.webm'
+        video.addEventListener('ended', function () {
+          container.addClass('hide')
+        })
+        video.load();
+      }
+
+      preview_video = container;
+
+      var playPromise;
+
+      try {
+        playPromise = video.play()
+      }
+      catch (e) { }
+
+
+      if (playPromise !== undefined) {
+        playPromise.then(function () {
+
+        })
+          .catch(function (e) {
+
+          });
+      }
+
+      container.removeClass('hide');
+    }, 1500);
+  }
+
+  function fixList(list) {
+    list.forEach(function (a) {
+      if (!a.quality && a.time) a.quality = a.time;
+    });
+    return list;
+  }
+
+  function menu$2(target, card_data) {
+    if (!card_data.bookmark) return;
+    var cm = [{
+      title: !card_data.bookmark.uid ? 'В закладки' : 'Удалить из закладок'
+    }];
+
+    if (card_data.history_uid) {
+      cm.push({
+        title: 'Удалить из истории',
+        history: true
+      });
+    }
+
+    if (card_data.related) {
+      cm.push({
+        title: 'Похожие',
+        related: true
+      });
+    }
+
+    if (card_data.model) {
+      cm.push({
+        title: card_data.model.name,
+        model: true
+      });
+    }
+
+    if (Lampa.Platform.is('android') && Lampa.Storage.field('player') !== 'inner') {
+      cm.push({
+        title: 'Плеер Lampa',
+        lampaplayer: true
+      });
+    }
+
+    Lampa.Select.show({
+      title: 'Меню',
+      items: cm,
+      onSelect: function onSelect(m) {
+        if (m.model) {
+          Lampa.Activity.push({
+            url: Defined.localhost.replace('/sisi', '') + '/' + card_data.model.uri,
+            title: 'Модель - ' + card_data.model.name,
+            component: 'sisi_view_' + Defined.use_api,
+            page: 1
+          });
+        } else if (m.related) {
+          Lampa.Activity.push({
+            url: card_data.video + '&related=true',
+            title: 'Похожие - ' + card_data.title,
+            component: 'sisi_view_' + Defined.use_api,
+            page: 1
+          });
+        } else if (m.history) {
+          Api.history(card_data, function (status) {
+            Lampa.Noty.show('Успешно');
+          });
+          Lampa.Controller.toggle('content');
+        } else if (m.lampaplayer) {
+          Lampa.Controller.toggle('content');
+          play(card_data);
+        } else {
+          Api.bookmark(card_data, !card_data.bookmark.uid, function (status) {
+            Lampa.Noty.show('Успешно');
+          });
+          Lampa.Controller.toggle('content');
+        }
+      },
+      onBack: function onBack() {
+        Lampa.Controller.toggle('content');
+      }
+    });
+  }
+
+  var Utils = {
+    sourceTitle: sourceTitle,
+    play: play,
+    fixCards: fixCards,
+    isVIP: isVIP,
+    preview: preview,
+    hidePreview: hidePreview,
+    fixList: fixList,
+    menu: menu$2
+  };
+
+  var menu$1;
+
+  function ApiPWA() {
+    var _this = this;
+
+    var network = new Lampa.Reguest();
+
+    this.menu = function (success, error) {
+      if (menu$1) return success(menu$1);
+      DotNet.invokeMethodAsync("JinEnergy", 'sisi', '').then(function (data) {
+        if (data) {
+          menu$1 = data;
+          success(menu$1);
+        } else {
+          error(data.msg);
+        }
+      })["catch"](function () {
+        console.log('Sisi', 'no load menu');
+        error();
+      });
+    };
+
+    this.view = function (params, success, error) {
+      var u = this.account(Lampa.Utils.addUrlComponent(params.url, 'pg=' + (params.page || 1)));
+      DotNet.invokeMethodAsync("JinEnergy", u.path, u.query).then(function (json) {
+        if (json.list) {
+          json.results = Utils.fixList(json.list);
+          json.collection = true;
+          json.total_pages = json.total_pages || 30;
+          Utils.fixCards(json.results);
+          delete json.list;
+          success(json);
+        } else {
+          error();
+        }
+      })["catch"](function () {
+        console.log('Sisi', 'no load', u.path + '+' + u.query);
+        error();
+      });
+    };
+
+    this.bookmark = function (element, add, call) {
+      call(true);
+    };
+
+    this.account = function (u, join) {
+      if (!u) return u;
+      if (u !== false && typeof u !== 'string') return '';
+      if (join) {
+        if (Defined.use_api == 'lampac' && Defined.localhost && u.indexOf(Defined.localhost.replace('/sisi', '')) == -1) return u;
+      }
+
+      var unic_id = Lampa.Storage.get('sisi_unic_id', '');
+      var uid = Lampa.Storage.get('lampac_unic_id', '');
+      var email = Lampa.Storage.get('account', {}).email;
+
+      if (u.indexOf('box_mac=') == -1) u = Lampa.Utils.addUrlComponent(u, 'box_mac=' + unic_id);
+
+      if (email) {
+        if (u.indexOf('account_email=') == -1) u = Lampa.Utils.addUrlComponent(u, 'account_email=' + encodeURIComponent(email));
+      }
+
+      if (uid) {
+        if (u.indexOf('uid=') == -1) u = Lampa.Utils.addUrlComponent(u, 'uid=' + encodeURIComponent(uid));
+      }
+
+      if (u.indexOf('token=') == -1) {
+        var token = '{token}';
+        if (token != '') u = Lampa.Utils.addUrlComponent(u, 'token={token}');
+      }
+
+      if (join) return u;
+      return {
+        path: u.split('?')[0],
+        query: u.split('?')[1]
+      };
+    };
+
+    this.playlist = function (add_url_query, oncomplite, error) {
+      var load = function load() {
+        var status = new Lampa.Status(menu$1.length);
+
+        status.onComplite = function (data) {
+          var items = [];
+          menu$1.forEach(function (m) {
+            if (data[m.playlist_url] && data[m.playlist_url].results.length) items.push(data[m.playlist_url]);
+          });
+          if (items.length) oncomplite(items);
+          else error();
+        };
+
+        menu$1.forEach(function (m, i) {
+          var separator = m.playlist_url.indexOf('?') !== -1 ? '&' : '?';
+          var url_query = add_url_query.indexOf('?') !== -1 || add_url_query.indexOf('&') !== -1 ? add_url_query.substring(1) : add_url_query;
+          var u = _this.account(m.playlist_url + separator + url_query);
+
+          var b = false;
+          var w = setTimeout(function () {
+            b = true;
+            status.error();
+          }, 1000 * 8);
+          DotNet.invokeMethodAsync("JinEnergy", u.path, u.query).then(function (json) {
+            clearTimeout(w);
+            if (b) return;
+
+            if (json.list) {
+              json.title = Utils.sourceTitle(m.title);
+              json.results = Utils.fixList(json.list);
+              json.url = m.playlist_url;
+              json.collection = true;
+              json.line_type = 'none';
+              json.card_events = {
+                onMenu: Utils.menu,
+                onEnter: function onEnter(card, element) {
+                  Utils.hidePreview();
+                  Utils.play(element);
+                }
+              };
+              Utils.fixCards(json.results);
+              delete json.list;
+              status.append(m.playlist_url, json);
+            } else {
+              status.error();
+            }
+          })["catch"](function () {
+            console.log('Sisi', 'no load', u.path + '+' + u.query);
+            clearTimeout(w);
+            status.error();
+          });
+        });
+      };
+
+      if (menu$1) load();
+      else {
+        _this.menu(load, error);
+      }
+    };
+
+    this.main = function (params, oncomplite, error) {
+      var catQuery = params.category ? 'cat=' + encodeURIComponent(params.category) : '';
+      this.playlist(catQuery, oncomplite, error);
+    };
+
+    this.search = function (params, oncomplite, error) {
+      this.playlist('?search=' + encodeURIComponent(params.query), oncomplite, error);
+    };
+
+    this.qualitys = function (video_url, oncomplite, error) {
+      var u = this.account(video_url + '&json=true');
+      DotNet.invokeMethodAsync("JinEnergy", u.path, u.query).then(oncomplite)["catch"](function (e) {
+        console.log('Sisi', 'no load', u.path + '+' + u.query);
+        error();
+      });
+    };
+
+    this.clear = function () {
+      network.clear();
+    };
+  }
+
+  var ApiPWA$1 = new ApiPWA();
+
+  var menu;
+
+  function ApiHttp() {
+    var _this = this;
+
+    var network = new Lampa.Reguest();
+
+    this.menu = function (success, error) {
+      if (menu) return success(menu);
+      network.silent(this.account(Defined.localhost) + '&rchtype=' + ((window.rch_nws && window.rch_nws[hostkey] ? window.rch_nws[hostkey].type : window.rch && window.rch[hostkey] ? window.rch[hostkey].type : '') || ''), function (data) {
+        if (data.channels) {
+          menu = data.channels;
+          success(menu);
+        } else {
+          error(data.msg);
+        }
+      }, error);
+    };
+
+    this.view = function (params, success, error, waiting_rch) {
+      var u = Lampa.Utils.addUrlComponent(params.url, 'pg=' + (params.page || 1));
+      network.silent(this.account(u), function (json) {
+        if (json.rch) {
+          if (waiting_rch) {
+            error();
+            return;
+          }
+          rchRun(json, function () {
+            _this.view(params, success, error, true);
+          });
+        } else if (json.accsdb) {
+          error();
+          Lampa.Noty.show(json.denymsg || json.msg, { style: 'error', time: 8000 });
+        } else if (json.list) {
+          json.results = Utils.fixList(json.list);
+          json.collection = true;
+          json.total_pages = json.total_pages || 30;
+          Utils.fixCards(json.results);
+          delete json.list;
+          success(json);
+        } else {
+          error();
+        }
+      }, error);
+    };
+
+    this.bookmark = function (element, add, call) {
+      var u = Defined.localhost + '/bookmark/' + (add ? 'add' : 'remove?id=' + element.bookmark.uid);
+      network.silent(this.account(u), function (e) {
+        call(true);
+      }, function () {
+        call(false);
+      }, JSON.stringify(element), {
+        headers: {
+          'Content-Type': 'application/json'
+        }
+      });
+    };
+
+    this.history = function (element, call) {
+      var u = Defined.localhost + '/history/remove?id=' + element.history_uid;
+      network.silent(this.account(u), function (e) {
+        call(true);
+      }, function () {
+        call(false);
+      });
+    };
+
+    this.account = function (u) {
+      if (!u) return u;
+      if (u !== false && typeof u !== 'string') return '';
+      u = u.replace(/^[\?&]+/, '');
+      u = u.replace(/[\?&]+$/, '');
+
+      if (Defined.localhost && u.indexOf(Defined.localhost.replace('/sisi', '')) === -1 && window.location.hostname !== 'localhost') return u;
+
+      var unic_id = Lampa.Storage.get('sisi_unic_id', '');
+      var uid = Lampa.Storage.get('lampac_unic_id', '');
+      var email = Lampa.Storage.get('account', {}).email;
+
+      if (u.indexOf('box_mac=') === -1)
+        u = Lampa.Utils.addUrlComponent(u, 'box_mac=' + unic_id);
+
+      if (email) {
+        if (u.indexOf('account_email=') === -1)
+          u = Lampa.Utils.addUrlComponent(u, 'account_email=' + encodeURIComponent(email));
+      }
+
+      if (uid) {
+        if (u.indexOf('uid=') === -1)
+          u = Lampa.Utils.addUrlComponent(u, 'uid=' + encodeURIComponent(uid));
+      }
+
+      if (u.indexOf('token=') === -1) {
+        var token = '{token}';
+        if (token != '') u = Lampa.Utils.addUrlComponent(u, 'token={token}');
+      }
+
+      var profile_id = Lampa.Storage.get('lampac_profile_id', '');
+      if (profile_id != '') u = Lampa.Utils.addUrlComponent(u, 'profile_id=' + profile_id);
+
+      if (u.indexOf('nws_id=') === -1 && window.rch_nws && window.rch_nws[hostkey]) {
+        var nws_id = window.rch_nws[hostkey].connectionId || Lampa.Storage.get('lampac_nws_id', '');
+        if (nws_id) u = Lampa.Utils.addUrlComponent(u, 'nws_id=' + encodeURIComponent(nws_id));
+      }
+
+      return u;
+    };
+
+    this.playlist = function (add_url_query, oncomplite, error) {
+      var load = function load() {
+        var sources = (menu || []).filter(function (m) {
+          return m && typeof m.playlist_url === 'string' && m.playlist_url;
+        });
+        if (!sources.length) {
+          error();
+          return;
+        }
+
+        var status = new Lampa.Status(sources.length);
+
+        status.onComplite = function (data) {
+          var items = [];
+          sources.forEach(function (m) {
+            if (data[m.playlist_url] && data[m.playlist_url].results.length) items.push(data[m.playlist_url]);
+          });
+          if (items.length) oncomplite(items);
+          else error();
+        };
+
+        sources.forEach(function (m) {
+          function loadThis() {
+            var separator = m.playlist_url.indexOf('?') !== -1 ? '&' : '?';
+            network.silent(_this.account(m.playlist_url.replace(/[\?&]+$/, '') + separator + add_url_query.replace(/^[\?&]+/, '')), function (json) {
+              if (json.rch) {
+                rchRun(json, function () {
+                  loadThis();
+                });
+              } else if (json.accsdb) {
+                status.error();
+                Lampa.Noty.show(json.denymsg || json.msg, { style: 'error', time: 8000 });
+              } else if (json.list) {
+                json.title = Utils.sourceTitle(m.title);
+                json.results = Utils.fixList(json.list);
+                json.url = m.playlist_url;
+                json.collection = true;
+                json.line_type = 'none';
+                json.card_events = {
+                  onMenu: Utils.menu,
+                  onEnter: function onEnter(card, element) {
+                    Utils.hidePreview();
+                    Utils.play(element);
+                  }
+                };
+                Utils.fixCards(json.results);
+                delete json.list;
+                status.append(m.playlist_url, json);
+              } else {
+                if (add_url_query && add_url_query.indexOf('cat=') >= 0) {
+                  status.append(m.playlist_url, { title: Utils.sourceTitle(m.title), results: [], url: m.playlist_url });
+                } else {
+                  status.error();
+                }
+              }
+            }, function () {
+              if (add_url_query && add_url_query.indexOf('cat=') >= 0) {
+                status.append(m.playlist_url, { title: Utils.sourceTitle(m.title), results: [], url: m.playlist_url });
+              } else {
+                status.error();
+              }
+            });
+          }
+
+          loadThis();
+        });
+      };
+
+      if (menu) load();
+      else {
+        _this.menu(load, error);
+      }
+    };
+
+    this.main = function (params, oncomplite, error) {
+      var catQuery = params.category ? 'cat=' + encodeURIComponent(params.category) : '';
+      this.playlist(catQuery, oncomplite, error);
+    };
+
+    this.search = function (params, oncomplite, error) {
+      this.playlist('?search=' + encodeURIComponent(params.query), oncomplite, error);
+    };
+
+    this.qualitys = function (video_url, oncomplite, error, waiting_rch) {
+      network.silent(this.account(video_url + '&json=true'), function (json) {
+        if (json.rch) {
+          if (waiting_rch) {
+            error();
+            return;
+          }
+          rchRun(json, function () {
+            _this.qualitys(video_url, oncomplite, error, true);
+          });
+        } else if (json.accsdb) {
+          error();
+          Lampa.Noty.show(json.denymsg || json.msg, { style: 'error', time: 8000 });
+        } else oncomplite(json);
+      }, error);
+    };
+
+    this.clear = function () {
+      network.clear();
+    };
+  }
+
+  var ApiHttp$1 = new ApiHttp();
+
+  var Api = ApiHttp$1; //Defined.use_api == 'pwa' ? ApiPWA$1 : ApiHttp$1;
+
+  // ── Parental PIN Control ──
+  var pinUnlocked = false;
+  var pinHost = (Defined.localhost || '').replace(/\/sisi\/?$/, '');
+
+  function checkPinAndProceed(callback) {
+    if (pinUnlocked) return callback();
+
+    $.getJSON(Api.account(pinHost + '/sisi/pin/status'), function (data) {
+      if (!data.has_pin) {
+        pinUnlocked = true;
+        return callback();
+      }
+      if (data.method === 'tg_confirm') {
+        showTGConfirmModal(callback);
+      } else {
+        showPinModal(callback);
+      }
+    }).fail(function () {
+      pinUnlocked = true;
+      callback();
+    });
+  }
+
+  function showPinModal(callback) {
+    var pinValue = '';
+    var html = '<div style="padding:2em;text-align:center;">';
+    html += '<div style="font-size:1.5em;font-weight:700;margin-bottom:0.8em;">🔐 Родительский контроль</div>';
+    html += '<div style="margin-bottom:1em;color:rgba(255,255,255,0.6);">Введите 6-значный PIN-код</div>';
+    html += '<div id="sisi-pin-display" style="font-size:2.5em;letter-spacing:0.5em;margin-bottom:1em;min-height:1.5em;">______</div>';
+    html += '<div id="sisi-pin-error" style="color:#e50914;min-height:1.5em;margin-bottom:0.5em;"></div>';
+    html += '<div style="display:flex;flex-wrap:wrap;justify-content:center;gap:0.4em;max-width:15em;margin:0 auto;">';
+    for (var i = 1; i <= 9; i++) {
+      html += '<div class="sisi-pin-btn selector" data-digit="' + i + '" style="width:3.5em;height:3.5em;display:flex;align-items:center;justify-content:center;font-size:1.5em;font-weight:700;background:rgba(255,255,255,0.1);border-radius:0.5em;cursor:pointer;">' + i + '</div>';
+    }
+    html += '<div class="sisi-pin-btn selector" data-action="forgot" style="width:3.5em;height:3.5em;display:flex;align-items:center;justify-content:center;font-size:0.9em;background:rgba(255,255,255,0.05);border-radius:0.5em;cursor:pointer;">?</div>';
+    html += '<div class="sisi-pin-btn selector" data-digit="0" style="width:3.5em;height:3.5em;display:flex;align-items:center;justify-content:center;font-size:1.5em;font-weight:700;background:rgba(255,255,255,0.1);border-radius:0.5em;cursor:pointer;">0</div>';
+    html += '<div class="sisi-pin-btn selector" data-action="clear" style="width:3.5em;height:3.5em;display:flex;align-items:center;justify-content:center;font-size:1.2em;background:rgba(255,255,255,0.05);border-radius:0.5em;cursor:pointer;">⌫</div>';
+    html += '</div></div>';
+
+    Lampa.Modal.open({
+      title: '',
+      html: $(html),
+      onBack: function () {
+        Lampa.Modal.close();
+        Lampa.Activity.backward();
+      },
+      onSelect: function () {}
+    });
+
+    function updateDisplay() {
+      var display = '';
+      for (var i = 0; i < 6; i++) {
+        display += i < pinValue.length ? '●' : '_';
+      }
+      $('#sisi-pin-display').text(display);
+    }
+
+    function submitPin() {
+      $.ajax({
+        url: Api.account(pinHost + '/sisi/pin/check'),
+        type: 'POST',
+        contentType: 'application/json',
+        data: JSON.stringify({ pin: pinValue }),
+        success: function (data) {
+          if (data.success) {
+            pinUnlocked = true;
+            Lampa.Modal.close();
+            callback();
+          } else if (data.error === 'too_many_attempts') {
+            $('#sisi-pin-error').text('Слишком много попыток. Подождите ' + data.retry_after + ' сек.');
+            pinValue = '';
+            updateDisplay();
+          } else {
+            $('#sisi-pin-error').text('Неверный PIN-код');
+            pinValue = '';
+            updateDisplay();
+          }
+        },
+        error: function () {
+          $('#sisi-pin-error').text('Ошибка проверки');
+          pinValue = '';
+          updateDisplay();
+        }
+      });
+    }
+
+    $('.sisi-pin-btn').on('hover:enter', function () {
+      var digit = $(this).data('digit');
+      var action = $(this).data('action');
+
+      if (action === 'clear') {
+        pinValue = pinValue.slice(0, -1);
+        updateDisplay();
+        $('#sisi-pin-error').text('');
+      } else if (action === 'forgot') {
+        Lampa.Modal.close();
+        showPinResetModal(callback);
+      } else if (digit !== undefined && pinValue.length < 6) {
+        pinValue += String(digit);
+        updateDisplay();
+        if (pinValue.length === 6) {
+          setTimeout(submitPin, 200);
+        }
+      }
+    });
+
+    updateDisplay();
+  }
+
+  function showPinResetModal(callback) {
+    var resetCode = '';
+    var codeSent = false;
+
+    function sendCode() {
+      $.ajax({
+        url: Api.account(pinHost + '/sisi/pin/reset'),
+        type: 'POST',
+        contentType: 'application/json',
+        data: '{}',
+        success: function (data) {
+          if (data.sent) {
+            codeSent = true;
+            Lampa.Noty.show('Код отправлен в Telegram');
+            showCodeInput();
+          } else {
+            Lampa.Noty.show(data.error || 'Ошибка отправки', { time: 5000 });
+            showPinModal(callback);
+          }
+        }
+      });
+    }
+
+    function showCodeInput() {
+      Lampa.Input.edit({ title: 'Код из Telegram', value: '', free: true }, function (code) {
+        if (!code) { showPinModal(callback); return; }
+        $.ajax({
+          url: Api.account(pinHost + '/sisi/pin/reset'),
+          type: 'POST',
+          contentType: 'application/json',
+          data: JSON.stringify({ code: code }),
+          success: function (data) {
+            if (data.success) {
+              pinUnlocked = true;
+              Lampa.Noty.show('PIN-код сброшен');
+              callback();
+            } else {
+              Lampa.Noty.show(data.error || 'Неверный код', { time: 5000 });
+              showCodeInput();
+            }
+          }
+        });
+      });
+    }
+
+    sendCode();
+  }
+
+  function showTGConfirmModal(callback) {
+    // Send TG confirm request, then poll for response.
+    $.ajax({
+      url: Api.account(pinHost + '/sisi/pin/tg-confirm'),
+      type: 'POST', contentType: 'application/json', data: '{}',
+      success: function (data) {
+        if (data.error) {
+          Lampa.Noty.show(data.error, { time: 5000 });
+          return;
+        }
+        var reqId = data.request_id;
+        // Show waiting modal.
+        var html = '<div style="padding:2em;text-align:center;">';
+        html += '<div style="font-size:1.5em;font-weight:700;margin-bottom:0.8em;">🔐 Подтверждение в Telegram</div>';
+        html += '<div style="margin-bottom:1em;color:rgba(255,255,255,0.7);">Подтвердите вход в Telegram боте</div>';
+        html += '<div id="tg-confirm-status" style="font-size:1.2em;margin-bottom:1em;">⏳ Ожидание...</div>';
+        html += '</div>';
+
+        Lampa.Modal.open({
+          title: '',
+          html: $(html),
+          onBack: function () {
+            Lampa.Modal.close();
+            Lampa.Activity.backward();
+          }
+        });
+
+        // Poll every 2 seconds.
+        var pollCount = 0;
+        var pollInterval = setInterval(function () {
+          pollCount++;
+          if (pollCount > 60) { // 2 min timeout
+            clearInterval(pollInterval);
+            Lampa.Modal.close();
+            Lampa.Noty.show('Время подтверждения истекло', { time: 5000 });
+            return;
+          }
+          $.getJSON(Api.account(pinHost + '/sisi/pin/tg-confirm?id=' + reqId), function (r) {
+            if (r.status === 'allowed') {
+              clearInterval(pollInterval);
+              pinUnlocked = true;
+              Lampa.Modal.close();
+              callback();
+            } else if (r.status === 'denied') {
+              clearInterval(pollInterval);
+              Lampa.Modal.close();
+              Lampa.Noty.show('❌ Доступ запрещён', { time: 5000 });
+              Lampa.Activity.backward();
+            } else if (r.status === 'expired') {
+              clearInterval(pollInterval);
+              Lampa.Modal.close();
+              Lampa.Noty.show('Запрос истёк', { time: 5000 });
+              Lampa.Activity.backward();
+            }
+            // "pending" — keep polling
+          });
+        }, 2000);
+      },
+      error: function () {
+        Lampa.Noty.show('Ошибка отправки запроса', { time: 5000 });
+      }
+    });
+  }
+
+  function Sisi(object) {
+    var comp = new Lampa.InteractionMain(object);
+
+    var origCreate = comp.create;
+    comp.create = function () {
+      var _this = this;
+      this.activity.loader(true);
+      checkPinAndProceed(function () {
+        Api.main(object, _this.build.bind(_this), _this.empty.bind(_this));
+      });
+      return this.render();
+    };
+
+    comp.empty = function (er) {
+      var _this = this;
+
+      var empty = new Lampa.Empty({
+        descr: typeof er == 'string' ? er : Lampa.Lang.translate('empty_text_two')
+      });
+      Lampa.Activity.all().forEach(function (active) {
+        if (_this.activity == active.activity) active.activity.render().find('.activity__body > div')[0].appendChild(empty.render(true));
+      });
+      this.start = empty.start.bind(empty);
+      this.activity.loader(false);
+      this.activity.toggle();
+    };
+
+    comp.onMore = function (data) {
+      Lampa.Activity.push({
+        url: data.url,
+        title: data.title,
+        component: 'sisi_view_' + Defined.use_api,
+        page: 2
+      });
+    };
+
+    comp.onAppend = function (line, element) {
+      line.onAppend = function (card) {
+        var origFocus = card.onFocus;
+
+        card.onFocus = function (target, card_data) {
+          origFocus(target, card_data);
+          Utils.preview(target, card_data);
+        };
+      };
+    };
+
+    return comp;
+  }
+
+  function View(object) {
+    var comp = new Lampa.InteractionCategory(object);
+    var menu;
+
+    comp.create = function () {
+      var _this = this;
+
+      this.activity.loader(true);
+      Api.view(object, function (data) {
+        menu = data.menu;
+
+        if (menu) {
+          menu.forEach(function (m) {
+            if (!m) return;
+            var rawTitle = m.title === undefined || m.title === null ? '' : String(m.title);
+            var spl = rawTitle.split(':');
+            m.title = spl[0].trim();
+            if (spl[1]) m.subtitle = Lampa.Utils.capitalizeFirstLetter(spl[1].trim().replace(/all/i, 'Любой'));
+
+            if (m.submenu && Array.isArray(m.submenu)) {
+              m.submenu.forEach(function (s) {
+                if (!s) return;
+                var subTitle = s.title === undefined || s.title === null ? '' : String(s.title);
+                s.title = Lampa.Utils.capitalizeFirstLetter(subTitle.trim().replace(/all/i, 'Любой'));
+              });
+            }
+          });
+        }
+
+        _this.build(data);
+
+        comp.render().find('.category-full').addClass('mapping--grid cols--3');
+
+        if (!data.results.length && object.url.indexOf('/bookmarks')) {
+          Lampa.Noty.show('Удерживайте ОК на видео для добавления в закладки.', {
+            time: 10000
+          });
+        }
+      }, this.empty.bind(this));
+    };
+
+    comp.nextPageReuest = function (object, resolve, reject) {
+      Api.view(object, resolve.bind(this), reject.bind(this));
+    };
+
+    comp.cardRender = function (object, element, card) {
+      card.onMenu = function (target, card_data) {
+        return Utils.menu(target, card_data);
+      };
+
+      card.onEnter = function () {
+        Utils.hidePreview();
+        Utils.play(element);
+      };
+
+      var origFocus = card.onFocus;
+
+      card.onFocus = function (target, card_data) {
+        origFocus(target, card_data);
+        Utils.preview(target, element);
+      };
+    };
+
+    comp.filter = function () {
+      if (menu) {
+        var items = menu.filter(function (m) {
+          return m && !m.search_on;
+        });
+        var search = menu.find(function (m) {
+          return m && m.search_on;
+        });
+        if (!search) search = object.search_start;
+        if (!items.length && !search) return;
+
+        if (search) {
+          Lampa.Arrays.insert(items, 0, {
+            title: 'Найти',
+            onSelect: function onSelect() {
+              $('body').addClass('ambience--enable')
+              Lampa.Input.edit({
+                title: 'Поиск',
+                value: '',
+                free: true,
+                nosave: true
+              }, function (value) {
+                $('body').removeClass('ambience--enable')
+                Lampa.Controller.toggle('content');
+
+                if (value) {
+                  var searchUrl = search && typeof search.playlist_url === 'string' ? search.playlist_url : '';
+                  if (!searchUrl) return;
+                  var separator = searchUrl.indexOf('?') !== -1 ? '&' : '?';
+                  Lampa.Activity.push({
+                    url: searchUrl + separator + 'search=' + encodeURIComponent(value),
+                    title: 'Поиск - ' + value,
+                    component: 'sisi_view_' + Defined.use_api,
+                    search_start: search,
+                    page: 1
+                  });
+                }
+              });
+            }
+          });
+        }
+
+        Lampa.Select.show({
+          title: 'Фильтр',
+          items: items,
+          onBack: function onBack() {
+            Lampa.Controller.toggle('content');
+          },
+          onSelect: function onSelect(a) {
+            menu.forEach(function (m) {
+              if (!m) return;
+              m.selected = m == a ? true : false;
+            });
+
+            if (a && a.submenu) {
+              Lampa.Select.show({
+                title: a.title,
+                items: a.submenu,
+                onBack: function onBack() {
+                  comp.filter();
+                },
+                onSelect: function onSelect(b) {
+                  if (!b || !b.playlist_url) return;
+                  Lampa.Activity.push({
+                    title: object.title,
+                    url: b.playlist_url,
+                    component: 'sisi_view_' + Defined.use_api,
+                    page: 1
+                  });
+                }
+              });
+            } else {
+              comp.filter();
+            }
+          }
+        });
+      }
+    };
+
+    comp.onRight = comp.filter.bind(comp);
+    return comp;
+  }
+
+  var Search = {
+    title: 'Клубничка',
+    search: function search(params, oncomplite) {
+      network.silent('{localhost}/rch/check/connected', function (json) {
+        if (json.rch) {
+          rchRun(json, function () {
+            Api.search(params, oncomplite);
+          });
+        } else {
+          Api.search(params, oncomplite);
+        }
+      }, function () {
+        oncomplite([]);
+      });
+    },
+    onCancel: function onCancel() {
+      Api.clear();
+    },
+    params: {
+      lazy: true,
+      align_left: true,
+      card_events: {
+        onMenu: function onMenu() { }
+      }
+    },
+    onMore: function onMore(params, close) {
+      close();
+      var url = Lampa.Utils.addUrlComponent(params.data.url, 'search=' + encodeURIComponent(params.query));
+      Lampa.Activity.push({
+        url: url,
+        title: 'Поиск - ' + params.query,
+        component: 'sisi_view_' + Defined.use_api,
+        page: 2
+      });
+    },
+    onSelect: function onSelect(params, close) {
+      Utils.play(params.element);
+    },
+    onAppend: function onAppend(card) {
+      card.render().addClass('card--collection');
+    }
+  };
+
+
+  function startPlugin() {
+    window['plugin_sisi_' + Defined.use_api + '_ready'] = true;
+    var unic_id = Lampa.Storage.get('sisi_unic_id', '');
+
+    if (!unic_id) {
+      unic_id = Lampa.Utils.uid(8).toLowerCase();
+      Lampa.Storage.set('sisi_unic_id', unic_id);
+    }
+
+    Lampa.Component.add('sisi_' + Defined.use_api, Sisi);
+    Lampa.Component.add('sisi_view_' + Defined.use_api, View);
+    //addSourceSearch();
+    Lampa.Search.addSource(Search);
+
+    function showCategoryFilter() {
+      var host = Defined.localhost || window.location.origin;
+      var catUrl = host.replace(/\/sisi\/?$/, '') + '/sisi/categories';
+      $.getJSON(catUrl, function (cats) {
+        if (!cats || !cats.length) return;
+        var items = [{ title: 'Все', key: '' }].concat(cats.map(function (c) {
+          return { title: c.title, key: c.key };
+        }));
+        Lampa.Select.show({
+          title: 'Категория',
+          items: items,
+          onBack: function () { Lampa.Controller.toggle('content'); },
+          onSelect: function (a) {
+            Lampa.Activity.push({
+              url: '',
+              title: a.title === 'Все' ? '' : a.title,
+              component: 'sisi_' + Defined.use_api,
+              page: 1,
+              category: a.key
+            });
+          }
+        });
+      });
+    }
+
+    function addFilter() {
+      var activi;
+      var timer;
+      var button = $("<div class=\"head__action head__settings selector\">\n            <svg height=\"36\" viewBox=\"0 0 38 36\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n                <rect x=\"1.5\" y=\"1.5\" width=\"35\" height=\"33\" rx=\"1.5\" stroke=\"currentColor\" stroke-width=\"3\"></rect>\n                <rect x=\"7\" y=\"8\" width=\"24\" height=\"3\" rx=\"1.5\" fill=\"currentColor\"></rect>\n                <rect x=\"7\" y=\"16\" width=\"24\" height=\"3\" rx=\"1.5\" fill=\"currentColor\"></rect>\n                <rect x=\"7\" y=\"25\" width=\"24\" height=\"3\" rx=\"1.5\" fill=\"currentColor\"></rect>\n                <circle cx=\"13.5\" cy=\"17.5\" r=\"3.5\" fill=\"currentColor\"></circle>\n                <circle cx=\"23.5\" cy=\"26.5\" r=\"3.5\" fill=\"currentColor\"></circle>\n                <circle cx=\"21.5\" cy=\"9.5\" r=\"3.5\" fill=\"currentColor\"></circle>\n            </svg>\n        </div>");
+      function onFilterPress() {
+        var cur = activi || Lampa.Activity.active();
+        if (cur && cur.component === sisiViewComp) {
+          // Individual source view — use its native filter
+          var comp;
+          try {
+            comp = Lampa.Manifest.app_digital >= 300 ? cur.activity.component : cur.activity.component();
+          } catch(e) { comp = null; }
+          if (comp && typeof comp.filter === 'function') {
+            comp.filter();
+            return;
+          }
+        }
+        // ALL tab or fallback — global category filter
+        showCategoryFilter();
+      }
+      button.hide().on('hover:enter', onFilterPress).on('click', onFilterPress);
+      $('.head .open--search').after(button);
+      var sisiViewComp = 'sisi_view_' + Defined.use_api;
+      var sisiMainComp = 'sisi_' + Defined.use_api;
+      Lampa.Listener.follow('activity', function (e) {
+        if (e.type == 'start') activi = e.object;
+        clearTimeout(timer);
+        timer = setTimeout(function () {
+          if (activi) {
+            if (activi.component !== sisiViewComp && activi.component !== sisiMainComp) {
+              button.hide();
+              activi = false;
+            }
+          }
+        }, 1000);
+
+        if (e.type == 'start' && (e.component == sisiViewComp || e.component == sisiMainComp)) {
+          button.show();
+          activi = e.object;
+        }
+      });
+    }
+
+    function addSettings() {
+      if (window.sisi_add_param_ready) return;
+      window.sisi_add_param_ready = true;
+      Lampa.SettingsApi.addComponent({
+        component: 'sisi',
+        name: Lampa.Lang.translate('lampac_sisiname'),
+        icon: "<svg width=\"200\" height=\"243\" viewBox=\"0 0 200 243\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\"><path d=\"M187.714 130.727C206.862 90.1515 158.991 64.2019 100.983 64.2019C42.9759 64.2019 -4.33044 91.5669 10.875 130.727C26.0805 169.888 63.2501 235.469 100.983 234.997C138.716 234.526 168.566 171.303 187.714 130.727Z\" stroke=\"currentColor\" stroke-width=\"15\"/><path d=\"M102.11 62.3146C109.995 39.6677 127.46 28.816 169.692 24.0979C172.514 56.1811 135.338 64.2018 102.11 62.3146Z\" stroke=\"currentColor\" stroke-width=\"15\"/><path d=\"M90.8467 62.7863C90.2285 34.5178 66.0667 25.0419 31.7127 33.063C28.8904 65.1461 68.8826 62.7863 90.8467 62.7863Z\" stroke=\"currentColor\" stroke-width=\"15\"/><path d=\"M100.421 58.5402C115.627 39.6677 127.447 13.7181 85.2149 9C82.3926 41.0832 83.5258 35.4214 100.421 58.5402Z\" stroke=\"currentColor\" stroke-width=\"15\"/><rect x=\"39.0341\" y=\"98.644\" width=\"19.1481\" height=\"30.1959\" rx=\"9.57407\" fill=\"currentColor\"/><rect x=\"90.8467\" y=\"92.0388\" width=\"19.1481\" height=\"30.1959\" rx=\"9.57407\" fill=\"currentColor\"/><rect x=\"140.407\" y=\"98.644\" width=\"19.1481\" height=\"30.1959\" rx=\"9.57407\" fill=\"currentColor\"/><rect x=\"116.753\" y=\"139.22\" width=\"19.1481\" height=\"30.1959\" rx=\"9.57407\" fill=\"currentColor\"/><rect x=\"64.9404\" y=\"139.22\" width=\"19.1481\" height=\"30.1959\" rx=\"9.57407\" fill=\"currentColor\"/><rect x=\"93.0994\" y=\"176.021\" width=\"19.1481\" height=\"30.1959\" rx=\"9.57407\" fill=\"currentColor\"/></svg>"
+      });
+      Lampa.SettingsApi.addParam({
+        component: 'sisi',
+        param: {
+          name: 'sisi_preview',
+          type: 'trigger',
+          values: '',
+          "default": true
+        },
+        field: {
+          name: 'Предпросмотр',
+          description: 'Показывать предпросмотр при наведение на карточку'
+        },
+        onRender: function onRender(item) { }
+      });
+      Lampa.SettingsApi.addParam({
+        component: 'sisi',
+        param: {
+          name: 'sisi_history',
+          type: 'trigger',
+          values: '',
+          "default": true
+        },
+        field: {
+          name: 'История',
+          description: 'Сохранять историю просмотров'
+        },
+        onRender: function onRender(item) { }
+      });
+
+      // PIN parental control settings
+      Lampa.SettingsApi.addParam({
+        component: 'sisi',
+        param: {
+          name: 'sisi_pin_manage',
+          type: 'trigger',
+          values: '',
+          "default": true
+        },
+        field: {
+          name: '🔐 Родительский контроль',
+          description: 'Установить PIN-код или подтверждение через Telegram'
+        },
+        onRender: function onRender(item) {
+          item.on('hover:enter', function () {
+            Lampa.Select.show({
+              title: '🔐 Родительский контроль',
+              items: [
+                { title: 'Установить PIN (6 цифр)', action: 'set' },
+                { title: 'Подтверждение через Telegram', action: 'tg_confirm' },
+                { title: 'Убрать защиту', action: 'remove' }
+              ],
+              onBack: function () { Lampa.Controller.toggle('settings'); },
+              onSelect: function (a) {
+                if (a.action === 'tg_confirm') {
+                  $.ajax({
+                    url: Api.account(pinHost + '/sisi/pin/set'),
+                    type: 'POST', contentType: 'application/json',
+                    data: JSON.stringify({ pin: '', method: 'tg_confirm' }),
+                    success: function (d) {
+                      if (d.success) Lampa.Noty.show('Подтверждение через Telegram включено');
+                      else Lampa.Noty.show(d.error || 'Ошибка');
+                    }
+                  });
+                } else if (a.action === 'set') {
+                  (function() {
+                    var newPin = '';
+                    var html = '<div style="padding:1.5em;text-align:center;">';
+                    html += '<div style="font-size:1.3em;font-weight:700;margin-bottom:0.6em;">Установить PIN-код</div>';
+                    html += '<div style="margin-bottom:0.8em;color:rgba(255,255,255,0.6);">Введите 6 цифр</div>';
+                    html += '<div id="set-pin-display" style="font-size:2.2em;letter-spacing:0.5em;margin-bottom:0.8em;">______</div>';
+                    html += '<div style="display:flex;flex-wrap:wrap;justify-content:center;gap:0.3em;max-width:14em;margin:0 auto;">';
+                    for (var i = 1; i <= 9; i++) {
+                      html += '<div class="set-pin-btn selector" data-digit="' + i + '" style="width:3.2em;height:3.2em;display:flex;align-items:center;justify-content:center;font-size:1.4em;font-weight:700;background:rgba(255,255,255,0.1);border-radius:0.5em;cursor:pointer;">' + i + '</div>';
+                    }
+                    html += '<div style="width:3.2em;height:3.2em;"></div>';
+                    html += '<div class="set-pin-btn selector" data-digit="0" style="width:3.2em;height:3.2em;display:flex;align-items:center;justify-content:center;font-size:1.4em;font-weight:700;background:rgba(255,255,255,0.1);border-radius:0.5em;cursor:pointer;">0</div>';
+                    html += '<div class="set-pin-btn selector" data-action="clear" style="width:3.2em;height:3.2em;display:flex;align-items:center;justify-content:center;font-size:1.1em;background:rgba(255,255,255,0.05);border-radius:0.5em;cursor:pointer;">⌫</div>';
+                    html += '</div></div>';
+                    Lampa.Modal.open({
+                      title: '',
+                      html: $(html),
+                      onBack: function () { Lampa.Modal.close(); Lampa.Controller.toggle('settings'); }
+                    });
+                    function updateDisp() {
+                      var d = '';
+                      for (var i = 0; i < 6; i++) d += i < newPin.length ? '●' : '_';
+                      $('#set-pin-display').text(d);
+                    }
+                    $('.set-pin-btn').on('hover:enter', function () {
+                      var digit = $(this).data('digit');
+                      var action = $(this).data('action');
+                      if (action === 'clear') { newPin = newPin.slice(0, -1); updateDisp(); }
+                      else if (digit !== undefined && newPin.length < 6) {
+                        newPin += String(digit);
+                        updateDisp();
+                        if (newPin.length === 6) {
+                          setTimeout(function () {
+                            $.ajax({
+                              url: Api.account(pinHost + '/sisi/pin/set'),
+                              type: 'POST', contentType: 'application/json',
+                              data: JSON.stringify({ pin: newPin }),
+                              success: function (d) {
+                                Lampa.Modal.close();
+                                if (d.success) Lampa.Noty.show('PIN установлен');
+                                else Lampa.Noty.show(d.error || 'Ошибка');
+                              }
+                            });
+                          }, 300);
+                        }
+                      }
+                    });
+                    updateDisp();
+                  })();
+                } else {
+                  // Require confirmation before removing protection.
+                  function doRemove() {
+                    $.ajax({
+                      url: Api.account(pinHost + '/sisi/pin/remove'),
+                      type: 'POST', contentType: 'application/json', data: '{}',
+                      success: function (d) {
+                        if (d.success) { pinUnlocked = true; Lampa.Noty.show('Защита убрана'); }
+                        else Lampa.Noty.show(d.error || 'Ошибка');
+                      }
+                    });
+                  }
+                  // Check current method and require auth.
+                  $.getJSON(Api.account(pinHost + '/sisi/pin/status'), function (st) {
+                    if (!st.has_pin) { doRemove(); return; }
+                    if (st.method === 'tg_confirm') {
+                      // TG confirm to remove.
+                      showTGConfirmModal(doRemove);
+                    } else {
+                      // PIN confirm to remove.
+                      showPinModal(doRemove);
+                    }
+                  });
+                }
+              }
+            });
+          });
+        }
+      });
+    }
+
+    function add() {
+      var button = $("<li class=\"menu__item selector\" data-action=\"sisi\">\n            <div class=\"menu__ico\">\n                <svg width=\"200\" height=\"243\" viewBox=\"0 0 200 243\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\"><path d=\"M187.714 130.727C206.862 90.1515 158.991 64.2019 100.983 64.2019C42.9759 64.2019 -4.33044 91.5669 10.875 130.727C26.0805 169.888 63.2501 235.469 100.983 234.997C138.716 234.526 168.566 171.303 187.714 130.727Z\" stroke=\"currentColor\" stroke-width=\"15\"/><path d=\"M102.11 62.3146C109.995 39.6677 127.46 28.816 169.692 24.0979C172.514 56.1811 135.338 64.2018 102.11 62.3146Z\" stroke=\"currentColor\" stroke-width=\"15\"/><path d=\"M90.8467 62.7863C90.2285 34.5178 66.0667 25.0419 31.7127 33.063C28.8904 65.1461 68.8826 62.7863 90.8467 62.7863Z\" stroke=\"currentColor\" stroke-width=\"15\"/><path d=\"M100.421 58.5402C115.627 39.6677 127.447 13.7181 85.2149 9C82.3926 41.0832 83.5258 35.4214 100.421 58.5402Z\" stroke=\"currentColor\" stroke-width=\"15\"/><rect x=\"39.0341\" y=\"98.644\" width=\"19.1481\" height=\"30.1959\" rx=\"9.57407\" fill=\"currentColor\"/><rect x=\"90.8467\" y=\"92.0388\" width=\"19.1481\" height=\"30.1959\" rx=\"9.57407\" fill=\"currentColor\"/><rect x=\"140.407\" y=\"98.644\" width=\"19.1481\" height=\"30.1959\" rx=\"9.57407\" fill=\"currentColor\"/><rect x=\"116.753\" y=\"139.22\" width=\"19.1481\" height=\"30.1959\" rx=\"9.57407\" fill=\"currentColor\"/><rect x=\"64.9404\" y=\"139.22\" width=\"19.1481\" height=\"30.1959\" rx=\"9.57407\" fill=\"currentColor\"/><rect x=\"93.0994\" y=\"176.021\" width=\"19.1481\" height=\"30.1959\" rx=\"9.57407\" fill=\"currentColor\"/></svg>\n            </div>\n            <div class=\"menu__text\">" + Lampa.Lang.translate('lampac_sisiname') + "</div>\n        </li>");
+
+      if (Defined.use_api == 'pwa') {
+        var pw = $('<div>p</div>');
+        pw.css({
+          position: 'absolute',
+          right: '-0.3em',
+          bottom: '-0.5em',
+          backgroundColor: '#fff',
+          color: '#000',
+          padding: '0.2em 0.4em',
+          fontSize: '0.6em',
+          borderRadius: '0.5em',
+          fontWeight: 900,
+          textTransform: 'uppercase'
+        });
+        button.find('.menu__ico').css('position', 'relative').append(pw);
+      }
+
+      button.on('hover:enter', function () {
+        // Проверка и создание Lampa.ParentalControl, если не существует
+        if (!Lampa.ParentalControl) {
+          Lampa.ParentalControl = {
+            query: function (success, error) {
+              // По умолчанию всегда разрешает доступ
+              if (typeof success === 'function') success();
+            }
+          };
+        }
+        Lampa.ParentalControl.query(function () {
+          Api.menu(function (data) {
+            // let items = [{
+            //     title: 'Все'
+            // }]
+            var items = [];
+
+            if ({push_all} && (Defined.use_api !== 'pwa' || Lampa.Platform.is('android'))) {
+              items.push({
+                title: 'Все'
+              });
+            }
+
+            data.forEach(function (a) {
+              a.title = Utils.sourceTitle(a.title);
+            });
+            items = items.concat(data);
+            Lampa.Select.show({
+              title: 'Сайты',
+              items: items,
+              onSelect: function onSelect(a) {
+                if (a.playlist_url) {
+                  Lampa.Activity.push({
+                    url: a.playlist_url,
+                    title: a.title,
+                    component: 'sisi_view_' + Defined.use_api,
+                    page: 1
+                  });
+                } else {
+                  Lampa.Activity.push({
+                    url: '',
+                    title: Lampa.Lang.translate('lampac_sisiname'),
+                    component: 'sisi_' + Defined.use_api,
+                    page: 1
+                  });
+                }
+              },
+              onBack: function onBack() {
+                Lampa.Controller.toggle('menu');
+              }
+            });
+          }, function (e) {
+            if (typeof e == 'string') modal(e)
+          });
+        }, function () { });
+      });
+      $('.menu .menu__list').eq(0).append(button);
+
+    }
+
+    function init() {
+      if (window.lampa_settings.sisi_app) {
+        Api.menu(function (data) {
+          data.forEach(function (a) {
+            a.title = Utils.sourceTitle(a.title);
+
+            Lampa.Menu.addButton('<img src="./img/icons/settings/more.svg">', a.title, function () {
+              if (a.playlist_url) {
+                Lampa.Activity.push({
+                  url: a.playlist_url,
+                  title: a.title,
+                  component: 'sisi_view_' + Defined.use_api,
+                  page: 1
+                });
+              } else {
+                Lampa.Activity.push({
+                  url: '',
+                  title: Lampa.Lang.translate('lampac_sisiname'),
+                  component: 'sisi_' + Defined.use_api,
+                  page: 1
+                });
+              }
+            })
+          });
+        })
+      }
+      else {
+        add()
+      }
+
+      addFilter();
+      addSettings();
+    }
+
+    if (window.appready) init();
+    else {
+      Lampa.Listener.follow('app', function (e) {
+        if (e.type == 'ready') init();
+      });
+    }
+  }
+
+  if (!window['plugin_sisi_' + Defined.use_api + '_ready']) {
+    startPlugin();
+    /*
+    if(Defined.use_api == 'pwa'){
+        let s = document.createElement('script')
+            s.onload = function(){
+                Blazor.start({
+                    loadBootResource: function (type, name, defaultUri, integrity) {
+                        return Defined.framework+'/_framework/' + name
+                    }
+                })
+                  startPlugin()
+            }
+              s.setAttribute('autostart', 'false')
+            s.setAttribute('src', Defined.framework+'/_framework/blazor.webassembly.js')
+        
+            document.body.appendChild(s)
+    }
+    else startPlugin()
+    */
+  }
+
+})();

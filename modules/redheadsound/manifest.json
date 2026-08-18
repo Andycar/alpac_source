@@ -1,0 +1,19 @@
+{
+  "id": "redheadsound",
+  "name": "Red Head Sound",
+  "version": "0.3.0",
+  "author": "lampame",
+  "description": "Red Head Sound (redheadsound1.top) → stloadi-iframe → встроенный Mirage. Работает с datacenter-IP (без residential), требует валидный токен в [online.mirage].",
+  "entry": "index.js",
+  "content_types": ["movie", "serial"],
+  "quality": "FHD",
+  "languages": ["ru"],
+  "tags": ["dubbing"],
+  "config_schema": [
+    {"key": "site",       "label": "URL сайта",         "type": "string", "default": "https://redheadsound1.top"},
+    {"key": "userAgent",  "label": "User-Agent",        "type": "string", "default": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36"},
+    {"key": "yearTolerance", "label": "Допуск по году ±", "type": "int", "default": 1},
+    {"key": "miragePrefix", "label": "Mirage route", "type": "string", "default": "/lite/mirage",
+     "description": "Маршрут встроенного Mirage-балансера. Менять только если у вас он переименован."}
+  ]
+}

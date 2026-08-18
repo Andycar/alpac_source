@@ -1,0 +1,19 @@
+{
+  "id": "eneyida",
+  "name": "Eneyida",
+  "version": "1.0.0",
+  "author": "lampame",
+  "description": "eneyida.tv — украинский сайт с фильмами и сериалами. Плеер HDVBua.",
+  "entry": "index.js",
+  "content_types": ["movie", "serial"],
+  "quality": "FHD",
+  "languages": ["uk", "ru"],
+  "ukrainian": true,
+  "tags": ["ukrainian"],
+  "repository": "https://github.com/lampame/lampac-ukraine",
+  "config_schema": [
+    {"key": "host", "label": "Хост", "type": "string", "default": "https://eneyida.tv"},
+    {"key": "proxyStreams", "label": "Проксировать стримы", "type": "bool", "default": true},
+    {"key": "timeout", "label": "Таймаут HTTP (сек)", "type": "int", "default": 15}
+  ]
+}

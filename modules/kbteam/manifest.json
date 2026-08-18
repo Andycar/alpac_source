@@ -1,0 +1,17 @@
+{
+  "id": "kbteam",
+  "name": "KB-Team (VideoCDN)",
+  "version": "1.0.0",
+  "author": "lampame",
+  "description": "kb-team.club /msx/kinozal/videocdn.php — MSX JSON API. Принимает kinopoisk_id, отдаёт ZeroCDN m3u8 (RU/CIS только).",
+  "entry": "index.js",
+  "content_types": ["movie", "serial"],
+  "quality": "FHD",
+  "languages": ["ru"],
+  "tags": ["videocdn", "msx", "kinopoisk"],
+  "config_schema": [
+    {"key": "apiHost", "label": "API URL", "type": "string", "default": "http://kb-team.club/msx/kinozal/videocdn.php"},
+    {"key": "proxyStreams", "label": "Проксировать стримы", "type": "bool", "default": true},
+    {"key": "cacheTTL", "label": "Кэш ответов (сек)", "type": "int", "default": 1800, "description": "Auth-токены в URL валидны ~1 час"}
+  ]
+}

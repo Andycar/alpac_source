@@ -1,0 +1,96 @@
+# Default values for lampac-go.
+
+replicaCount: 1
+
+image:
+  # Set to your published image, e.g. ghcr.io/<owner>/lampac-go.
+  repository: ghcr.io/alcopa/lampac-go
+  tag: ""          # defaults to .Chart.appVersion
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+# lampac-go listen port (LAMPAC_GO_ADDR=:<port>).
+listenPort: 18118
+
+# Repo root — where lampac-go keeps config, database, cache, plugins, wwwroot.
+# The persistence volume mounts here.
+repoRoot: /opt/lampac
+
+# Extra environment variables (e.g. tokens, tuning).
+env: {}
+  # LAMPAC_GO_LOCAL_CORE: "true"
+
+# Mount a config.toml from a ConfigMap this chart creates. When false, the
+# image's default config is used and you manage config out-of-band.
+config:
+  create: false
+  # Raw config.toml contents (only used when create: true).
+  toml: |
+    [server]
+    addr = ":18118"
+
+# Persistent state (config/database/cache/data). Strongly recommended — without
+# it, watch history / tokens / caches are lost on pod restart.
+persistence:
+  enabled: true
+  # existingClaim: my-pvc     # use a pre-created PVC instead of creating one
+  storageClass: ""
+  accessMode: ReadWriteOnce
+  size: 10Gi
+
+service:
+  type: ClusterIP
+  port: 18118
+  annotations: {}
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: lampac.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+resources: {}
+  # limits:
+  #   cpu: "2"
+  #   memory: 2Gi
+  # requests:
+  #   cpu: 500m
+  #   memory: 512Mi
+
+# HTTP probes hit lampac-go's built-in /healthz (live) and /readyz (ready).
+livenessProbe:
+  httpGet:
+    path: /healthz
+    port: http
+  initialDelaySeconds: 20
+  periodSeconds: 15
+readinessProbe:
+  httpGet:
+    path: /readyz
+    port: http
+  initialDelaySeconds: 10
+  periodSeconds: 10
+
+podAnnotations: {}
+podSecurityContext:
+  fsGroup: 1000
+securityContext: {}
+  # runAsNonRoot: true
+  # runAsUser: 1000
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# Cluster mode — lampac-go can distribute outbound balancer fetches across
+# several nodes that share an X-Cluster-Key. Set replicaCount > 1 and configure
+# the [cluster] section (shared key) via `config.toml` / `env`. This chart does
+# not fabricate the key wiring; see internal/cluster + config `[cluster]`.

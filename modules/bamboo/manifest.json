@@ -1,0 +1,19 @@
+{
+  "id": "bamboo",
+  "name": "Bamboo",
+  "version": "1.0.0",
+  "author": "lampame",
+  "description": "bambooua.com — аниме и дорамы с украинскими субтитрами и озвучкой.",
+  "entry": "index.js",
+  "content_types": ["serial", "movie"],
+  "quality": "FHD",
+  "languages": ["uk", "ru", "ja", "ko"],
+  "ukrainian": true,
+  "anime": true,
+  "tags": ["ukrainian", "anime", "dorama"],
+  "repository": "https://github.com/lampame/lampac-ukraine/tree/main/LME.Bamboo",
+  "config_schema": [
+    {"key": "host", "label": "Хост", "type": "string", "default": "https://bambooua.com"},
+    {"key": "proxyStreams", "label": "Проксировать стримы", "type": "bool", "default": true}
+  ]
+}

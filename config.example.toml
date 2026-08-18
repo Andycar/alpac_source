@@ -1,0 +1,34 @@
+# lampac-go configuration example.
+# Copy to config.toml next to the binary and adjust. Every key is optional —
+# built-in defaults cover a working local install; the admin panel can edit
+# most of this at runtime.
+
+[server]
+# addr = ":18118"
+
+[tmdb_proxy]
+# TMDB metadata/image proxy: "self" proxies through this server.
+# mode = "self"
+
+[online]
+# Per-source settings live under [online.<source>]. Sources that need
+# affiliate credentials (alloha, mirage, …) stay off until you supply your own
+# token, e.g.:
+#
+# [online.alloha]
+# token = "your-alloha-affiliate-token"
+# link_host = "https://your-player-domain.example"
+
+[telegram]
+# Telegram-bot auth (optional). Create a bot via @BotFather.
+# bot_token = ""
+# bot_name  = ""
+# admin_id  = 0
+
+[admin]
+# Password for the admin panel when Telegram auth is not configured.
+# password = ""
+
+[updater]
+# Self-update server (optional). Leave empty to disable self-update.
+# server_url = ""

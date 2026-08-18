@@ -1,0 +1,11 @@
+{{- if .Values.config.create }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "lampac-go.fullname" . }}-config
+  labels:
+    {{- include "lampac-go.labels" . | nindent 4 }}
+data:
+  config.toml: |
+{{ .Values.config.toml | indent 4 }}
+{{- end }}

@@ -1,0 +1,22 @@
+lampac-go is deploying.
+
+1. Watch the pod come up:
+     kubectl -n {{ .Release.Namespace }} rollout status deploy/{{ include "lampac-go.fullname" . }}
+
+2. Reach it:
+{{- if .Values.ingress.enabled }}
+   {{- range .Values.ingress.hosts }}
+     http://{{ .host }}
+   {{- end }}
+{{- else if eq .Values.service.type "ClusterIP" }}
+     kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "lampac-go.fullname" . }} {{ .Values.service.port }}:{{ .Values.service.port }}
+     open http://127.0.0.1:{{ .Values.service.port }}
+{{- else }}
+     kubectl -n {{ .Release.Namespace }} get svc {{ include "lampac-go.fullname" . }}
+{{- end }}
+
+{{- if not .Values.persistence.enabled }}
+
+WARNING: persistence is disabled — watch history, tokens and caches are lost on
+every pod restart. Set persistence.enabled=true for anything but a quick test.
+{{- end }}

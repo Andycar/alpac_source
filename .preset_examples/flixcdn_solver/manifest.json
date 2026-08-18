@@ -1,0 +1,62 @@
+{
+  "id": "flixcdn_solver",
+  "name": "FlixCDN Turnstile solver",
+  "version": "1.1.1",
+  "author": "lampac-go",
+  "module_type": "env_preset",
+  "description": "Python-микросервис на порту {{listen_port}}: undetected-chromedriver проходит Cloudflare Turnstile на FlixCDN. Lampac-go дёргает GET /solve?url=... когда нужно получить file_string.",
+  "tags": ["preset", "cloudflare", "turnstile", "flixcdn"],
+  "params": [
+    {
+      "key": "listen_port",
+      "label": "Порт solver-сервиса",
+      "type": "int",
+      "default": 7880,
+      "min": 1024,
+      "max": 65535,
+      "description": "Порт на котором solver слушает /solve запросы."
+    },
+    {
+      "key": "chrome_version",
+      "label": "Chrome major version",
+      "type": "int",
+      "default": 146,
+      "description": "Версия Chrome для undetected-chromedriver. По умолчанию 146 — должна совпадать с установленным `chromium --version`."
+    },
+    {
+      "key": "display_num",
+      "label": "Xvfb DISPLAY",
+      "type": "int",
+      "default": 99,
+      "description": "Номер виртуального дисплея (Xvfb должен быть запущен на этом DISPLAY)."
+    }
+  ],
+  "files": [
+    {
+      "src": "flixcdn_solver.py",
+      "dst": "{{lampac_root}}/pac/flixcdn_solver.py",
+      "mode": "0755",
+      "template": true
+    },
+    {
+      "src": "flixcdn-solver.service",
+      "dst": "/etc/systemd/system/flixcdn-solver.service",
+      "mode": "0644",
+      "template": true,
+      "needs_root": true
+    }
+  ],
+  "deps": {
+    "apt": ["xvfb", "chromium", "python3-pip"],
+    "pip": ["undetected-chromedriver", "selenium"]
+  },
+  "ports": [7880],
+  "post_install": [
+    "systemctl daemon-reload",
+    "systemctl enable --now flixcdn-solver"
+  ],
+  "post_uninstall": [
+    "systemctl disable --now flixcdn-solver"
+  ],
+  "requires_root": true
+}

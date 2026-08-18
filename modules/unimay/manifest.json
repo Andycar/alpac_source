@@ -1,0 +1,19 @@
+{
+  "id": "unimay",
+  "name": "Unimay",
+  "version": "1.0.0",
+  "author": "lampame",
+  "description": "Unimay (api.unimay.media) — украинская озвучка аниме от релиз-группы Unimay.",
+  "entry": "index.js",
+  "content_types": ["movie", "serial"],
+  "quality": "FHD",
+  "languages": ["uk"],
+  "ukrainian": true,
+  "anime": true,
+  "tags": ["ukrainian", "anime"],
+  "repository": "https://github.com/lampame/lampac-ukraine/tree/main/LME.Unimay",
+  "config_schema": [
+    {"key": "host", "label": "Хост API", "type": "string", "default": "https://api.unimay.media/v1"},
+    {"key": "proxyStreams", "label": "Проксировать стримы", "type": "bool", "default": true}
+  ]
+}

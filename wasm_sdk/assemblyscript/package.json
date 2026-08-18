@@ -1,0 +1,10 @@
+{
+  "name": "@lampac/sdk",
+  "version": "0.1.0",
+  "private": true,
+  "description": "AssemblyScript SDK for lampac-go WASM plugins",
+  "files": ["assembly/lampac.ts"],
+  "exports": {
+    ".": "./assembly/lampac.ts"
+  }
+}

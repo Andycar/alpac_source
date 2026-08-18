@@ -1,0 +1,18 @@
+{
+  "id": "fapguru",
+  "name": "Fap-Guru.pro",
+  "version": "0.1.0",
+  "author": "lampac-go",
+  "description": "SISI JS-источник для x.fap-guru.pro. Категории по пути /categories/{slug}/.",
+  "icon": "🍆",
+  "tags": ["sisi", "tube"],
+  "languages": ["ru"],
+  "quality": "720p",
+  "default_transport": "default",
+  "default_balancer": "fapguru",
+  "host_defaults": "https://x.fap-guru.pro",
+  "config_schema": [
+    { "key": "site_host", "label": "Хост сайта", "type": "string", "default": "x.fap-guru.pro" },
+    { "key": "user_agent", "label": "User-Agent", "type": "string", "default": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36" }
+  ]
+}

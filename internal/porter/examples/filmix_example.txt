@@ -1,0 +1,95 @@
+// Standalone balancer: filmix (category: api)
+// Pattern: JSON API search → post details → player_links
+package main
+
+import (
+	"encoding/json"
+	"flag"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"net/url"
+	"strings"
+	"sync"
+	"time"
+)
+
+const balancerName = "filmix"
+var defaultHost = "https://filmixapp.cyou"
+
+type searchItem struct { ID int `json:"id"`; Title string `json:"title"` }
+type postResponse struct { PlayerLinks struct { Movie []struct { Link string `json:"link"`; Translation string `json:"translation"` } `json:"movie"` } `json:"player_links"` }
+
+type cacheItem struct { value any; expiresAt time.Time }
+type simpleCache struct { mu sync.RWMutex; items map[string]cacheItem }
+func newCache() *simpleCache { return &simpleCache{items: make(map[string]cacheItem)} }
+func (c *simpleCache) get(k string) (any, bool) { c.mu.RLock(); defer c.mu.RUnlock(); i,ok:=c.items[k]; if !ok||time.Now().After(i.expiresAt){return nil,false}; return i.value,true }
+func (c *simpleCache) set(k string, v any, ttl time.Duration) { c.mu.Lock(); c.items[k]=cacheItem{v,time.Now().Add(ttl)}; c.mu.Unlock() }
+
+type server struct { client *http.Client; host, mainHost, token string; cache *simpleCache }
+
+func main() {
+	port := flag.Int("port", 50100, "listen port")
+	mainHost := flag.String("main-host", "", "main server")
+	host := flag.String("host", "", "upstream override")
+	token := flag.String("token", "", "API token")
+	flag.Parse()
+	h := defaultHost; if *host!="" { h=strings.TrimRight(*host,"/") }
+	s := &server{client:&http.Client{Timeout:20*time.Second}, host:h, mainHost:*mainHost, token:*token, cache:newCache()}
+	mux := http.NewServeMux(); mux.HandleFunc("/", s.handle)
+	addr := fmt.Sprintf("127.0.0.1:%d", *port)
+	log.Printf("%s: listening on %s", balancerName, addr)
+	log.Fatal(http.ListenAndServe(addr, mux))
+}
+
+func (s *server) handle(w http.ResponseWriter, r *http.Request) {
+	log.Printf("%s: %s %s", balancerName, r.Method, r.URL.String())
+	q := r.URL.Query()
+	if q.Get("checksearch")=="true"||q.Get("checksearch")=="1" { s.checkSearch(w,r); return }
+	s.index(w, r)
+}
+
+func (s *server) checkSearch(w http.ResponseWriter, r *http.Request) {
+	title := strings.TrimSpace(r.URL.Query().Get("title"))
+	if title==""||s.token=="" { respondJSON(w,map[string]any{"rch":false}); return }
+	respondJSON(w, map[string]any{"rch": len(s.search(title))>0})
+}
+
+func (s *server) search(q string) []searchItem {
+	if c,ok:=s.cache.get("s:"+q); ok { return c.([]searchItem) }
+	body,err:=s.fetch(s.host+"/api/v2/search?"+url.Values{"story":{q},"token":{s.token}}.Encode(), "")
+	if err!=nil { return nil }
+	var items []searchItem; if json.Unmarshal([]byte(body),&items)!=nil { return nil }
+	if len(items)>0 { s.cache.set("s:"+q, items, 20*time.Minute) }
+	return items
+}
+
+func (s *server) index(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query(); rjson := q.Get("rjson")=="true"||q.Get("rjson")=="1"
+	title := strings.TrimSpace(q.Get("title")); origTitle := strings.TrimSpace(q.Get("original_title"))
+	items := s.search(title); if len(items)==0 && origTitle!="" { items=s.search(origTitle) }
+	if len(items)==0 { respondEmpty(w,rjson); return }
+	body,err:=s.fetch(fmt.Sprintf("%s/api/v2/post/%d?token=%s",s.host,items[0].ID,s.token), "")
+	if err!=nil { respondEmpty(w,rjson); return }
+	var post postResponse; if json.Unmarshal([]byte(body),&post)!=nil||len(post.PlayerLinks.Movie)==0 { respondEmpty(w,rjson); return }
+	data := make([]map[string]any,0)
+	for _,m := range post.PlayerLinks.Movie { if m.Link=="" { continue }; data=append(data,map[string]any{"method":"play","url":m.Link,"stream":m.Link,"name":m.Translation,"title":joinName(title,origTitle)}) }
+	if rjson { respondJSON(w,map[string]any{"type":"movie","data":data}); return }
+	var sb strings.Builder; sb.WriteString(`<div class="videos__line">`)
+	for _,row := range data { sb.WriteString(`<div class="videos__item videos__movie selector" data-json='`+escapeAttr(row)+`'><div class="videos__item-imgbox videos__movie-imgbox"></div><div class="videos__item-title">`+fmt.Sprint(row["name"])+`</div></div>`) }
+	sb.WriteString(`</div>`); respondHTML(w,sb.String())
+}
+
+func (s *server) fetch(u, ref string) (string, error) {
+	req,_:=http.NewRequest(http.MethodGet,u,nil); req.Header.Set("User-Agent","Dalvik/2.1.0 (Linux; U; Android 12; Pixel 5)")
+	if ref!="" { req.Header.Set("Referer",ref) }
+	resp,err:=s.client.Do(req); if err!=nil{return "",err}; defer resp.Body.Close()
+	if resp.StatusCode>=300{return "",fmt.Errorf("status %d",resp.StatusCode)}
+	b,_:=io.ReadAll(io.LimitReader(resp.Body,4<<20)); return string(b),nil
+}
+func respondJSON(w http.ResponseWriter, v any) { w.Header().Set("Content-Type","application/json; charset=utf-8"); json.NewEncoder(w).Encode(v) }
+func respondHTML(w http.ResponseWriter, h string) { w.Header().Set("Content-Type","text/html; charset=utf-8"); w.Write([]byte(h)) }
+func respondEmpty(w http.ResponseWriter, rj bool) { if rj{respondJSON(w,map[string]any{"type":"empty","data":[]any{}});return}; respondHTML(w,"") }
+func joinName(t,o string) string { if o!=""&&o!=t{return t+" / "+o}; return t }
+func escapeAttr(v any) string { b,_:=json.Marshal(v); return strings.ReplaceAll(string(b),"'","&#39;") }

@@ -1,0 +1,184 @@
+// Standalone balancer: uaflix (category: dle)
+// Pattern: DLE search → film page → iframe CDN player → stream URL
+// Key: method:"call" for indirect URLs, similar=false auto-select, checksearch by title (no kinopoisk_id)
+package main
+
+import (
+	"encoding/json"
+	"flag"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"net/url"
+	"regexp"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+)
+
+const balancerName = "uaflix"
+var defaultHost = "https://uaflix.net"
+
+type cacheItem struct { value any; expiresAt time.Time }
+type simpleCache struct { mu sync.RWMutex; items map[string]cacheItem }
+func newCache() *simpleCache { return &simpleCache{items: make(map[string]cacheItem)} }
+func (c *simpleCache) get(k string) (any, bool) { c.mu.RLock(); defer c.mu.RUnlock(); i, ok := c.items[k]; if !ok||time.Now().After(i.expiresAt){return nil,false}; return i.value,true }
+func (c *simpleCache) set(k string, v any, ttl time.Duration) { c.mu.Lock(); c.items[k]=cacheItem{v,time.Now().Add(ttl)}; c.mu.Unlock() }
+
+type server struct { client *http.Client; host, mainHost, token string; cache *simpleCache }
+type SearchResult struct { Title, Url, PosterUrl string; Year int }
+
+// DLE search result parsing regexps
+var reSearchItem = regexp.MustCompile(`(?is)<a[^>]+class="sres-wrap[^"]*"[^>]+href="([^"]+)"[^>]*>(.*?)</a>`)
+var reSearchTitle = regexp.MustCompile(`(?is)<h2[^>]*>(.*?)</h2>`)
+var reSearchImg = regexp.MustCompile(`(?is)<img[^>]+src="([^"]+)"`)
+var reYear = regexp.MustCompile(`\((\d{4})\)`)
+var reStripTags = regexp.MustCompile(`<[^>]+>`)
+var reIframe = regexp.MustCompile(`(?i)<iframe[^>]+src=["']([^"']+)["']`)
+var reFile = regexp.MustCompile(`(?i)file["']?\s*:\s*["']([^"']+\.m3u8)`)
+
+func main() {
+	port := flag.Int("port", 50100, "listen port")
+	mainHost := flag.String("main-host", "", "main server")
+	host := flag.String("host", "", "upstream override")
+	token := flag.String("token", "", "API token")
+	flag.Parse()
+	h := defaultHost; if *host != "" { h = strings.TrimRight(*host, "/") }
+	s := &server{client: &http.Client{Timeout: 20*time.Second}, host: h, mainHost: *mainHost, token: *token, cache: newCache()}
+	mux := http.NewServeMux(); mux.HandleFunc("/", s.handle)
+	addr := fmt.Sprintf("127.0.0.1:%d", *port)
+	log.Printf("%s: listening on %s", balancerName, addr)
+	log.Fatal(http.ListenAndServe(addr, mux))
+}
+
+func (s *server) handle(w http.ResponseWriter, r *http.Request) {
+	log.Printf("%s: %s %s", balancerName, r.Method, r.URL.String())
+	q := r.URL.Query()
+	if q.Get("checksearch")=="true"||q.Get("checksearch")=="1" { s.checkSearch(w,r); return }
+	s.index(w, r)
+}
+
+// checkSearch — Lampa sends title, original_title, id (TMDB). No kinopoisk_id for DLE sites!
+func (s *server) checkSearch(w http.ResponseWriter, r *http.Request) {
+	title := strings.TrimSpace(r.URL.Query().Get("title"))
+	if title == "" { title = strings.TrimSpace(r.URL.Query().Get("original_title")) }
+	if title == "" { respondJSON(w, map[string]any{"rch":false}); return }
+	searchUrl := fmt.Sprintf("%s/index.php?do=search&subaction=search&story=%s", s.host, url.QueryEscape(title))
+	body, err := s.fetch(searchUrl, s.host, 8)
+	if err != nil { respondJSON(w, map[string]any{"rch":false}); return }
+	respondJSON(w, map[string]any{"rch": reSearchItem.MatchString(body)})
+}
+
+func (s *server) index(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	rjson := q.Get("rjson")=="true"||q.Get("rjson")=="1"
+	title := strings.TrimSpace(q.Get("title"))
+	origTitle := strings.TrimSpace(q.Get("original_title"))
+	kpID := strings.TrimSpace(q.Get("kinopoisk_id"))
+	href := q.Get("href")
+	play := q.Get("play") == "true"
+	t := q.Get("t")
+
+	// play=true: fetch the actual stream URL and return method:"play"
+	if play {
+		filmUrl := t; if filmUrl == "" { respondEmpty(w,rjson); return }
+		streamUrl := s.extractStream(filmUrl)
+		if streamUrl == "" { respondEmpty(w,rjson); return }
+		respondJSON(w, map[string]any{"method":"play","url":streamUrl,"title":joinName(title,origTitle)})
+		return
+	}
+
+	// similar=false means "auto-select first result, don't show list"
+	similarMode := q.Get("similar") != "false"
+
+	filmUrl := href
+	if filmUrl == "" {
+		results := s.search(kpID, title, origTitle)
+		if len(results) == 0 { respondEmpty(w,rjson); return }
+		// Show similar list only if multiple results AND similarMode
+		if len(results) > 1 && similarMode {
+			data := make([]map[string]any,0)
+			for _,res := range results {
+				link := fmt.Sprintf("%s?title=%s&original_title=%s&similar=true&href=%s",
+					r.URL.Path, url.QueryEscape(title), url.QueryEscape(origTitle), url.QueryEscape(res.Url))
+				data = append(data, map[string]any{"method":"link","similar":true,"id":res.Title,"url":link,"name":res.Title,"year":res.Year,"img":res.PosterUrl})
+			}
+			if rjson { respondJSON(w, map[string]any{"type":"similar","data":data}); return }
+			var sb strings.Builder; sb.WriteString(`<div class="videos__line">`)
+			for i,d := range data {
+				cls := "videos__item videos__season selector"; if i==0 { cls += " focused" }
+				j,_ := json.Marshal(d); sb.WriteString(`<div class="`+cls+`" data-json='`+strings.ReplaceAll(string(j),"'","&#39;")+`'><div class="videos__season-title">`+results[i].Title+`</div></div>`)
+			}
+			sb.WriteString(`</div>`); respondHTML(w, sb.String()); return
+		}
+		filmUrl = results[0].Url
+	}
+
+	// Movie: return method:"call" pointing to self with play=true
+	// Lampa will GET this URL, our handler returns method:"play" with actual stream
+	link := fmt.Sprintf("%s?t=%s&play=true&title=%s&original_title=%s",
+		r.URL.Path, url.QueryEscape(filmUrl), url.QueryEscape(title), url.QueryEscape(origTitle))
+	row := map[string]any{"method":"call","url":link,"name":title,"title":joinName(title,origTitle)}
+	if rjson { respondJSON(w, map[string]any{"type":"movie","data":[]any{row}}); return }
+	respondHTML(w, `<div class="videos__line"><div class="videos__item videos__movie selector" data-json='`+escapeAttr(row)+`'><div class="videos__item-imgbox videos__movie-imgbox"></div><div class="videos__item-title">`+title+`</div></div></div>`)
+}
+
+func (s *server) search(kpID, title, origTitle string) []SearchResult {
+	filmTitle := origTitle; if filmTitle == "" { filmTitle = title }; if filmTitle == "" { return nil }
+	memKey := "search:" + filmTitle
+	if v, ok := s.cache.get(memKey); ok { return v.([]SearchResult) }
+	searchUrl := fmt.Sprintf("%s/index.php?do=search&subaction=search&story=%s", s.host, url.QueryEscape(filmTitle))
+	body, err := s.fetch(searchUrl, s.host, 0)
+	if err != nil { return nil }
+	results := make([]SearchResult,0)
+	matches := reSearchItem.FindAllStringSubmatch(body, -1)
+	for _,m := range matches {
+		if len(m) < 3 { continue }
+		u := m[1]; inner := m[2]
+		t := ""; if tm := reSearchTitle.FindStringSubmatch(inner); len(tm)>1 { t = strings.TrimSpace(reStripTags.ReplaceAllString(tm[1],"")) }
+		if t == "" { continue }
+		poster := ""; if im := reSearchImg.FindStringSubmatch(inner); len(im)>1 { poster = im[1]; if !strings.HasPrefix(poster,"http") { poster = s.host + poster } }
+		year := 0; if ym := reYear.FindStringSubmatch(t); len(ym)>1 { year,_ = strconv.Atoi(ym[1]) }
+		// Fix domain aliases (some DLE sites have multiple domains)
+		if !strings.HasPrefix(u, "http") { u = s.host + u } else if !strings.Contains(u, s.host) {
+			parsed,_ := url.Parse(u); if parsed != nil { u = s.host + parsed.Path }
+		}
+		results = append(results, SearchResult{Title:t, Url:u, PosterUrl:poster, Year:year})
+	}
+	if len(results)>0 { s.cache.set(memKey, results, 20*time.Minute) }
+	return results
+}
+
+// extractStream fetches a film page, finds iframe, fetches CDN page, extracts m3u8 URL
+func (s *server) extractStream(filmUrl string) string {
+	html, err := s.fetch(filmUrl, s.host, 0)
+	if err != nil { return "" }
+	im := reIframe.FindStringSubmatch(html)
+	if len(im) < 2 { return "" }
+	iframeUrl := im[1]; if strings.HasPrefix(iframeUrl,"//") { iframeUrl = "https:" + iframeUrl }
+	if strings.Contains(iframeUrl, "youtube.com") { return "" }
+	cdnHtml, err := s.fetch(iframeUrl, filmUrl, 0)
+	if err != nil { return "" }
+	fm := reFile.FindStringSubmatch(cdnHtml)
+	if len(fm) > 1 { return fm[1] }
+	return ""
+}
+
+func (s *server) fetch(u, ref string, timeoutSec int) (string, error) {
+	client := s.client; if timeoutSec > 0 { client = &http.Client{Timeout: time.Duration(timeoutSec)*time.Second} }
+	req, _ := http.NewRequest(http.MethodGet, u, nil)
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+	if ref != "" { req.Header.Set("Referer", ref) }
+	resp, err := client.Do(req); if err != nil { return "", err }
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 { return "", fmt.Errorf("status %d", resp.StatusCode) }
+	b, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20)); return string(b), nil
+}
+
+func respondJSON(w http.ResponseWriter, v any) { w.Header().Set("Content-Type", "application/json; charset=utf-8"); json.NewEncoder(w).Encode(v) }
+func respondHTML(w http.ResponseWriter, h string) { w.Header().Set("Content-Type", "text/html; charset=utf-8"); w.Write([]byte(h)) }
+func respondEmpty(w http.ResponseWriter, rj bool) { if rj { respondJSON(w, map[string]any{"type":"empty","data":[]any{}}) } else { respondHTML(w,"") } }
+func joinName(t, o string) string { if o != "" && o != t { return t + " / " + o }; return t }
+func escapeAttr(v any) string { b, _ := json.Marshal(v); return strings.ReplaceAll(string(b), "'", "&#39;") }

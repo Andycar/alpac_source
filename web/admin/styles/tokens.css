@@ -1,0 +1,189 @@
+/* tokens.css — design system (colors, typography, spacing, motion, fx).
+ *
+ * Apple-flavoured dark with a vibrant aurora accent ramp. Light mode supported
+ * via prefers-color-scheme. TG WebApp overrides come through themeParams.
+ *
+ * Premium identity: glass surfaces, layered shadows with chromatic glow,
+ * gradient text on display titles, animated aurora ambient on body::before.
+ */
+
+:root {
+  /* ---------- Color: foundations (dark by default) ---------- */
+  --bg-0: #06080d;        /* page background — deeper for aurora contrast */
+  --bg-1: #0c1119;        /* primary surface */
+  --bg-2: #131a25;        /* elevated surface */
+  --bg-3: #1b2333;        /* hover surface */
+  --bg-4: #232d41;        /* active / pressed */
+
+  --surface-glass: rgba(18, 24, 36, 0.62);
+  --surface-glass-strong: rgba(18, 24, 36, 0.88);
+  --surface-overlay: rgba(6, 8, 13, 0.82);
+
+  --border-1: rgba(255, 255, 255, 0.06);
+  --border-2: rgba(255, 255, 255, 0.11);
+  --border-3: rgba(255, 255, 255, 0.18);
+
+  --text-0: #f6f7fb;       /* primary text */
+  --text-1: #c9d0dc;       /* secondary */
+  --text-2: #8c95a8;       /* muted */
+  --text-3: #5d6781;       /* hint / disabled */
+
+  /* ---------- Color: accents (vibrant aurora) ---------- */
+  --accent: #7791ff;          /* primary brand (slightly brighter) */
+  --accent-2: #b266ff;        /* gradient pair (purple) */
+  --accent-3: #ff6bd6;        /* pink for trio gradients */
+  --accent-4: #38d4ff;        /* cyan */
+  --accent-soft: rgba(119, 145, 255, 0.18);
+  --accent-glow: rgba(119, 145, 255, 0.40);
+
+  --success: #34e0a1;
+  --success-soft: rgba(52, 224, 161, 0.14);
+  --warn:   #ffb547;
+  --warn-soft: rgba(255, 181, 71, 0.14);
+  --danger: #ff6b7a;
+  --danger-soft: rgba(255, 107, 122, 0.14);
+  --info:   #5fb6ff;
+  --info-soft: rgba(95, 182, 255, 0.14);
+
+  /* Quality badges */
+  --q-4k:  #ec4899;
+  --q-fhd: #60a5fa;
+  --q-hd:  #34d399;
+  --q-sd:  #94a3b8;
+
+  /* ---------- Gradients (use directly: background: var(--g-accent)) ---------- */
+  --g-accent:  linear-gradient(135deg, #7791ff 0%, #b266ff 60%, #ff6bd6 100%);
+  --g-cyan:    linear-gradient(135deg, #38d4ff 0%, #7791ff 100%);
+  --g-amber:   linear-gradient(135deg, #ffb547 0%, #ff6bd6 100%);
+  --g-mint:    linear-gradient(135deg, #34e0a1 0%, #38d4ff 100%);
+  --g-fire:    linear-gradient(135deg, #ff6b7a 0%, #b266ff 100%);
+  --g-text:    linear-gradient(135deg, #f6f7fb 0%, #c9d0dc 80%);
+  --g-text-accent: linear-gradient(135deg, #7791ff 0%, #b266ff 50%, #ff6bd6 100%);
+
+  /* Border gradients — use as background on a wrapper with mask */
+  --g-border: linear-gradient(135deg, rgba(119,145,255,0.55), rgba(178,102,255,0.18) 40%, transparent 70%, rgba(255,107,214,0.25));
+  --g-border-soft: linear-gradient(135deg, rgba(255,255,255,0.12), rgba(255,255,255,0.02) 40%, transparent 70%, rgba(255,255,255,0.08));
+
+  /* ---------- Typography ---------- */
+  --font-display: -apple-system, BlinkMacSystemFont, "SF Pro Display",
+    "Inter", "Segoe UI", Roboto, "Helvetica Neue", system-ui, sans-serif;
+  --font-text: -apple-system, BlinkMacSystemFont, "SF Pro Text",
+    "Inter", "Segoe UI", Roboto, "Helvetica Neue", system-ui, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Monaco,
+    "Cascadia Mono", "Source Code Pro", "Roboto Mono", monospace;
+
+  --fs-xs:   11px;
+  --fs-sm:   12px;
+  --fs-base: 14px;
+  --fs-md:   16px;
+  --fs-lg:   18px;
+  --fs-xl:   22px;
+  --fs-2xl:  28px;
+  --fs-3xl:  36px;
+  --fs-4xl:  48px;
+  --fs-5xl:  64px;
+
+  --lh-tight: 1.05;
+  --lh-normal: 1.45;
+  --lh-relaxed: 1.6;
+
+  --fw-regular: 400;
+  --fw-medium: 500;
+  --fw-semibold: 600;
+  --fw-bold: 700;
+  --fw-black: 800;
+
+  /* ---------- Spacing scale (4px base) ---------- */
+  --s-1: 4px;
+  --s-2: 8px;
+  --s-3: 12px;
+  --s-4: 16px;
+  --s-5: 24px;
+  --s-6: 32px;
+  --s-7: 48px;
+  --s-8: 64px;
+  --s-9: 96px;
+
+  /* ---------- Radii ---------- */
+  --r-1: 6px;
+  --r-2: 10px;
+  --r-3: 14px;
+  --r-4: 18px;
+  --r-5: 24px;
+  --r-6: 32px;
+  --r-pill: 999px;
+
+  /* ---------- Shadows — Apple stack + chromatic glow ---------- */
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.28),
+               0 1px 1px rgba(255, 255, 255, 0.02) inset;
+  --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.32),
+               0 1px 2px rgba(0, 0, 0, 0.2),
+               0 1px 1px rgba(255, 255, 255, 0.04) inset;
+  --shadow-lg: 0 22px 44px rgba(0, 0, 0, 0.46),
+               0 6px 14px rgba(0, 0, 0, 0.26),
+               0 1px 1px rgba(255, 255, 255, 0.05) inset;
+  --shadow-xl: 0 40px 80px rgba(0, 0, 0, 0.52),
+               0 12px 24px rgba(0, 0, 0, 0.32),
+               0 1px 1px rgba(255, 255, 255, 0.06) inset;
+  --shadow-glow: 0 0 0 1px var(--accent-soft),
+                 0 16px 48px var(--accent-glow);
+  --shadow-glow-violet: 0 0 0 1px rgba(178,102,255,0.18),
+                        0 16px 48px rgba(178,102,255,0.32);
+  --shadow-glow-pink:   0 0 0 1px rgba(255,107,214,0.16),
+                        0 16px 48px rgba(255,107,214,0.28);
+  --shadow-glow-cyan:   0 0 0 1px rgba(56,212,255,0.16),
+                        0 16px 48px rgba(56,212,255,0.28);
+
+  /* ---------- Motion ---------- */
+  --ease-spring:   cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-out:      cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-in:       cubic-bezier(0.7, 0, 0.84, 0);
+  --ease-in-out:   cubic-bezier(0.83, 0, 0.17, 1);
+
+  --t-fast:    140ms;
+  --t-normal:  240ms;
+  --t-slow:    420ms;
+
+  /* ---------- Z layers ---------- */
+  --z-sidebar:  10;
+  --z-topbar:   20;
+  --z-dropdown: 100;
+  --z-modal:    1000;
+  --z-toast:    2000;
+
+  /* ---------- Sizes ---------- */
+  --sidebar-w: 264px;
+  --sidebar-w-collapsed: 72px;
+  --topbar-h: 60px;
+  --content-max: 1320px;
+}
+
+/* Light mode (auto). Kept understated — admins typically run dark. */
+@media (prefers-color-scheme: light) {
+  :root.theme-auto {
+    --bg-0: #f4f6fb;
+    --bg-1: #ffffff;
+    --bg-2: #f1f3f8;
+    --bg-3: #e7eaf2;
+    --bg-4: #dde1ec;
+
+    --surface-glass: rgba(255, 255, 255, 0.72);
+    --surface-glass-strong: rgba(255, 255, 255, 0.94);
+    --surface-overlay: rgba(241, 243, 248, 0.78);
+
+    --border-1: rgba(15, 18, 30, 0.06);
+    --border-2: rgba(15, 18, 30, 0.10);
+    --border-3: rgba(15, 18, 30, 0.18);
+
+    --text-0: #0d1320;
+    --text-1: #3a4358;
+    --text-2: #6b7387;
+    --text-3: #99a0b3;
+
+    --g-text: linear-gradient(135deg, #0d1320 0%, #3a4358 80%);
+  }
+}
+
+:root.theme-tg {
+  /* placeholders the bridge fills in at runtime */
+}

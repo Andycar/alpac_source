@@ -1,0 +1,97 @@
+{
+  "id": "tevas",
+  "name": "ТЕВАС",
+  "version": "0.1.0",
+  "author": "lampac-go",
+  "description": "ТЕВАС (pult.tevas.dev / tevas.team / tevas.tech) — бесплатный онлайн-кинотеатр, MP4-стримы 1080p. Скрапит /search/ и страницы фильмов/эпизодов, путь к видео берётся прямо из Playerjs `file:`, CDN-хост подставляется из config. ВНИМАНИЕ: сайт жёстко режет datacenter-IP (EU/RU/BY DC получают 301 на ad-парковку с одних зеркал, и CF IP-бан с tevas.tech — даже настоящий FlareSolverr получает «Probably your IP is banned»). Чтобы заработало — нужен residential SOCKS5 (NetNut/SOAX/iProxy) или scraping-сервис типа scrapingbee. Модуль готов к работе, дефолты безопасные (отключен use_flaresolverr); включайте только когда поставите residential proxy в socks_proxy.",
+  "entry": "index.js",
+  "content_types": ["movie", "serial"],
+  "quality": "FHD",
+  "languages": ["ru"],
+  "tags": ["ru", "mp4", "community"],
+  "default_transport": "ipv6",
+  "config_schema": [
+    {
+      "key": "site_url",
+      "label": "Основной адрес сайта",
+      "type": "string",
+      "default": "https://pult.tevas.dev",
+      "description": "Источник HTML-страниц с путями к видео. Живые зеркала на 2026-05: pult.tevas.dev, tevas.team, tevas.tech. ВАЖНО: с datacenter-IP (EU/RU/BY/UK любой хостер) сайт жёстко режет. Польский DC IP получает 301 на ad-парковку. RU Selectel DC — TCP открыт, но CF Turnstile (tevas.tech) не пробивается даже через FlareSolverr. Для работы НУЖЕН residential SOCKS5 (NetNut/SOAX/iProxy или свой 4G-модем); проверено на 2026-05-18."
+    },
+    {
+      "key": "mirrors",
+      "label": "Зеркала (через запятую)",
+      "type": "string",
+      "default": "https://pult.tevas.dev,https://tevas.team,https://tevas.tech",
+      "description": "Список зеркал для fallback'а: если основной адрес не отвечает (timeout / Cloudflare challenge / геоблок), модуль перебирает зеркала. Последнее живое запоминается в кэше на час, чтобы не дёргать мертвые на каждый запрос."
+    },
+    {
+      "key": "socks_proxy",
+      "label": "SOCKS5 для обхода гео-блока (host:port)",
+      "type": "string",
+      "default": "",
+      "placeholder": "127.0.0.1:40003",
+      "description": "Если ваш VPS не в RU/UA — сайт ТЕВАС режет по IP и отдаёт 301-редирект на ad-парковку (quickresultseeker.com). Пропишите тут адрес SOCKS5 residential RU/UA прокси (например xray/v2ray sidecar), и все HTML-запросы (search/serial/movie page) пойдут через него. ВАЖНО: для проксирования CDN-стрима видео через тот же SOCKS5 — настройте серверный config online.toml: [[proxy.direct.entries]] balancers=[\"tevas\"] socks5=\"<addr>\"."
+    },
+    {
+      "key": "cookies",
+      "label": "Cookie-jar (cf_clearance и др.)",
+      "type": "textarea",
+      "default": "",
+      "placeholder": "cf_clearance=AbCd...; _ga=GA1.2...; _gid=GA1.2...",
+      "description": "Если сайт за Cloudflare Bot Fight (tevas.tech) и DC-IP вашего сервера в bot-блоке, можно подсунуть cookies из живого браузера. Алгоритм: 1) откройте https://tevas.tech/ на своём ноутбуке в Chrome, дождитесь успешной загрузки страницы; 2) DevTools → Application → Storage → Cookies → tevas.tech; 3) скопируйте СТРОКУ всех cookies (или хотя бы `cf_clearance=…`) и вставьте сюда. CF иногда привязывает clearance к UA+IP, иногда только к UA+fingerprint — попробуйте; если 403 не уйдёт, придётся ждать residential proxy. cf_clearance живёт обычно 24-48 часов."
+    },
+    {
+      "key": "cookie_user_agent",
+      "label": "User-Agent для cookies",
+      "type": "string",
+      "default": "",
+      "placeholder": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
+      "description": "ОБЯЗАТЕЛЬНО при использовании cookies: CF проверяет что UA совпадает с тем, под которым выдан cf_clearance. Скопируйте свой UA из браузера (whoer.net, F12 → Network → любой запрос → Request Headers → User-Agent). Если поле пустое — модуль использует стандартный Linux Chrome UA, и cookies могут не сработать."
+    },
+    {
+      "key": "use_flaresolverr",
+      "label": "Гонять HTML через FlareSolverr",
+      "type": "bool",
+      "default": false,
+      "description": "На 2026-05 включать НЕ рекомендуется: tevas.tech за Cloudflare Turnstile, и FS-solver с datacenter-IP (любого, включая RU Selectel) challenge не пробивает — выдаёт «Error solving the challenge». Полезно только если у вас FS-контейнер заходит через residential SOCKS5 (NetNut/SOAX/4G-домашний)."
+    },
+    {
+      "key": "cdn_movie_host",
+      "label": "CDN-хост для фильмов",
+      "type": "string",
+      "default": "bigsgppgs.tevas.dev",
+      "placeholder": "bigsgppgs.tevas.dev",
+      "description": "Поддомен tevas.dev, обслуживающий /kino/download/... Ротируется со временем (anti-block). Если перестало играть — посмотрите DevTools → Network в браузере на работающей странице и впишите актуальный host (без https://)."
+    },
+    {
+      "key": "cdn_serial_host",
+      "label": "CDN-хост для сериалов",
+      "type": "string",
+      "default": "bigjjxjjs.tevas.dev",
+      "placeholder": "bigjjxjjs.tevas.dev",
+      "description": "Поддомен tevas.dev для /serial/... Обычно отличается от movie-хоста."
+    },
+    {
+      "key": "use_proxy",
+      "label": "Стрим через /proxy/ lampac",
+      "type": "bool",
+      "default": true,
+      "description": "CDN tevas.dev пропускает по UA: «правильный» Linux/Chrome UA проходит без Referer'а, но любой нестандартный UA (curl, медиаплеер TV-приставки, mediastack/stagefright и т.п.) режется. Прокси через lampac добавляет канонические UA+Referer на upstream — стрим играет на любом клиенте. Если у вас уверенный браузер-плеер (Lampa в Chrome/Firefox) и хочется убрать сервер из цепочки — можно выключить."
+    },
+    {
+      "key": "serial_cache_hours",
+      "label": "Кэш каталога сериалов (часов)",
+      "type": "number",
+      "default": 6,
+      "description": "Каталог /serial/ парсится HTML-ом. Чтобы не дёргать сайт на каждый запрос — кэшируем slug→title список."
+    },
+    {
+      "key": "referer",
+      "label": "Referer для CDN-запросов",
+      "type": "string",
+      "default": "https://tevas.tech/",
+      "description": "Подставляется в Referer прокси-стрима (если use_proxy=true). На прямой CDN не влияет (он открыт), но не помешает."
+    }
+  ]
+}

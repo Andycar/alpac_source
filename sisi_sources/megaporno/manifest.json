@@ -1,0 +1,18 @@
+{
+  "id": "megaporno",
+  "name": "Mega-Porno.me",
+  "version": "0.1.0",
+  "author": "lampac-go",
+  "description": "SISI JS-источник для mega-porno.me. Категории по пути /categories/{slug}/.",
+  "icon": "🍑",
+  "tags": ["sisi", "tube", "ru"],
+  "languages": ["ru"],
+  "quality": "720p",
+  "default_transport": "default",
+  "default_balancer": "megaporno",
+  "host_defaults": "https://mega-porno.me",
+  "config_schema": [
+    { "key": "site_host", "label": "Хост сайта", "type": "string", "default": "mega-porno.me" },
+    { "key": "user_agent", "label": "User-Agent", "type": "string", "default": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36" }
+  ]
+}

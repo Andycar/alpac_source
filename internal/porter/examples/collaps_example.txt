@@ -1,0 +1,114 @@
+// Standalone balancer: collaps (category: embed)
+// Pattern: embed page → regex extract HLS/seasons → movie/serial output
+package main
+
+import (
+	"encoding/json"
+	"flag"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"net/url"
+	"regexp"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+)
+
+const balancerName = "collaps"
+var defaultHost = "https://api.variyt.ws"
+var reHLS = regexp.MustCompile(`(?i)hls\s*:\s*"([^"]+)"`)
+var reSeasons = regexp.MustCompile(`(?is)seasons\s*:\s*(\[.+?\])\s*[,;]`)
+
+type embedSeason struct { Season int `json:"season"`; Episodes []embedEpisode `json:"episodes"` }
+type embedEpisode struct { Episode string `json:"episode"`; HLS string `json:"hls"` }
+
+type cacheItem struct { value any; expiresAt time.Time }
+type simpleCache struct { mu sync.RWMutex; items map[string]cacheItem }
+func newCache() *simpleCache { return &simpleCache{items: make(map[string]cacheItem)} }
+func (c *simpleCache) get(k string) (any, bool) { c.mu.RLock(); defer c.mu.RUnlock(); i, ok := c.items[k]; if !ok||time.Now().After(i.expiresAt){return nil,false}; return i.value,true }
+func (c *simpleCache) set(k string, v any, ttl time.Duration) { c.mu.Lock(); c.items[k]=cacheItem{v,time.Now().Add(ttl)}; c.mu.Unlock() }
+
+type server struct { client *http.Client; host, mainHost, token string; cache *simpleCache }
+
+func main() {
+	port := flag.Int("port", 50100, "listen port")
+	mainHost := flag.String("main-host", "", "main server")
+	host := flag.String("host", "", "upstream override")
+	token := flag.String("token", "", "API token")
+	flag.Parse()
+	h := defaultHost; if *host != "" { h = strings.TrimRight(*host, "/") }
+	s := &server{client: &http.Client{Timeout: 20*time.Second}, host: h, mainHost: *mainHost, token: *token, cache: newCache()}
+	mux := http.NewServeMux(); mux.HandleFunc("/", s.handle)
+	addr := fmt.Sprintf("127.0.0.1:%d", *port)
+	log.Printf("%s: listening on %s", balancerName, addr)
+	log.Fatal(http.ListenAndServe(addr, mux))
+}
+
+func (s *server) handle(w http.ResponseWriter, r *http.Request) {
+	log.Printf("%s: %s %s", balancerName, r.Method, r.URL.String())
+	q := r.URL.Query()
+	if q.Get("checksearch")=="true"||q.Get("checksearch")=="1" { s.checkSearch(w,r); return }
+	s.index(w, r)
+}
+
+func (s *server) checkSearch(w http.ResponseWriter, r *http.Request) {
+	kpID := strings.TrimSpace(r.URL.Query().Get("kinopoisk_id"))
+	if kpID == "" { respondJSON(w, map[string]any{"rch":false}); return }
+	body, err := s.fetch(s.host+"/embed/kp/"+kpID, "")
+	if err != nil { respondJSON(w, map[string]any{"rch":false}); return }
+	respondJSON(w, map[string]any{"rch": reHLS.MatchString(body)||reSeasons.MatchString(body)})
+}
+
+func (s *server) index(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	rjson := q.Get("rjson")=="true"||q.Get("rjson")=="1"
+	kpID := strings.TrimSpace(q.Get("kinopoisk_id"))
+	title := strings.TrimSpace(q.Get("title"))
+	origTitle := strings.TrimSpace(q.Get("original_title"))
+	if kpID == "" { respondEmpty(w,rjson); return }
+	body, err := s.fetch(s.host+"/embed/kp/"+kpID, "")
+	if err != nil { respondEmpty(w,rjson); return }
+	// Serial
+	if m := reSeasons.FindStringSubmatch(body); len(m)>=2 {
+		var seasons []embedSeason
+		if json.Unmarshal([]byte(m[1]), &seasons)==nil && len(seasons)>0 {
+			season := -1; if v:=q.Get("s"); v!="" { season,_=strconv.Atoi(v) }
+			if season < 0 { // season list
+				data := make([]map[string]any,0)
+				for _,s := range seasons {
+					data = append(data, map[string]any{"method":"link","id":s.Season,"url":r.URL.Path+"?"+url.Values{"kinopoisk_id":{kpID},"title":{title},"original_title":{origTitle},"s":{strconv.Itoa(s.Season)}}.Encode(),"name":fmt.Sprintf("%d сезон",s.Season)})
+				}
+				respondJSON(w, map[string]any{"type":"season","data":data}); return
+			}
+			for _,s := range seasons { // episode list
+				if s.Season!=season { continue }
+				data := make([]map[string]any,0)
+				for _,ep := range s.Episodes { if ep.HLS=="" { continue }; n,_:=strconv.Atoi(ep.Episode); data=append(data, map[string]any{"method":"play","url":ep.HLS,"stream":ep.HLS,"s":season,"e":n,"name":fmt.Sprintf("%s серия",ep.Episode),"title":joinName(title,origTitle)}) }
+				respondJSON(w, map[string]any{"type":"episode","data":data}); return
+			}
+		}
+	}
+	// Movie
+	if m := reHLS.FindStringSubmatch(body); len(m)>=2 {
+		row := map[string]any{"method":"play","url":m[1],"stream":m[1],"name":title,"title":joinName(title,origTitle)}
+		if rjson { respondJSON(w, map[string]any{"type":"movie","data":[]map[string]any{row}}); return }
+		respondHTML(w, `<div class="videos__line"><div class="videos__item videos__movie selector" data-json='`+escapeAttr(row)+`'><div class="videos__item-imgbox videos__movie-imgbox"></div><div class="videos__item-title">`+title+`</div></div></div>`)
+		return
+	}
+	respondEmpty(w,rjson)
+}
+
+func (s *server) fetch(u, ref string) (string, error) {
+	req,_:=http.NewRequest(http.MethodGet,u,nil); req.Header.Set("User-Agent","Mozilla/5.0"); if ref!="" { req.Header.Set("Referer",ref) }
+	resp,err:=s.client.Do(req); if err!=nil{return "",err}; defer resp.Body.Close()
+	if resp.StatusCode>=300{return "",fmt.Errorf("status %d",resp.StatusCode)}
+	b,_:=io.ReadAll(io.LimitReader(resp.Body,4<<20)); return string(b),nil
+}
+func respondJSON(w http.ResponseWriter, v any) { w.Header().Set("Content-Type","application/json; charset=utf-8"); json.NewEncoder(w).Encode(v) }
+func respondHTML(w http.ResponseWriter, h string) { w.Header().Set("Content-Type","text/html; charset=utf-8"); w.Write([]byte(h)) }
+func respondEmpty(w http.ResponseWriter, rj bool) { if rj{respondJSON(w,map[string]any{"type":"empty","data":[]any{}});return}; respondHTML(w,"") }
+func joinName(t,o string) string { if o!=""&&o!=t{return t+" / "+o}; return t }
+func escapeAttr(v any) string { b,_:=json.Marshal(v); return strings.ReplaceAll(string(b),"'","&#39;") }

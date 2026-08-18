@@ -1,0 +1,1076 @@
+/* ===========================================================================
+ * Themes & density — Wave 1 B3.
+ * ===========================================================================
+ *
+ * Theme is selected via data-theme="..." on .lwp-root (set by SkinManager).
+ * Density (compact/normal/spacious) is set via data-density="...".
+ *
+ * Each theme defines a small palette of CSS custom properties consumed by
+ * the rest of player.css. To add a new theme, copy a [data-theme="..."]
+ * block and tweak values.
+ */
+
+/* ---- Default values (cinematic theme is the baseline) ---- */
+.lwp-root {
+  /* Solid-ish background for panels. backdrop-filter: blur over a video
+     surface is a major GPU cost (per-frame readback + blur + composite)
+     and on 1080p+ streams drops playback to 5-7 FPS on weaker machines.
+     We keep the panels opaque-dark by default; blur is opt-in for rare
+     modals like ShortcutsOverlay (user sees it for a few seconds). */
+  --lwp-glass-bg: rgba(18, 18, 24, 0.96);
+  --lwp-glass-blur: 0px;
+  --lwp-radius: 12px;
+  --lwp-radius-sm: 8px;
+  --lwp-edge-glow-strength: 0;
+  --lwp-controls-pad-y: 18px;
+  --lwp-controls-pad-x: 22px;
+  --lwp-button-size: 44px;
+  --lwp-fg-strong: #fff;
+  --lwp-fg-muted: rgba(255, 255, 255, 0.72);
+  --lwp-divider: rgba(255, 255, 255, 0.08);
+}
+
+/* ---- Cinematic (default) ----
+   NB: Formerly bumped --lwp-glass-blur to 18px; we keep it 0 here because
+   backdrop-filter over video is a GPU-killer. The opaque panel still
+   looks clean against the dimmed video underneath. */
+.lwp-root[data-theme="cinematic"] {
+  --lwp-glass-bg: rgba(18, 18, 24, 0.94);
+  --lwp-glass-blur: 0px;
+  --lwp-radius: 14px;
+  --lwp-radius-sm: 10px;
+  --lwp-edge-glow-strength: 1;
+}
+
+/* ---- Minimal — flat dark, no blur, smaller radius ---- */
+.lwp-root[data-theme="minimal"] {
+  --lwp-glass-bg: rgba(10, 10, 12, 0.92);
+  --lwp-glass-blur: 0px;
+  --lwp-radius: 6px;
+  --lwp-radius-sm: 4px;
+  --lwp-edge-glow-strength: 0;
+}
+
+/* ---- Classic — closer to default Lampa look ---- */
+.lwp-root[data-theme="classic"] {
+  --lwp-glass-bg: rgba(30, 30, 36, 0.95);
+  --lwp-glass-blur: 0px;
+  --lwp-radius: 8px;
+  --lwp-radius-sm: 6px;
+  --lwp-edge-glow-strength: 0.4;
+}
+
+/* ---- OLED black — pure black for OLED-burnin-friendly displays ---- */
+.lwp-root[data-theme="oled-black"] {
+  --lwp-glass-bg: rgba(0, 0, 0, 0.95);
+  --lwp-glass-blur: 0px;
+  --lwp-radius: 4px;
+  --lwp-radius-sm: 2px;
+  --lwp-edge-glow-strength: 0;
+}
+.lwp-root[data-theme="oled-black"] .lwp-gradient-top,
+.lwp-root[data-theme="oled-black"] .lwp-gradient-bottom {
+  background: #000;
+}
+
+/* ---- Density modifiers ---- */
+.lwp-root[data-density="compact"] {
+  --lwp-controls-pad-y: 12px;
+  --lwp-controls-pad-x: 16px;
+  --lwp-button-size: 36px;
+}
+.lwp-root[data-density="spacious"] {
+  --lwp-controls-pad-y: 26px;
+  --lwp-controls-pad-x: 32px;
+  --lwp-button-size: 52px;
+}
+
+/* ===========================================================================
+ * Ambilight layer — Wave 1 B3.
+ * ===========================================================================
+ *
+ * Sits inside .lwp-video-stage, just above the video. Its CSS custom
+ * properties (--lwp-amb-top etc.) are written by AmbilightLayer.svelte
+ * every ~500ms.
+ *
+ * "subtle" blends a soft halo around the video. "rich" extends the halo
+ * further out and increases opacity. Both are pointer-events-none so
+ * gestures still hit the video underneath.
+ */
+.lwp-ambilight {
+  position: absolute;
+  inset: -4px;
+  pointer-events: none;
+  z-index: 1;
+  opacity: 0;
+  transition: opacity 600ms ease, box-shadow 800ms ease;
+}
+
+.lwp-ambilight-subtle {
+  opacity: 0.45;
+  box-shadow:
+    inset  0  120px 80px -100px var(--lwp-amb-top, rgba(0,0,0,0)),
+    inset  0 -120px 80px -100px var(--lwp-amb-bottom, rgba(0,0,0,0)),
+    inset  120px  0 80px -100px var(--lwp-amb-left, rgba(0,0,0,0)),
+    inset -120px  0 80px -100px var(--lwp-amb-right, rgba(0,0,0,0));
+}
+
+.lwp-ambilight-rich {
+  opacity: 0.85;
+  box-shadow:
+    inset  0  220px 160px -160px var(--lwp-amb-top, rgba(0,0,0,0)),
+    inset  0 -220px 160px -160px var(--lwp-amb-bottom, rgba(0,0,0,0)),
+    inset  220px  0 160px -160px var(--lwp-amb-left, rgba(0,0,0,0)),
+    inset -220px  0 160px -160px var(--lwp-amb-right, rgba(0,0,0,0)),
+    /* outer halo bleeds beyond the video — gives the "Ambilight TV" effect */
+    0 0 64px 8px var(--lwp-amb-accent, rgba(0,0,0,0));
+}
+
+.lwp-ambilight-edge-glow {
+  outline: 1px solid color-mix(in srgb, var(--lwp-amb-accent, #fff) 25%, transparent);
+}
+
+/* ===========================================================================
+ * MiniPlayer floating fallback — Wave 1 D3.
+ * ===========================================================================
+ * Used only when Document PiP is unavailable. Sits above everything as a
+ * draggable corner pane. Default position: bottom-right.
+ */
+.lwp-mini-player {
+  position: fixed;
+  width: 360px;
+  height: 202px;
+  background: #000;
+  border-radius: var(--lwp-radius, 12px);
+  overflow: hidden;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.6);
+  z-index: 1000000;
+  cursor: grab;
+  touch-action: none;
+}
+.lwp-mini-player:active {
+  cursor: grabbing;
+}
+.lwp-mini-tl { top: 16px; left: 16px; }
+.lwp-mini-tr { top: 16px; right: 16px; }
+.lwp-mini-bl { bottom: 16px; left: 16px; }
+.lwp-mini-br { bottom: 16px; right: 16px; }
+.lwp-mini-slot {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+.lwp-mini-slot > video {
+  position: static !important;
+  inset: auto !important;
+  width: 100% !important;
+  height: 100% !important;
+  object-fit: contain;
+  background: #000;
+}
+.lwp-mini-close {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  border: none;
+  background: rgba(0, 0, 0, 0.6);
+  color: #fff;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0;
+  transition: opacity 200ms ease;
+}
+.lwp-mini-player:hover .lwp-mini-close {
+  opacity: 1;
+}
+
+/* ===========================================================================
+ * Watchparty panel — Wave 2 C2.
+ * ===========================================================================
+ */
+.lwp-menu-floating {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 1000001;
+  min-width: 320px;
+  max-width: 420px;
+  background: var(--lwp-glass-bg, rgba(20,20,26,0.85));
+  border-radius: var(--lwp-radius, 12px);
+  padding: 16px;
+  box-shadow: 0 12px 40px rgba(0,0,0,0.6);
+}
+.lwp-menu-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-weight: 600;
+  margin-bottom: 12px;
+  color: var(--lwp-fg-strong, #fff);
+}
+.lwp-watchparty {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.lwp-watchparty-form,
+.lwp-watchparty-active {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.lwp-watchparty-label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 13px;
+  color: var(--lwp-fg-muted, rgba(255,255,255,0.72));
+}
+.lwp-watchparty-label input {
+  background: rgba(255,255,255,0.08);
+  border: 1px solid var(--lwp-divider, rgba(255,255,255,0.08));
+  color: var(--lwp-fg-strong, #fff);
+  border-radius: var(--lwp-radius-sm, 8px);
+  padding: 8px 10px;
+  font-size: 14px;
+}
+.lwp-watchparty-row {
+  display: flex;
+  justify-content: space-between;
+  font-size: 14px;
+}
+.lwp-watchparty-row span {
+  color: var(--lwp-fg-muted, rgba(255,255,255,0.72));
+}
+.lwp-watchparty-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+.lwp-watchparty-error {
+  color: #ff8a80;
+  font-size: 13px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: SFMono-Regular, Menlo, Consolas, monospace;
+  line-height: 1.4;
+  max-height: 160px;
+  overflow-y: auto;
+}
+
+/* Chat (Pack 5) */
+.lwp-chat {
+  margin-top: 12px;
+  border-top: 1px solid var(--lwp-divider, rgba(255,255,255,0.08));
+  padding-top: 8px;
+  max-height: 220px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.lwp-chat-empty {
+  color: var(--lwp-fg-muted, rgba(255,255,255,0.5));
+  font-size: 12px;
+  text-align: center;
+  padding: 16px 0;
+}
+.lwp-chat-msg {
+  display: flex;
+  flex-direction: column;
+  padding: 6px 10px;
+  background: rgba(255,255,255,0.04);
+  border-radius: var(--lwp-radius-sm, 8px);
+  font-size: 13px;
+  align-self: flex-start;
+  max-width: 85%;
+}
+.lwp-chat-msg-self {
+  align-self: flex-end;
+  background: color-mix(in srgb, var(--lwp-amb-accent, var(--lwp-accent, #4fc3f7)) 25%, transparent);
+}
+.lwp-chat-meta {
+  display: flex;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--lwp-fg-muted, rgba(255,255,255,0.55));
+  margin-bottom: 2px;
+}
+.lwp-chat-nick { font-weight: 600; }
+.lwp-chat-text {
+  color: var(--lwp-fg-strong, #fff);
+  word-wrap: break-word;
+}
+.lwp-chat-input-row {
+  display: flex;
+  gap: 6px;
+  margin-top: 8px;
+}
+.lwp-chat-input {
+  flex: 1;
+  background: rgba(255,255,255,0.08);
+  border: 1px solid var(--lwp-divider, rgba(255,255,255,0.08));
+  color: var(--lwp-fg-strong, #fff);
+  border-radius: var(--lwp-radius-sm, 8px);
+  padding: 8px 10px;
+  font-size: 13px;
+}
+.lwp-chat-input:focus {
+  outline: 2px solid color-mix(in srgb, var(--lwp-amb-accent, var(--lwp-accent, #4fc3f7)) 60%, transparent);
+}
+
+/* ===========================================================================
+ * Watchparty chat sidebar — Twitch-style.
+ * ===========================================================================
+ *
+ * Three modes, switched via the chatSidebarMode store:
+ *   - hidden → only .lwp-chat-tab (a rounded bubble on the right edge)
+ *   - side   → .lwp-chat-sidebar (full right-side panel, 340px wide)
+ *   - overlay → .lwp-chat-overlay (transparent floating messages)
+ *
+ * Sidebar is INSIDE the .lwp-root container so it lives alongside the
+ * player (absolute positioning scoped to the player). It does not
+ * interfere with Lampa's own UI outside the player overlay.
+ */
+
+/* Hint text in the join-modal after switching to sidebar mode */
+.lwp-watchparty-hint {
+  margin-top: 10px;
+  padding: 8px 10px;
+  background: rgba(255,255,255,0.04);
+  border-radius: var(--lwp-radius-sm, 6px);
+  color: var(--lwp-fg-muted, rgba(255,255,255,0.6));
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+/* ---- Collapsed tab ---- */
+.lwp-chat-tab {
+  position: absolute;
+  top: 50%;
+  right: 0;
+  transform: translateY(-50%);
+  z-index: 90;
+  width: 36px;
+  height: 56px;
+  border-top-left-radius: 10px;
+  border-bottom-left-radius: 10px;
+  border: 1px solid var(--lwp-divider, rgba(255,255,255,0.08));
+  border-right: none;
+  background: rgba(20,20,26,0.85);
+  color: var(--lwp-fg-muted, rgba(255,255,255,0.7));
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 160ms ease, color 160ms ease, transform 180ms ease;
+}
+.lwp-chat-tab:hover {
+  background: rgba(30,30,36,0.92);
+  color: #fff;
+  transform: translateY(-50%) translateX(-2px);
+}
+.lwp-chat-tab-badge {
+  position: absolute;
+  top: 4px;
+  right: 2px;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: 8px;
+  background: var(--lwp-amb-accent, var(--lwp-accent, #4fc3f7));
+  color: #000;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 16px;
+  text-align: center;
+}
+
+/* ---- Full sidebar ---- */
+.lwp-chat-sidebar {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 340px;
+  max-width: 92vw;
+  display: flex;
+  flex-direction: column;
+  background: rgba(14, 14, 18, 0.92);
+  border-left: 1px solid var(--lwp-divider, rgba(255,255,255,0.08));
+  z-index: 90;
+  color: var(--lwp-fg-strong, #fff);
+  font-size: 13px;
+  animation: lwp-chat-slide-in 220ms ease-out;
+}
+@keyframes lwp-chat-slide-in {
+  from { transform: translateX(100%); opacity: 0.6; }
+  to   { transform: translateX(0);    opacity: 1; }
+}
+
+.lwp-chat-sidebar-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--lwp-divider, rgba(255,255,255,0.08));
+  background: rgba(0,0,0,0.25);
+}
+.lwp-chat-sidebar-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 600;
+  letter-spacing: 0.3px;
+}
+.lwp-chat-sidebar-title small {
+  color: var(--lwp-fg-muted, rgba(255,255,255,0.55));
+  font-weight: 400;
+  margin-left: 4px;
+}
+.lwp-chat-room-indicator {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #69f0ae;
+  box-shadow: 0 0 6px rgba(105, 240, 174, 0.5);
+}
+.lwp-chat-sidebar-actions {
+  display: flex;
+  gap: 4px;
+}
+.lwp-chat-icon-btn {
+  width: 28px;
+  height: 28px;
+  border: none;
+  background: transparent;
+  color: var(--lwp-fg-muted, rgba(255,255,255,0.6));
+  border-radius: 6px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 140ms ease, color 140ms ease;
+}
+.lwp-chat-icon-btn:hover {
+  background: rgba(255,255,255,0.08);
+  color: #fff;
+}
+
+.lwp-chat-sidebar-messages {
+  flex: 1;
+  overflow-y: auto;
+  padding: 8px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255,255,255,0.15) transparent;
+}
+.lwp-chat-sidebar-messages::-webkit-scrollbar {
+  width: 6px;
+}
+.lwp-chat-sidebar-messages::-webkit-scrollbar-thumb {
+  background: rgba(255,255,255,0.15);
+  border-radius: 3px;
+}
+.lwp-chat-sidebar-empty {
+  text-align: center;
+  color: var(--lwp-fg-muted, rgba(255,255,255,0.5));
+  padding: 24px 8px;
+  font-size: 13px;
+}
+.lwp-chat-sidebar-empty small {
+  display: block;
+  margin-top: 6px;
+  font-size: 11px;
+  color: rgba(255,255,255,0.35);
+}
+.lwp-chat-sidebar-msg {
+  line-height: 1.4;
+  word-break: break-word;
+  padding: 3px 0;
+  position: relative;
+}
+.lwp-chat-sidebar-msg.self {
+  padding-left: 6px;
+  border-left: 2px solid var(--lwp-amb-accent, var(--lwp-accent, #4fc3f7));
+}
+.lwp-chat-sidebar-nick {
+  font-weight: 700;
+  cursor: default;
+}
+.lwp-chat-sidebar-colon {
+  margin-right: 4px;
+  color: rgba(255,255,255,0.5);
+}
+.lwp-chat-sidebar-text {
+  color: #fff;
+}
+.lwp-chat-sidebar-time {
+  display: inline;
+  margin-left: 6px;
+  font-size: 10px;
+  color: rgba(255,255,255,0.3);
+  font-variant-numeric: tabular-nums;
+}
+
+.lwp-chat-sidebar-input-row {
+  display: flex;
+  gap: 6px;
+  padding: 10px;
+  border-top: 1px solid var(--lwp-divider, rgba(255,255,255,0.08));
+  background: rgba(0,0,0,0.25);
+}
+.lwp-chat-sidebar-input {
+  flex: 1;
+  background: rgba(255,255,255,0.06);
+  border: 1px solid rgba(255,255,255,0.08);
+  color: #fff;
+  border-radius: 6px;
+  padding: 7px 10px;
+  font-size: 13px;
+  outline: none;
+  transition: border-color 140ms ease, background 140ms ease;
+}
+.lwp-chat-sidebar-input::placeholder {
+  color: rgba(255,255,255,0.35);
+}
+.lwp-chat-sidebar-input:focus {
+  background: rgba(255,255,255,0.1);
+  border-color: color-mix(in srgb, var(--lwp-amb-accent, var(--lwp-accent, #4fc3f7)) 60%, transparent);
+}
+.lwp-chat-sidebar-send {
+  width: 34px;
+  border: none;
+  border-radius: 6px;
+  background: var(--lwp-amb-accent, var(--lwp-accent, #4fc3f7));
+  color: #000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: filter 140ms ease;
+}
+.lwp-chat-sidebar-send:hover { filter: brightness(1.1); }
+
+/* ---- Transparent floating overlay (Twitch theatre chat) ---- */
+.lwp-chat-overlay {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 360px;
+  max-width: 55vw;
+  z-index: 80;
+  pointer-events: none; /* clicks pass through to controls/video */
+  display: flex;
+  align-items: flex-end;
+  padding: 12px 16px;
+}
+.lwp-chat-overlay-messages {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  align-items: flex-start;
+  max-height: 60vh;
+  overflow: hidden;
+}
+.lwp-chat-overlay-msg {
+  padding: 2px 8px;
+  background: transparent;
+  font-size: 14px;
+  font-weight: 500;
+  line-height: 1.3;
+  text-shadow: 0 0 2px rgba(0,0,0,0.95), 0 1px 3px rgba(0,0,0,0.85);
+  word-break: break-word;
+  animation: lwp-chat-overlay-in 260ms ease-out, lwp-chat-overlay-out 700ms ease-in 11.3s forwards;
+  opacity: 1;
+}
+.lwp-chat-overlay-nick {
+  font-weight: 700;
+}
+.lwp-chat-overlay-colon {
+  margin-right: 4px;
+  color: rgba(255,255,255,0.75);
+}
+.lwp-chat-overlay-text {
+  color: #fff;
+}
+@keyframes lwp-chat-overlay-in {
+  from { opacity: 0; transform: translateX(8px); }
+  to   { opacity: 1; transform: translateX(0); }
+}
+@keyframes lwp-chat-overlay-out {
+  from { opacity: 1; }
+  to   { opacity: 0; }
+}
+
+.lwp-chat-overlay-exit {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  z-index: 90;
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  border: 1px solid rgba(255,255,255,0.18);
+  background: rgba(0,0,0,0.55);
+  color: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  opacity: 0.6;
+  transition: opacity 160ms ease, background 160ms ease;
+}
+.lwp-chat-overlay-exit:hover {
+  opacity: 1;
+  background: rgba(0,0,0,0.85);
+}
+
+/* When side panel is visible, shrink the video stage to avoid overlap
+   on the right. Uses a CSS sibling selector on the root attribute we
+   already set in Player.svelte. */
+.lwp-root[data-chat="side"] .lwp-video-stage {
+  right: 340px;
+}
+@media (max-width: 720px) {
+  /* On narrow screens the side panel covers the video — that's fine,
+     user will toggle it off if they want the picture. */
+  .lwp-root[data-chat="side"] .lwp-video-stage {
+    right: 0;
+  }
+}
+.lwp-btn-primary {
+  background: var(--lwp-accent, #4fc3f7);
+  color: #000;
+  font-weight: 600;
+}
+.lwp-btn-danger {
+  background: rgba(255,138,128,0.15);
+  color: #ff8a80;
+}
+.lwp-btn-ghost {
+  background: transparent;
+  color: var(--lwp-fg-muted, rgba(255,255,255,0.72));
+}
+
+/* ===========================================================================
+ * SettingsMenu sections — visual hierarchy for Wave 1+2 grouped settings.
+ * ===========================================================================
+ */
+.lwp-menu-section {
+  padding: 14px 16px 4px;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 1.5px;
+  color: var(--lwp-amb-accent, var(--lwp-fg-muted, rgba(255,255,255,0.55)));
+  position: sticky;
+  top: 0;
+  background: linear-gradient(to bottom,
+    var(--lwp-glass-bg, rgba(20,20,26,0.95)) 60%,
+    transparent);
+  z-index: 1;
+}
+
+/* Theme chip with color swatch */
+.lwp-chip-theme {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.lwp-chip-theme .lwp-color-dot {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 1px solid rgba(255,255,255,0.15);
+  display: inline-block;
+}
+
+/* Active chip should pick up the live ambient accent when available. */
+.lwp-chip.active {
+  outline: 1px solid color-mix(in srgb, var(--lwp-amb-accent, var(--lwp-accent, #4fc3f7)) 60%, transparent);
+}
+
+/* ===========================================================================
+ * Toast notifications.
+ * ===========================================================================
+ */
+.lwp-toast-host {
+  position: fixed;
+  top: 18px;
+  right: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  z-index: 1000002;
+  pointer-events: none;
+  max-width: 360px;
+}
+.lwp-toast {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  background: var(--lwp-glass-bg, rgba(20,20,26,0.9));
+  border-radius: var(--lwp-radius-sm, 8px);
+  color: var(--lwp-fg-strong, #fff);
+  font-size: 13px;
+  box-shadow: 0 8px 28px rgba(0,0,0,0.55);
+  pointer-events: auto;
+  border-left: 3px solid var(--lwp-accent, #4fc3f7);
+  animation: lwp-toast-in 220ms ease-out;
+}
+.lwp-toast-success { border-left-color: #69f0ae; }
+.lwp-toast-warn    { border-left-color: #ffd54f; }
+.lwp-toast-error   { border-left-color: #ff8a80; }
+.lwp-toast-text { flex: 1; }
+.lwp-toast-close {
+  background: transparent;
+  border: none;
+  color: var(--lwp-fg-muted, rgba(255,255,255,0.55));
+  cursor: pointer;
+  font-size: 18px;
+  line-height: 1;
+  padding: 0 4px;
+}
+.lwp-toast-close:hover { color: var(--lwp-fg-strong, #fff); }
+@keyframes lwp-toast-in {
+  from { transform: translateX(20px); opacity: 0; }
+  to   { transform: translateX(0);    opacity: 1; }
+}
+
+/* ===========================================================================
+ * Shortcuts cheat sheet overlay.
+ * ===========================================================================
+ */
+.lwp-shortcuts-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 1000003;
+  /* Solid opaque-ish backdrop. No backdrop-filter — even on a short-
+     lived modal, the per-frame GPU readback can stall the video decoder
+     on low-end hardware. Plain darkening is enough. */
+  background: rgba(0,0,0,0.75);
+}
+.lwp-shortcuts-overlay {
+  position: fixed;
+  top: 50%; left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 1000004;
+  width: min(720px, 92vw);
+  max-height: 88vh;
+  background: var(--lwp-glass-bg, rgba(20,20,26,0.95));
+  border-radius: var(--lwp-radius, 12px);
+  box-shadow: 0 24px 64px rgba(0,0,0,0.7);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+.lwp-shortcuts-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--lwp-divider, rgba(255,255,255,0.08));
+  font-weight: 600;
+  color: var(--lwp-fg-strong, #fff);
+}
+.lwp-shortcuts-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px 24px;
+  padding: 18px;
+  overflow-y: auto;
+}
+@media (max-width: 600px) {
+  .lwp-shortcuts-grid { grid-template-columns: 1fr; }
+}
+.lwp-shortcuts-group-title {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: var(--lwp-amb-accent, var(--lwp-accent, #4fc3f7));
+  padding: 6px 0;
+  border-bottom: 1px dashed var(--lwp-divider, rgba(255,255,255,0.08));
+  margin-bottom: 6px;
+}
+.lwp-shortcuts-row {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  padding: 4px 0;
+  font-size: 13px;
+  color: var(--lwp-fg-strong, #fff);
+}
+.lwp-shortcuts-row kbd {
+  display: inline-block;
+  min-width: 84px;
+  padding: 3px 7px;
+  font-family: SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  background: rgba(255,255,255,0.08);
+  border-radius: 4px;
+  border: 1px solid rgba(255,255,255,0.06);
+  color: var(--lwp-fg-muted, rgba(255,255,255,0.85));
+  white-space: nowrap;
+  text-align: center;
+}
+.lwp-shortcuts-row span {
+  flex: 1;
+  color: var(--lwp-fg-muted, rgba(255,255,255,0.72));
+}
+
+/* ===========================================================================
+ * Polish — chapter tick tooltip + sprite border + focus ring.
+ * ===========================================================================
+ */
+.lwp-chapter-tick {
+  cursor: pointer;
+  pointer-events: auto !important;
+}
+.lwp-chapter-tick::after {
+  content: attr(title);
+  position: absolute;
+  bottom: 18px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: rgba(0,0,0,0.85);
+  color: #fff;
+  padding: 4px 8px;
+  border-radius: 4px;
+  font-size: 11px;
+  white-space: nowrap;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 140ms ease;
+}
+.lwp-chapter-tick:hover::after { opacity: 1; }
+
+.lwp-thumbnail-sprite {
+  outline: 1px solid rgba(255,255,255,0.1);
+}
+
+/* Better focus ring (D-pad / keyboard navigation) */
+.lwp-chip:focus-visible,
+.lwp-menu-item:focus-visible,
+.lwp-btn:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--lwp-amb-accent, var(--lwp-accent, #4fc3f7)) 80%, white 20%);
+  outline-offset: 2px;
+}
+
+/* ===========================================================================
+ * Resume prompt — "Continue from N:NN?" overlay (Pack 1).
+ * ===========================================================================
+ */
+.lwp-resume-prompt {
+  position: absolute;
+  bottom: 96px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 100000;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 12px 18px;
+  background: var(--lwp-glass-bg, rgba(20,20,26,0.92));
+  border-radius: var(--lwp-radius, 12px);
+  box-shadow: 0 12px 36px rgba(0,0,0,0.55);
+  font-size: 14px;
+  color: var(--lwp-fg-strong, #fff);
+  animation: lwp-toast-in 220ms ease-out;
+}
+.lwp-resume-text {
+  display: flex;
+  align-items: baseline;
+  gap: 4px;
+}
+.lwp-resume-actions {
+  display: flex;
+  gap: 8px;
+}
+
+/* ===========================================================================
+ * Episode progress dots (in EpisodeDrawer) — Pack 1.
+ * ===========================================================================
+ */
+.lwp-episode-progress {
+  position: relative;
+  margin-top: 6px;
+  height: 3px;
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 2px;
+  overflow: visible;
+}
+.lwp-episode-progress-fill {
+  height: 100%;
+  background: var(--lwp-amb-accent, var(--lwp-accent, #4fc3f7));
+  border-radius: 2px;
+  transition: width 800ms ease-out;
+}
+.lwp-episode-watched-dot {
+  position: absolute;
+  right: -2px;
+  top: -3px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #69f0ae;
+  box-shadow: 0 0 6px rgba(105, 240, 174, 0.6);
+}
+
+/* ===========================================================================
+ * Bookmarks (Pack 2).
+ * ===========================================================================
+ */
+/* Dot on the timeline */
+.lwp-bookmark-dot {
+  position: absolute;
+  bottom: -2px;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: #ffd54f;
+  border: 1.5px solid rgba(0,0,0,0.6);
+  transform: translateX(-50%);
+  pointer-events: auto;
+  cursor: pointer;
+  box-shadow: 0 0 4px rgba(0,0,0,0.5);
+  z-index: 3;
+}
+.lwp-bookmark-dot:hover {
+  background: #ffe082;
+  box-shadow: 0 0 8px rgba(255, 213, 79, 0.6);
+}
+
+/* Panel */
+.lwp-bookmarks-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 50vh;
+  overflow-y: auto;
+}
+.lwp-bookmarks-empty {
+  color: var(--lwp-fg-muted, rgba(255,255,255,0.55));
+  font-size: 13px;
+  padding: 12px 4px;
+}
+.lwp-bookmarks-empty kbd {
+  display: inline-block;
+  padding: 2px 6px;
+  background: rgba(255,255,255,0.08);
+  border-radius: 4px;
+  font-family: SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+}
+.lwp-bookmark-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 4px;
+  border-bottom: 1px solid var(--lwp-divider, rgba(255,255,255,0.06));
+}
+.lwp-bookmark-time {
+  font-family: SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  color: var(--lwp-amb-accent, var(--lwp-accent, #4fc3f7));
+  background: transparent;
+  border: none;
+  padding: 4px 6px;
+  cursor: pointer;
+  border-radius: 4px;
+}
+.lwp-bookmark-time:hover { background: rgba(255,255,255,0.06); }
+.lwp-bookmark-label {
+  flex: 1;
+  font-size: 13px;
+  cursor: text;
+  color: var(--lwp-fg-strong, #fff);
+  padding: 4px 6px;
+  border-radius: 4px;
+}
+.lwp-bookmark-label:hover { background: rgba(255,255,255,0.04); }
+.lwp-bookmark-note-input {
+  flex: 1;
+  background: rgba(255,255,255,0.08);
+  border: 1px solid var(--lwp-divider, rgba(255,255,255,0.08));
+  color: var(--lwp-fg-strong, #fff);
+  border-radius: 4px;
+  padding: 4px 8px;
+  font-size: 13px;
+}
+.lwp-bookmarks-footer {
+  margin-top: 8px;
+  display: flex;
+  justify-content: flex-end;
+}
+
+/* ===========================================================================
+ * Voice control indicator (Pack 4).
+ * ===========================================================================
+ */
+.lwp-voice-indicator {
+  position: absolute;
+  top: 18px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 100000;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 16px;
+  background: var(--lwp-glass-bg, rgba(20,20,26,0.92));
+  border-radius: 999px;
+  font-size: 13px;
+  color: var(--lwp-fg-strong, #fff);
+  border: 1px solid color-mix(in srgb, var(--lwp-amb-accent, var(--lwp-accent, #4fc3f7)) 50%, transparent);
+  max-width: 80vw;
+  pointer-events: none;
+}
+.lwp-voice-pulse {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: #ff5252;
+  box-shadow: 0 0 0 0 rgba(255, 82, 82, 0.6);
+  animation: lwp-voice-pulse 1.4s infinite;
+}
+.lwp-voice-label {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 60vw;
+}
+@keyframes lwp-voice-pulse {
+  0%   { box-shadow: 0 0 0 0 rgba(255, 82, 82, 0.6); }
+  70%  { box-shadow: 0 0 0 10px rgba(255, 82, 82, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(255, 82, 82, 0); }
+}
+
+/* ===========================================================================
+ * Buffer health graph (Pack 6) — embedded in StatsOverlay.
+ * ===========================================================================
+ */
+.lwp-buffer-graph {
+  margin: 8px 12px 12px;
+  padding: 6px;
+  background: rgba(0, 0, 0, 0.3);
+  border-radius: var(--lwp-radius-sm, 8px);
+  border: 1px solid var(--lwp-divider, rgba(255,255,255,0.06));
+}
+.lwp-buffer-graph canvas {
+  display: block;
+  width: 100%;
+  height: 60px;
+}
