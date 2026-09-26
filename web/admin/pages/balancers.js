@@ -112,7 +112,7 @@ async function toggle(row) {
   try {
     const res = await api.post('/balancers', { name: row.name, fields: patch });
     if (res && res.error) throw new Error(res.error);
-    toast.success((next ? 'Включён: ' : 'Выключен: ') + row.name);
+    toast.success((next ? 'Включён: ' : 'Выключен: ') + (row.display || row.name));
     // Optimistic local update so the toggle responds instantly.
     row.fields = { ...(row.fields || {}), enable: next };
     paint();
@@ -230,7 +230,7 @@ async function toggleStreamProxy(row) {
   try {
     const res = await api.post('/balancers', { name: row.name, fields: { _stream_proxy: next } });
     if (res && res.error) throw new Error(res.error);
-    toast.success('Stream proxy ' + (next ? 'ВКЛ' : 'ВЫКЛ') + ' для ' + row.name);
+    toast.success('Stream proxy ' + (next ? 'ВКЛ' : 'ВЫКЛ') + ' для ' + (row.display || row.name));
     row.fields = { ...(row.fields || {}), _stream_proxy: next };
     paint();
   } catch (e) {
@@ -251,7 +251,7 @@ function filtered() {
   return state.rows.filter(r => {
     if (state.group && (r.group || 'other') !== state.group) return false;
     if (!f) return true;
-    return r.name.toLowerCase().includes(f);
+    return r.name.toLowerCase().includes(f) || (r.display || '').toLowerCase().includes(f);
   });
 }
 
@@ -325,7 +325,7 @@ function balancerCard(r) {
     <div class="b-card ${en ? '' : 'off'}">
       <div class="b-head">
         <div class="b-title">
-          <span class="b-name">${r.name}</span>
+          <span class="b-name">${r.display || r.name}</span>
           ${quality ? html`<span class="quality q-${quality.toLowerCase()}">${quality}</span>` : ''}
         </div>
         <label class="toggle">
@@ -425,7 +425,7 @@ function renderEditModal() {
     !present.has(s.key) && !state.deletedKeys.has(s.key) && !HIDDEN_FIELDS.has(s.key)
   );
   return html`
-    <l-modal ?open=${!!state.editing} title=${'Настройка: ' + (row.name || '')} @close=${closeEditor}>
+    <l-modal ?open=${!!state.editing} title=${'Настройка: ' + (row.display || row.name || '')} @close=${closeEditor}>
       <div class="be-grid">
         ${keys.length === 0
           ? html`<div class="be-empty">У балансера нет полей в конфиге. Добавь ниже — ключ запишется в раздел <code>[${row.name}]</code> в <code>init.conf</code>.</div>`

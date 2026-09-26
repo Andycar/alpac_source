@@ -164,12 +164,12 @@ func TestBindDevice_NewUID_OK(t *testing.T) {
 func TestStatus_StableFPRecovery(t *testing.T) {
 	store, pending := seedStore(t)
 	// Give tok-A's device a stable fp.
-	store.UpdateDeviceStableFP("tok-A", "uid-A", "sfp-tv")
+	store.UpdateDeviceStableFP("tok-A", "uid-A", "n:sfp-tv")
 	h := tgAuthStatusHandler(store, pending, "lampacbot", nil)
 
 	// Fresh boot after wipe: brand-new UID, unknown precise fp, but the same
 	// stable fp the device bound earlier.
-	r := httptest.NewRequest(http.MethodGet, "/tg/auth/status?uid=brand-new&fp=fp-drifted&sfp=sfp-tv", nil)
+	r := httptest.NewRequest(http.MethodGet, "/tg/auth/status?uid=brand-new&fp=fp-drifted&sfp=n:sfp-tv", nil)
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, r)
 
@@ -214,14 +214,14 @@ func TestBindDevice_WithStableFP(t *testing.T) {
 	h := tgAuthBindDeviceHandler(store)
 
 	r := httptest.NewRequest(http.MethodGet,
-		"/tg/auth/bind-device?token=tok-B&uid=tv-uid&fp=fp-tv&sfp=sfp-tv", nil)
+		"/tg/auth/bind-device?token=tok-B&uid=tv-uid&fp=fp-tv&sfp=n:sfp-tv", nil)
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, r)
 
 	if body := parseBody(t, w); body["ok"] != true {
 		t.Fatalf("ok = %v, want true", body["ok"])
 	}
-	if tok, _, ok := store.FindTokenByStableFP("sfp-tv"); !ok || tok != "tok-B" {
+	if tok, _, ok := store.FindTokenByStableFP("n:sfp-tv"); !ok || tok != "tok-B" {
 		t.Errorf("sfp not bound: tok=%q ok=%v, want tok-B", tok, ok)
 	}
 }

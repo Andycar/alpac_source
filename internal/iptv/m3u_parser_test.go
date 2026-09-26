@@ -222,16 +222,46 @@ func TestExtractAttr(t *testing.T) {
 }
 
 func TestChannelID_Deterministic(t *testing.T) {
-	id1 := channelID("http://example.com/stream.m3u8", "Test Channel")
-	id2 := channelID("http://example.com/stream.m3u8", "Test Channel")
+	id1 := channelID("tvg1|Test Channel|News", 1)
+	id2 := channelID("tvg1|Test Channel|News", 1)
 	if id1 != id2 {
 		t.Errorf("channelID not deterministic: %q != %q", id1, id2)
 	}
 
-	// Different URL → different ID.
-	id3 := channelID("http://example.com/other.m3u8", "Test Channel")
-	if id1 == id3 {
-		t.Error("different URLs should produce different IDs")
+	// Different identity → different ID.
+	if id3 := channelID("tvg1|Other Channel|News", 1); id1 == id3 {
+		t.Error("different identities should produce different IDs")
+	}
+	// Same identity, different occurrence (зеркала) → different ID.
+	if id4 := channelID("tvg1|Test Channel|News", 2); id1 == id4 {
+		t.Error("duplicate occurrences should produce different IDs")
+	}
+}
+
+// ID канала обязан переживать ротацию токена в URL (Xtream-панели): иначе
+// избранное/недавние клиентов протухают при каждом перечитывании плейлиста.
+func TestChannelID_StableAcrossURLTokenRotation(t *testing.T) {
+	build := func(token string) []Channel {
+		m3u := "#EXTM3U\n" +
+			"#EXTINF:-1 tvg-id=\"ch1\" group-title=\"Кино\",Канал Один\n" +
+			"http://panel/live/" + token + "/1.m3u8\n" +
+			"#EXTINF:-1 tvg-id=\"ch1\" group-title=\"Кино\",Канал Один\n" + // зеркало
+			"http://panel2/live/" + token + "/1.m3u8\n"
+		var out []Channel
+		if _, err := ParseM3U(strings.NewReader(m3u), func(ch Channel) { out = append(out, ch) }); err != nil {
+			t.Fatalf("ParseM3U error: %v", err)
+		}
+		return out
+	}
+	a, b := build("tokenA"), build("tokenB")
+	if len(a) != 2 || len(b) != 2 {
+		t.Fatalf("got %d/%d channels, want 2/2", len(a), len(b))
+	}
+	if a[0].ID != b[0].ID || a[1].ID != b[1].ID {
+		t.Errorf("IDs must survive token rotation: %q/%q vs %q/%q", a[0].ID, a[1].ID, b[0].ID, b[1].ID)
+	}
+	if a[0].ID == a[1].ID {
+		t.Error("mirror duplicates must keep distinct IDs")
 	}
 }
 
@@ -265,5 +295,39 @@ func TestParseM3U_ExtGrpLine(t *testing.T) {
 	}
 	if chans[2].Group != "новости" {
 		t.Errorf("ch2 group = %q, want новости (group-title wins over #EXTGRP)", chans[2].Group)
+	}
+}
+
+// TestCleanChannelNameWordBoundary: «360» внутри «360°» — часть имени, а не тег
+// качества; прежний паттерн превращал канал в «°».
+func TestCleanChannelNameWordBoundary(t *testing.T) {
+	cases := map[string]string{
+		"360° (1080p)":              "360°",
+		"Первый канал HD":           "Первый канал",
+		"Дом Кино HD (720p)":        "Дом Кино",
+		"Футбол (1080p) [Not 24/7]": "Футбол",
+		"HD Кино":                   "Кино",
+	}
+	for in, want := range cases {
+		if got := cleanChannelName(in); got != want {
+			t.Errorf("cleanChannelName(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// TestCleanChannelNameOddResolutions: региональные каналы сплошь 576p/288p —
+// без них в имени оставался хвост «(576p)».
+func TestCleanChannelNameOddResolutions(t *testing.T) {
+	cases := map[string]string{
+		"Губерния (Самара) (576p)": "Губерния (Самара)",
+		"Муз союз (576p)":          "Муз союз",
+		"Ника ТВ (576p)":           "Ника ТВ",
+		"Канал 288p":               "Канал",
+		"Что-то 240i":              "Что-то",
+	}
+	for in, want := range cases {
+		if got := cleanChannelName(in); got != want {
+			t.Errorf("cleanChannelName(%q) = %q, want %q", in, got, want)
+		}
 	}
 }

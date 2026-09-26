@@ -88,7 +88,21 @@ const (
 	gencitCacheFile     = "gencit_index.json"
 )
 
+// gencitIndexes мемоизирует индекс по хосту. scan() ниже обходит 25 000
+// playlist-id двадцатью воркерами, а индекс строился на каждую сборку
+// хендлера: в проде это давало новый обход при каждой перезагрузке конфига,
+// а в тестах — где liteSourceHandler собирается заново на каждый вызов —
+// сотни одновременных обходов. Замер на полном прогоне internal/httpapi:
+// ~9800 висящих SYN к ylitron.pro разом, эфемерные порты выбраны под ноль
+// (16342 из 16384), после чего падал connect даже к 127.0.0.1 и тесты сыпались
+// вразнобой. Один индекс на хост держит обход в пределах 20 соединений.
+var gencitIndexes sync.Map // host -> *gencitIndex
+
 func newGencitIndex(host, referer, repoRoot string, client *http.Client) *gencitIndex {
+	if v, ok := gencitIndexes.Load(host); ok {
+		return v.(*gencitIndex)
+	}
+
 	cachePath := ""
 	if repoRoot != "" {
 		cachePath = filepath.Join(repoRoot, "database", gencitCacheFile)
@@ -101,6 +115,12 @@ func newGencitIndex(host, referer, repoRoot string, client *http.Client) *gencit
 		referer:   referer,
 		client:    client,
 		ready:     make(chan struct{}),
+	}
+
+	// Гонку за создание разрешаем здесь: проигравший отдаёт чужой индекс и
+	// НЕ запускает свой обход.
+	if prev, loaded := gencitIndexes.LoadOrStore(host, idx); loaded {
+		return prev.(*gencitIndex)
 	}
 
 	// Try loading from disk cache first

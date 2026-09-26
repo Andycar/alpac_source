@@ -2,8 +2,14 @@ package cluster
 
 import (
 	"context"
+	"encoding/json"
+	"hash/fnv"
+	"io"
 	"math"
 	"net/http"
+	"net/url"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -17,12 +23,14 @@ import (
 
 // Node represents a single backend lampac-go instance (runtime state).
 type Node struct {
-	ID          string
-	Name        string
-	Host        string
-	Weight      int
-	Region      string
-	Enabled     bool
+	ID        string
+	Name      string
+	Host      string
+	Weight    int
+	Region    string
+	Enabled   bool
+	EdgeURL   string // клиентский адрес ноды, см. StoredNode.EdgeURL
+	EdgeLabel string // имя для зрителя, см. StoredNode.EdgeLabel
 
 	healthy     atomic.Bool
 	activeConns atomic.Int64
@@ -46,6 +54,18 @@ type Node struct {
 	probeHistMu  sync.Mutex
 	probeHist    []bool
 	probeHistCap int
+
+	// Rolling failure rate over recent forwarded requests (see failrate.go).
+	// Health from ping alone cannot see a node that answers but cannot serve.
+	failEWMA    atomic.Int64 // per-mille, 0..1000
+	failSamples atomic.Int64
+
+	// Version and build reported by the node's /api/cluster/ping. Empty until
+	// the first successful probe, or when the node is too old to report them.
+	// build (short binary hash) is what actually distinguishes two builds —
+	// the version string is identical across every release.
+	version atomic.Value // string
+	build   atomic.Value // string
 
 	consecFails int // guarded by pool.mu
 	consecOK    int // guarded by pool.mu
@@ -81,12 +101,12 @@ func (n *Node) UptimePct() float64 {
 	return float64(ok) / float64(len(n.probeHist)) * 100.0
 }
 
-func (n *Node) IsHealthy() bool       { return n.healthy.Load() }
-func (n *Node) ActiveConns() int64    { return n.activeConns.Load() }
-func (n *Node) TotalServed() int64    { return n.totalServed.Load() }
-func (n *Node) TotalFailed() int64    { return n.totalFailed.Load() }
-func (n *Node) LastLatencyMs() int64  { return n.lastLatency.Load() }
-func (n *Node) AvgLatencyMs() int64   { return n.avgLatency.Load() }
+func (n *Node) IsHealthy() bool      { return n.healthy.Load() }
+func (n *Node) ActiveConns() int64   { return n.activeConns.Load() }
+func (n *Node) TotalServed() int64   { return n.totalServed.Load() }
+func (n *Node) TotalFailed() int64   { return n.totalFailed.Load() }
+func (n *Node) LastLatencyMs() int64 { return n.lastLatency.Load() }
+func (n *Node) AvgLatencyMs() int64  { return n.avgLatency.Load() }
 func (n *Node) LastCheck() time.Time {
 	v, _ := n.lastCheck.Load().(time.Time)
 	return v
@@ -170,6 +190,8 @@ type NodeStatus struct {
 	Name          string    `json:"name"`
 	Host          string    `json:"host"`
 	Region        string    `json:"region,omitempty"`
+	EdgeURL       string    `json:"edge_url,omitempty"`
+	EdgeLabel     string    `json:"edge_label,omitempty"`
 	Enabled       bool      `json:"enabled"`
 	Healthy       bool      `json:"healthy"`
 	ActiveConns   int64     `json:"active_conns"`
@@ -187,6 +209,16 @@ type NodeStatus struct {
 	UniqueClients5m int `json:"unique_clients_5m"`
 	// % of successful probes over the recent history (typically last hour).
 	UptimePct float64 `json:"uptime_pct"`
+	// Share of recently forwarded requests that failed, 0..1 (see failrate.go).
+	// This is what routing penalises — total_failed is a lifetime figure and
+	// never recovers, so it cannot be used for that.
+	FailRate float64 `json:"fail_rate"`
+	// Build reported by the node itself. Empty = not probed yet, or a node old
+	// enough that its ping does not carry a version.
+	Version string `json:"version,omitempty"`
+	// Short hash of the node's binary — the only reliable way to tell whether
+	// the fleet is running the same code.
+	Build string `json:"build,omitempty"`
 }
 
 const (
@@ -195,21 +227,25 @@ const (
 
 // Pool manages a set of backend nodes with health checks and selection.
 type Pool struct {
-	mu         sync.RWMutex
-	nodes      []*Node
-	apiKey     string
-	client     *http.Client
-	cancel     context.CancelFunc
-	settings   Settings
-	store      *Store
+	mu       sync.RWMutex
+	nodes    []*Node
+	apiKey   string
+	client   *http.Client
+	cancel   context.CancelFunc
+	settings Settings
+	store    *Store
 
 	localConns  atomic.Int64
 	localWeight int
 
+	// localBuild is this instance's own short binary hash, used only to warn
+	// when a node reports a different one.
+	localBuild atomic.Value // string
+
 	// localServed counts requests handled by primary itself (not forwarded).
-	localServed  atomic.Int64
-	localFailed  atomic.Int64
-	localBytes   atomic.Int64
+	localServed atomic.Int64
+	localFailed atomic.Int64
+	localBytes  atomic.Int64
 
 	// Local stats — same shape as Node, for primary-handled requests.
 	localStatsMu       sync.RWMutex
@@ -225,15 +261,15 @@ type Pool struct {
 
 // ForwardEvent describes a single routing decision (forward or local handling).
 type ForwardEvent struct {
-	Time     time.Time `json:"time"`
-	Balancer string    `json:"balancer"`
-	Target   string    `json:"target"`         // "local" or node name
-	NodeID   string    `json:"node_id,omitempty"`
-	ClientIP string    `json:"client_ip,omitempty"`
-	LatencyMs int64    `json:"latency_ms,omitempty"`
-	Status   int       `json:"status,omitempty"` // HTTP status, 0 if not applicable
-	BytesOut  int64    `json:"bytes_out,omitempty"`
-	Failed   bool      `json:"failed,omitempty"`
+	Time      time.Time `json:"time"`
+	Balancer  string    `json:"balancer"`
+	Target    string    `json:"target"` // "local" or node name
+	NodeID    string    `json:"node_id,omitempty"`
+	ClientIP  string    `json:"client_ip,omitempty"`
+	LatencyMs int64     `json:"latency_ms,omitempty"`
+	Status    int       `json:"status,omitempty"` // HTTP status, 0 if not applicable
+	BytesOut  int64     `json:"bytes_out,omitempty"`
+	Failed    bool      `json:"failed,omitempty"`
 }
 
 // recordEvent appends an event to the ring buffer, dropping the oldest when at capacity.
@@ -269,15 +305,15 @@ func (p *Pool) RecordForwardEvent(node *Node, balancer, clientIP string, status 
 		return
 	}
 	p.recordEvent(ForwardEvent{
-		Time:     time.Now(),
-		Balancer: balancer,
-		Target:   node.Name,
-		NodeID:   node.ID,
-		ClientIP: clientIP,
+		Time:      time.Now(),
+		Balancer:  balancer,
+		Target:    node.Name,
+		NodeID:    node.ID,
+		ClientIP:  clientIP,
 		LatencyMs: latencyMs,
-		Status:   status,
-		BytesOut: bytesOut,
-		Failed:   failed,
+		Status:    status,
+		BytesOut:  bytesOut,
+		Failed:    failed,
 	})
 }
 
@@ -369,6 +405,16 @@ func (p *Pool) SetSettings(st Settings) error {
 	return nil
 }
 
+// ApplySettings подменяет настройки в памяти, ничего не записывая на диск.
+// Отличие от SetSettings: та сохраняет в стор, а на перечитывании мы, наоборот,
+// приехали ИЗ файла — писать обратно нечего и незачем.
+func (p *Pool) ApplySettings(st Settings) {
+	st.normalize()
+	p.mu.Lock()
+	p.settings = st
+	p.mu.Unlock()
+}
+
 // CurrentSettings returns a copy of the active settings.
 func (p *Pool) CurrentSettings() Settings {
 	p.mu.RLock()
@@ -398,16 +444,20 @@ func (p *Pool) reconcileLocked(snapshot []StoredNode) {
 			existing.Weight = maxInt(1, sn.Weight)
 			existing.Region = sn.Region
 			existing.Enabled = sn.Enabled
+			existing.EdgeURL = normalizeEdgeURL(sn.EdgeURL)
+			existing.EdgeLabel = strings.TrimSpace(sn.EdgeLabel)
 			next = append(next, existing)
 			continue
 		}
 		n := &Node{
-			ID:      sn.ID,
-			Name:    sn.Name,
-			Host:    sn.Host,
-			Weight:  maxInt(1, sn.Weight),
-			Region:  sn.Region,
-			Enabled: sn.Enabled,
+			ID:        sn.ID,
+			Name:      sn.Name,
+			Host:      sn.Host,
+			Weight:    maxInt(1, sn.Weight),
+			Region:    sn.Region,
+			Enabled:   sn.Enabled,
+			EdgeURL:   normalizeEdgeURL(sn.EdgeURL),
+			EdgeLabel: strings.TrimSpace(sn.EdgeLabel),
 		}
 		n.healthy.Store(true) // optimistic
 		next = append(next, n)
@@ -421,13 +471,32 @@ func (p *Pool) reconcileLocked(snapshot []StoredNode) {
 //   - target=local       → return (nil, true) meaning "handle locally"
 //   - target=node        → pick best healthy node, fallback nil if none
 //   - target=node-id     → pick that specific node if healthy, fallback to
-//                          best node, then to local
+//     best node, then to local
 //
 // If no rule matches, falls through to regular Pick() behaviour.
 //
 // Returned bool is `localForced` — when true the caller must NOT consult
 // Pick() further; the rule explicitly chose local.
-func (p *Pool) PickFor(balancer string) (node *Node, localForced bool) {
+func (p *Pool) PickFor(balancer, hint string) (node *Node, localForced bool) {
+	return p.PickForSkip(balancer, hint, nil)
+}
+
+// PickForSkip — выбор добывающей ноды с учётом нод, отключённых зрителем.
+func (p *Pool) PickForSkip(balancer, hint string, skip map[string]bool) (node *Node, localForced bool) {
+	return p.PickForSkipKey(balancer, hint, "", skip)
+}
+
+// PickForSkipKey — PickForSkip с ключом липкости (см. StickyKey): правило «sticky» ведёт один
+// и тот же ключ на одну и ту же ноду. Пустой ключ — правило работает как «edge».
+func (p *Pool) PickForSkipKey(balancer, hint, key string, skip map[string]bool) (node *Node, localForced bool) {
+	// Правило записано на ИМЯ балансера, а сюда приходит весь путь после /lite/. У части
+	// источников ссылку добывает второй запрос с подпутём («cdnvideohub/video.m3u8»,
+	// «videoseed/video/…»), и без отсечения он правилу не соответствовал — уходил в обычную
+	// балансировку. Для источника с IP-привязкой это провал: добыть могла нода без своего
+	// клиентского адреса, подписать ссылку ей нечем, и отдавать её берётся main с чужого IP.
+	if i := strings.IndexAny(balancer, "/?#"); i >= 0 {
+		balancer = balancer[:i]
+	}
 	if balancer == "" {
 		return p.Pick(), false
 	}
@@ -435,6 +504,11 @@ func (p *Pool) PickFor(balancer string) (node *Node, localForced bool) {
 	rules := p.settings.Rules
 	p.mu.RUnlock()
 
+	// Правило «local» сильнее любой подсказки: источники, которые умеет
+	// добывать только primary (браузер, токены), к нодам не уходят.
+	// «nodes» — тоже сильнее подсказки: нода не из списка получает мёртвые
+	// ссылки, и увести туда зрителя, выбравшего её скорость, значит сломать ему
+	// источник.
 	for _, r := range rules {
 		if !strings.EqualFold(r.Balancer, balancer) {
 			continue
@@ -442,23 +516,270 @@ func (p *Pool) PickFor(balancer string) (node *Node, localForced bool) {
 		switch r.Target {
 		case "local":
 			return nil, true
+		case "nodes":
+			return p.pickAllowedSkip(r.NodeIDs, hint, skip)
+		case "sticky":
+			// Тоже сильнее подсказки: у CDN с привязкой к первому IP «своя» нода зрителя —
+			// это чужой адрес для уже играющего поста, то есть 429 вместо кино.
+			return p.pickStickySkip(r.NodeIDs, key, skip)
+		}
+	}
+
+	// Зритель померил скорость и просит конкретную ноду (edge=…): пусть она
+	// и добывает ссылку — тогда поток, привязанный к добывшему, отдаст именно
+	// та нода, до которой у зрителя лучший канал. Нода узнаётся по edge_url.
+	// Запрет сильнее просьбы — как и в pickEdge на отдаче.
+	if n := p.findByEdge(hint); n != nil && !nodeSkipped(n, skip) {
+		return n, false
+	}
+
+	for _, r := range rules {
+		if !strings.EqualFold(r.Balancer, balancer) {
+			continue
+		}
+		switch r.Target {
 		case "node-id":
 			// Try the pinned node first.
 			if r.NodeID != "" {
-				if n := p.FindByID(r.NodeID); n != nil && n.Enabled && n.healthy.Load() {
+				// Закрепление админом — про нагрузку, а запрет зрителя — про его личный
+				// маршрут: уводить человека на ноду, которую он выключил, нельзя и здесь.
+				if n := p.FindByID(r.NodeID); n != nil && n.Enabled && n.healthy.Load() && !nodeSkipped(n, skip) {
 					return n, false
 				}
 			}
 			// Fallthrough to "any healthy node".
 			fallthrough
 		case "node":
-			n := p.PickRemote()
+			n := p.PickRemoteSkip(skip)
 			return n, false
+		case "edge":
+			// Только ноды с клиентским адресом: их ссылки отдаст тот, кто добыл.
+			// Нет ни одной живой — любая нода лучше, чем primary, который
+			// такой источник добыть не может вовсе (hdvb на main → пусто).
+			if n := p.PickEdgeNodeSkip(skip); n != nil {
+				return n, false
+			}
+			return p.PickRemoteSkip(skip), false
 		}
 		// Unknown target — ignore and fall through to default pick.
 		break
 	}
-	return p.Pick(), false
+	return p.PickSkip(skip), false
+}
+
+// StickyKey — идентичность запроса /lite для правила «sticky»: пост, если он уже известен,
+// иначе название + оригинал + год (так первый и второй уровень одного тайтла обычно
+// сходятся на одной ноде). Пусто — идентичности нет.
+func StickyKey(q url.Values) string {
+	for _, k := range []string{"postid", "post_id"} {
+		if v, err := strconv.Atoi(strings.TrimSpace(q.Get(k))); err == nil && v > 0 {
+			return "post:" + strconv.Itoa(v)
+		}
+	}
+	norm := func(k string) string { return strings.ToLower(strings.Join(strings.Fields(q.Get(k)), " ")) }
+	title, orig, year := norm("title"), norm("original_title"), norm("year")
+	if title == "" && orig == "" {
+		for _, k := range []string{"kinopoisk_id", "imdb_id", "id"} {
+			if v := strings.TrimSpace(q.Get(k)); v != "" && v != "0" {
+				return k + ":" + v
+			}
+		}
+		return ""
+	}
+	return "title:" + title + "|" + orig + "|" + year
+}
+
+// pickStickySkip — рандеву-хеширование по ключу: один пост всегда уходит на одну и ту же
+// живую ноду (с учётом веса), и только её выпадение переносит пост на соседнюю.
+//
+// Зачем: подпись Filmix `/s/<hash>/` выдаётся на УЧЁТКУ+пост (не на токен и не на устройство)
+// и закрепляется CDN за первым IP, который её тронул; с любого другого адреса та же ссылка —
+// 429 с retry-after ≈ 10 ч (проверено 22.09.2026: main 206, SPB 429, main 206, SPB 429).
+// Шесть хостов на одной учётке при равномерной раздаче = популярный пост играет с одной ноды,
+// а с остальных зрители получают 429 (CH 438, MSK 264, DE 232 за сутки). Липкость убирает
+// столкновения без единого лишнего токена. Список NodeIDs (если задан) ограничивает кольцо.
+func (p *Pool) pickStickySkip(ids []string, key string, skip map[string]bool) (*Node, bool) {
+	if key == "" {
+		if n := p.PickEdgeNodeSkip(skip); n != nil {
+			return n, false
+		}
+		return p.PickRemoteSkip(skip), false
+	}
+	allowed := map[string]bool{}
+	for _, id := range ids {
+		if id = strings.TrimSpace(id); id != "" {
+			allowed[id] = true
+		}
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	var best *Node
+	bestScore := math.MaxFloat64
+	for _, n := range p.nodes {
+		if len(allowed) > 0 && !allowed[n.ID] {
+			continue
+		}
+		if !n.Enabled || !n.healthy.Load() || nodeSkipped(n, skip) {
+			continue
+		}
+		w := n.Weight
+		if w <= 0 {
+			w = 1
+		}
+		h := fnv.New64a()
+		_, _ = h.Write([]byte(key))
+		_, _ = h.Write([]byte{0})
+		_, _ = h.Write([]byte(n.ID))
+		u := (float64(h.Sum64()>>11) + 1) / float64(uint64(1)<<53) // (0,1]
+		// Взвешенное рандеву: min(-ln u / w) выбирает ноду i с вероятностью w_i/Σw и не
+		// перетасовывает остальных при выпадении одной.
+		if score := -math.Log(u) / float64(w); score < bestScore {
+			bestScore, best = score, n
+		}
+	}
+	if best == nil {
+		return nil, true // ни одной живой — primary добудет сам
+	}
+	return best, false
+}
+
+// pickAllowedSkip — нода из разрешённого списка. Подсказка зрителя берётся,
+// только если называет ноду из списка; иначе — лучшая по оценке среди
+// разрешённых. Ни одной живой — primary (localForced): лучше честно добыть на
+// main, чем отдать заведомо мёртвую ссылку с неподходящей ноды.
+func (p *Pool) pickAllowedSkip(ids []string, hint string, skip map[string]bool) (*Node, bool) {
+	allowed := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		if id = strings.TrimSpace(id); id != "" {
+			allowed[id] = true
+		}
+	}
+	if len(allowed) == 0 {
+		return nil, true
+	}
+	if n := p.findByEdge(hint); n != nil && allowed[n.ID] && !nodeSkipped(n, skip) {
+		return n, false
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	var best *Node
+	bestScore := math.MaxFloat64
+	for _, n := range p.nodes {
+		if !allowed[n.ID] || !n.Enabled || !n.healthy.Load() || nodeSkipped(n, skip) {
+			continue
+		}
+		if s := p.scoreLocked(n); s < bestScore {
+			bestScore, best = s, n
+		}
+	}
+	if best == nil {
+		return nil, true
+	}
+	return best, false
+}
+
+// FailoverCandidates — ноды, которым main может отдать запрос на добор, когда
+// сам контент не получил: живые, включённые, с клиентским адресом и не
+// отключённые зрителем. Клиентский адрес обязателен: у источников с привязкой
+// ссылки к добывшему видео должна отдавать сама нода, а без edge_url её ссылку
+// отдавал бы main со своего IP — и получал бы 404. По возрастанию нагрузки.
+func (p *Pool) FailoverCandidates(skip map[string]bool) []*Node {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	type scored struct {
+		n *Node
+		s float64
+	}
+	var list []scored
+	for _, n := range p.nodes {
+		if n.EdgeURL == "" || !n.Enabled || !n.healthy.Load() || nodeSkipped(n, skip) {
+			continue
+		}
+		list = append(list, scored{n, p.scoreLocked(n)})
+	}
+	sort.Slice(list, func(i, j int) bool { return list[i].s < list[j].s })
+	out := make([]*Node, 0, len(list))
+	for _, x := range list {
+		out = append(out, x.n)
+	}
+	return out
+}
+
+// RuleTarget — цель правила маршрутизации для балансера ("" — правила нет).
+func (p *Pool) RuleTarget(balancer string) string {
+	if i := strings.IndexAny(balancer, "/?#|"); i >= 0 {
+		balancer = balancer[:i]
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	for _, r := range p.settings.Rules {
+		if strings.EqualFold(r.Balancer, balancer) {
+			return r.Target
+		}
+	}
+	return ""
+}
+
+// normalizeEdgeURL приводит адрес к виду «https://host[:port]» без хвоста.
+func normalizeEdgeURL(u string) string {
+	u = strings.TrimRight(strings.TrimSpace(u), "/")
+	if u == "" {
+		return ""
+	}
+	if !strings.Contains(u, "://") {
+		u = "https://" + u
+	}
+	return strings.ToLower(u)
+}
+
+// findByEdge — живая включённая нода с таким клиентским адресом, либо nil.
+func (p *Pool) findByEdge(hint string) *Node {
+	want := normalizeEdgeURL(hint)
+	if want == "" {
+		return nil
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	for _, n := range p.nodes {
+		if n.EdgeURL != "" && n.EdgeURL == want && n.Enabled && n.healthy.Load() {
+			return n
+		}
+	}
+	return nil
+}
+
+// PickEdgeNode — лучшая по счёту живая нода, у которой есть клиентский адрес.
+// nodeSkipped — отключил ли зритель эту ноду у себя (набор нормализованных edge_url).
+//
+// Запрет обязан действовать не только на ОТДАЧУ, но и на ДОБЫЧУ: у источников с правилом «edge»
+// ссылку отдаёт тот, кто её добыл, и без этой проверки зритель, отключивший ноду, всё равно
+// уезжал бы на неё — добыли там, значит оттуда и отдадут.
+//
+// Ноду без edge_url отключить нельзя: зритель её не видит и назвать не может.
+func nodeSkipped(n *Node, skip map[string]bool) bool {
+	if len(skip) == 0 || n == nil || n.EdgeURL == "" {
+		return false
+	}
+	return skip[normalizeEdgeURL(n.EdgeURL)]
+}
+
+func (p *Pool) PickEdgeNode() *Node { return p.PickEdgeNodeSkip(nil) }
+
+// PickEdgeNodeSkip — то же, но мимо нод, отключённых зрителем.
+func (p *Pool) PickEdgeNodeSkip(skip map[string]bool) *Node {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	bestScore := math.MaxFloat64
+	var best *Node
+	for _, n := range p.nodes {
+		if n.EdgeURL == "" || !n.Enabled || !n.healthy.Load() || nodeSkipped(n, skip) {
+			continue
+		}
+		if score := p.scoreLocked(n); score < bestScore {
+			bestScore, best = score, n
+		}
+	}
+	return best
 }
 
 // Pick selects the best node according to the configured strategy.
@@ -468,7 +789,10 @@ func (p *Pool) PickFor(balancer string) (node *Node, localForced bool) {
 // When Settings.ForceNode is true, the primary's local baseline is skipped
 // entirely — every request goes to the best available node. Falls back to
 // local only if no healthy node exists.
-func (p *Pool) Pick() *Node {
+func (p *Pool) Pick() *Node { return p.PickSkip(nil) }
+
+// PickSkip — то же, но мимо нод, отключённых зрителем.
+func (p *Pool) PickSkip(skip map[string]bool) *Node {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 
@@ -476,7 +800,7 @@ func (p *Pool) Pick() *Node {
 		var best *Node
 		bestScore := math.MaxFloat64
 		for _, n := range p.nodes {
-			if !n.Enabled || !n.healthy.Load() {
+			if !n.Enabled || !n.healthy.Load() || nodeSkipped(n, skip) {
 				continue
 			}
 			s := p.scoreLocked(n)
@@ -489,11 +813,13 @@ func (p *Pool) Pick() *Node {
 	}
 
 	// Local (primary) baseline score — uses conns only, latency assumed 0.
-	bestScore := float64(p.localConns.Load()) / float64(p.localWeight)
+	// The divisor is the primary's capacity relative to a node of weight 1; see
+	// Settings.LocalWeight for why leaving it at 1 starves an 8-core primary.
+	bestScore := float64(p.localConns.Load()) / float64(p.effectiveLocalWeight())
 	var best *Node // nil = local
 
 	for _, n := range p.nodes {
-		if !n.Enabled || !n.healthy.Load() {
+		if !n.Enabled || !n.healthy.Load() || nodeSkipped(n, skip) {
 			continue
 		}
 		score := p.scoreLocked(n)
@@ -507,14 +833,17 @@ func (p *Pool) Pick() *Node {
 
 // PickRemote returns the best healthy remote node, never primary. Used by
 // fan-out checksearch.
-func (p *Pool) PickRemote() *Node {
+func (p *Pool) PickRemote() *Node { return p.PickRemoteSkip(nil) }
+
+// PickRemoteSkip — то же, но мимо нод, отключённых зрителем.
+func (p *Pool) PickRemoteSkip(skip map[string]bool) *Node {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 
 	bestScore := math.MaxFloat64
 	var best *Node
 	for _, n := range p.nodes {
-		if !n.Enabled || !n.healthy.Load() {
+		if !n.Enabled || !n.healthy.Load() || nodeSkipped(n, skip) {
 			continue
 		}
 		score := p.scoreLocked(n)
@@ -563,7 +892,31 @@ func (p *Pool) PickRetryCandidates(maxAttempts int, skip map[string]bool) []*Nod
 
 // scoreLocked computes the strategy-aware score (lower = better).
 // Caller must hold p.mu.RLock.
+// scoreLocked ranks a node — lower is better.
+//
+// Every strategy is scaled by the node's recent failure rate, so the number
+// means "cost per successful request" rather than cost per attempt. Without
+// that scaling the pool happily kept feeding a node that was dropping 43% of
+// what it was given: the failures were counted but never consulted, and a
+// retry on another node costs the client the full latency twice.
 func (p *Pool) scoreLocked(n *Node) float64 {
+	return p.rawScoreLocked(n) * n.failPenalty()
+}
+
+// effectiveLocalWeight is the primary's capacity divisor. Settings wins when it
+// carries a usable value; p.localWeight is the pre-settings fallback. Callers
+// hold at least a read lock.
+func (p *Pool) effectiveLocalWeight() int {
+	if w := p.settings.LocalWeight; w > 0 {
+		return w
+	}
+	if p.localWeight > 0 {
+		return p.localWeight
+	}
+	return 1
+}
+
+func (p *Pool) rawScoreLocked(n *Node) float64 {
 	conns := float64(n.activeConns.Load()) / float64(n.Weight)
 	switch p.settings.Strategy {
 	case "least-conns":
@@ -673,6 +1026,7 @@ func (p *Pool) DecrConns(n *Node) {
 // observed latency.
 func (p *Pool) MarkFailedRequest(n *Node, latencyMs int64, err string) {
 	n.totalFailed.Add(1)
+	n.observeOutcome(true)
 	if latencyMs > 0 {
 		n.updateEWMA(latencyMs)
 	}
@@ -684,6 +1038,7 @@ func (p *Pool) MarkFailedRequest(n *Node, latencyMs int64, err string) {
 // MarkSuccessRequest is called after a successful proxied response. It feeds
 // EWMA with the observed latency to keep avgLatency responsive to real load.
 func (p *Pool) MarkSuccessRequest(n *Node, latencyMs int64) {
+	n.observeOutcome(false)
 	if latencyMs > 0 {
 		n.updateEWMA(latencyMs)
 	}
@@ -722,6 +1077,8 @@ func (p *Pool) Snapshot() []NodeStatus {
 			Name:            n.Name,
 			Host:            n.Host,
 			Region:          n.Region,
+			EdgeURL:         n.EdgeURL,
+			EdgeLabel:       n.EdgeLabel,
 			Enabled:         n.Enabled,
 			Healthy:         n.healthy.Load(),
 			ActiveConns:     n.activeConns.Load(),
@@ -736,6 +1093,9 @@ func (p *Pool) Snapshot() []NodeStatus {
 			ByBalancer:      byBal,
 			UniqueClients5m: uniq,
 			UptimePct:       n.UptimePct(),
+			FailRate:        n.FailRate(),
+			Version:         n.NodeVersion(),
+			Build:           n.NodeBuild(),
 		}
 	}
 	return out
@@ -768,6 +1128,14 @@ func (p *Pool) LocalSnapshot() LocalStatus {
 
 // APIKey returns the shared cluster secret.
 func (p *Pool) APIKey() string { return p.apiKey }
+
+// SetLocalBuild records this instance's build so probes can flag a node that
+// is running something else.
+func (p *Pool) SetLocalBuild(b string) {
+	if strings.TrimSpace(b) != "" {
+		p.localBuild.Store(b)
+	}
+}
 
 // Strategy returns the active routing strategy name.
 func (p *Pool) Strategy() string {
@@ -862,8 +1230,48 @@ func (p *Pool) probe(ctx context.Context, n *Node) {
 		p.markFailed(n)
 		return
 	}
+
+	// Read the version the node reports. Nodes older than this field simply
+	// omit it, so an empty string means "unknown", never "mismatch".
+	var ping struct {
+		Version string `json:"version"`
+		Build   string `json:"build"`
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<10))
+	if err := json.Unmarshal(body, &ping); err == nil {
+		prev, _ := n.version.Load().(string)
+		if v := strings.TrimSpace(ping.Version); v != "" && v != prev {
+			n.version.Store(v)
+		}
+		prevBuild, _ := n.build.Load().(string)
+		if b := strings.TrimSpace(ping.Build); b != "" && b != prevBuild {
+			n.build.Store(b)
+			if prevBuild != "" {
+				log.Info().Str("node", n.Host).Str("from", prevBuild).Str("to", b).
+					Msg("cluster: node build changed")
+			}
+			if mine, _ := p.localBuild.Load().(string); mine != "" && mine != b {
+				log.Warn().Str("node", n.Host).Str("node_build", b).Str("primary_build", mine).
+					Msg("cluster: node runs a different build than the primary")
+			}
+		}
+	}
+
 	n.lastError.Store("")
 	p.markOK(n)
+}
+
+// NodeVersion returns the version last reported by the node, or "" when the
+// node has not been probed yet or is too old to report one.
+func (n *Node) NodeVersion() string {
+	v, _ := n.version.Load().(string)
+	return v
+}
+
+// NodeBuild returns the short binary hash the node reported, or "".
+func (n *Node) NodeBuild() string {
+	v, _ := n.build.Load().(string)
+	return v
 }
 
 func (p *Pool) markFailed(n *Node) {

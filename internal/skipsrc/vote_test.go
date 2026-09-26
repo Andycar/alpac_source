@@ -32,8 +32,8 @@ func TestVotePrefersDurationAwareTiming(t *testing.T) {
 // Aniskip's absolute times outrank a duration-aware guess.
 func TestVoteAnimeAbsoluteOutranksDurationAware(t *testing.T) {
 	got := vote([]result{
-		{name: "skipme", signal: 0.4, segments: []Segment{
-			seg(CatIntro, 100, 190, BaseDurationAware, TrustSkipMe, "skipme")}},
+		{name: "skipdb", signal: 0.4, segments: []Segment{
+			seg(CatIntro, 100, 190, BaseDurationAware, TrustDurationAware, "skipdb")}},
 		{name: "aniskip", signal: 0.9, segments: []Segment{
 			seg(CatIntro, 85, 175, BaseAbsolute, TrustAnime, "aniskip")}},
 	})
@@ -68,8 +68,8 @@ func TestVoteClustersAndKeepsSinglePerCategory(t *testing.T) {
 // not marked confirmed, so a client may treat it more cautiously.
 func TestVoteSingleSourceUnconfirmed(t *testing.T) {
 	got := vote([]result{
-		{name: "introhater", signal: 0.3, segments: []Segment{
-			seg(CatCredits, 2400, 2500, BaseAbsolute, TrustAbsolute, "introhater")}},
+		{name: "introdb", signal: 0.3, segments: []Segment{
+			seg(CatCredits, 2400, 2500, BaseAbsolute, TrustAbsolute, "introdb")}},
 	})
 	if len(got) != 1 || got[0].Confirmed {
 		t.Fatalf("single source must survive but stay unconfirmed, got %+v", got)

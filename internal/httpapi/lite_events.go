@@ -26,6 +26,7 @@ import (
 	"encoding/hex"
 	stdjson "encoding/json"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"lampac-go/internal/balancerhealth"
 	"lampac-go/internal/httpclient"
@@ -37,6 +38,7 @@ import (
 	"net/url"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -388,6 +390,10 @@ var localCorePlugins = map[string]struct{}{
 	"mirage":       {},
 	"rutubemovie":  {},
 	"anwap":        {},
+	"rudub":        {},
+	"anidub":       {},
+	"zagonka":      {},
+	"smotrim":      {},
 	"vkmovie":      {},
 	"anilibria":    {},
 	"aniliberty":   {}, // full local Go impl (aniliberty.go) + animePlugins member — was missing here
@@ -435,6 +441,9 @@ var localCorePlugins = map[string]struct{}{
 	"leproduction": {},
 	"flixcdn":      {},
 	"sakhtv":       {},
+	"scts":         {},
+	"kbteam":       {},
+	"krasview":     {},
 }
 
 // balancerNameAliases maps alternate balancer keys to their canonical registry
@@ -544,7 +553,14 @@ var pluginQualityBadge = map[string]string{
 	"rutubemovie": "FHD",
 	// No quality ladder at all: one VOD playlist per title, measured 576x432 on
 	// older films and ~720 wide on newer ones.
-	"anwap":        "SD",
+	"anwap": "SD",
+	// Релизы студии — 1080p WEBRip; проверено ffprobe на сегменте, RESOLUTION
+	// в master-плейлисте площадки занижен и ему верить нельзя.
+	"rudub":   "FHD",
+	"anidub":  "FHD",
+	"zagonka": "HD", // потолок 720p (замер 20.09.2026 по трём карточкам)
+	// Архив ВГТРК отдаёт до 1080p; выше площадка не раздаёт.
+	"smotrim":      "FHD",
 	"vkmovie":      "4K",
 	"anilibria":    "FHD",
 	"animevost":    "SD",
@@ -582,6 +598,9 @@ var pluginQualityBadge = map[string]string{
 	"mikai":        "FHD",
 	"leproduction": "FHD",
 	"sakhtv":       "FHD",
+	"scts":         "FHD",
+	"kbteam":       "FHD",
+	"krasview":     "FHD",
 }
 
 func pluginQualityBadgeGet(plugin string) string {
@@ -635,6 +654,9 @@ var clarificationLanguages = map[string]struct{}{
 // animePlugins lists balancer keys that only serve anime content.
 // They are hidden when original_language is NOT Asian (ja/ko/zh/cn).
 var animePlugins = map[string]struct{}{
+	// AniDUB — аниме, дороги и азиатское кино: на неазиатской карточке он
+	// может ответить разве что редким мультфильмом, а дриллы тратит на всех.
+	"anidub":     {},
 	"anilibria":  {},
 	"aniliberty": {},
 	"animebesst": {},
@@ -643,6 +665,12 @@ var animePlugins = map[string]struct{}{
 	"animego":    {},
 	"animelib":   {},
 	"moonanime":  {},
+}
+
+// serialPlugins lists balancers whose catalogue is series-only. They are
+// hidden on film cards, where they can only answer with an empty list.
+var serialPlugins = map[string]struct{}{
+	"rudub": {},
 }
 
 // animeLanguages are original_language values that indicate anime/Asian content.
@@ -677,6 +705,17 @@ const eventsResponseCacheMax = 5000
 
 // eventsResponseSF deduplicates concurrent /lite/events checksearch computations.
 var eventsResponseSF singleflight.Group
+
+// eventsItemsFingerprint сворачивает набор источников запроса в короткий
+// ключ: одинаковые наборы делят запись кэша, разные — не пересекаются.
+func eventsItemsFingerprint(items []liteEventItem) string {
+	h := fnv.New64a()
+	for _, it := range items {
+		_, _ = h.Write([]byte(it.Balanser))
+		_, _ = h.Write([]byte{0})
+	}
+	return strconv.FormatUint(h.Sum64(), 36)
+}
 
 func eventsResponseCacheKey(q url.Values) string {
 	// Build a deterministic cache key from the query parameters that affect the response.
@@ -731,7 +770,13 @@ func liteEventsHandler(cfg config.Config, proxyLinks *proxylink.Manager, dynRout
 		}
 
 		if checkOnlineSearch && len(items) > 0 {
-			writeChecksearchEventsResponse(w, r, cfg, proxyLinks, dynRoutes, items)
+			// Набор БЕЗ личной видимости: именно он кэшируется и делится всей
+			// группой, а персональный ответ получается фильтрацией. Считать его
+			// дёшево — это перебор списка плагинов без единого запроса наружу.
+			rNoKit := r.WithContext(kit.WithConfig(r.Context(), nil))
+			fullItems := buildEventItems(rNoKit, cfg, resolveEventsPlugins(rNoKit, cfg, dynRoutes),
+				hostFromRequest(r), originalLanguage, checkOnlineSearch, dynRoutes)
+			writeChecksearchEventsResponse(w, r, cfg, proxyLinks, dynRoutes, items, fullItems)
 			return
 		}
 
@@ -891,6 +936,13 @@ func eventPluginVisible(r *http.Request, cfg config.Config, plugin, originalLang
 			return false
 		}
 	}
+	// Series-only balancers hidden on films (serial=0). An absent flag means
+	// the client did not say — then we stay visible rather than guess.
+	if _, isSerialOnly := serialPlugins[plugin]; isSerialOnly && r != nil {
+		if strings.TrimSpace(r.URL.Query().Get("serial")) == "0" {
+			return false
+		}
+	}
 	// Group deny — a Lampa-client concept, like the kit whitelist below.
 	//
 	// Skipped for a /capi aggregation drill so that `resolve_sources` is the
@@ -1045,7 +1097,7 @@ func writeLifeEventsResponse(w http.ResponseWriter, cfg config.Config, proxyLink
 // Splitting this out makes the cache-key/group-suffix interaction much
 // easier to reason about — the cache key MUST include the group ID so two
 // users with different balancer allowlists don't poison each other.
-func writeChecksearchEventsResponse(w http.ResponseWriter, r *http.Request, cfg config.Config, proxyLinks *proxylink.Manager, dynRoutes *DynamicRouteRegistry, items []liteEventItem) {
+func writeChecksearchEventsResponse(w http.ResponseWriter, r *http.Request, cfg config.Config, proxyLinks *proxylink.Manager, dynRoutes *DynamicRouteRegistry, items, fullItems []liteEventItem) {
 	cacheKey := eventsResponseCacheKey(r.URL.Query())
 	// Include resolved group ID so different group memberships don't share
 	// cache entries. Anonymous requests get an explicit "|g=" suffix so they
@@ -1056,6 +1108,48 @@ func writeChecksearchEventsResponse(w http.ResponseWriter, r *http.Request, cfg 
 	}
 	cacheKey += groupSuffix
 
+	// Кэш держим на ПОЛНЫЙ набор группы, а зрителю отдаём его отфильтрованным
+	// под личную видимость (/bkit). Два предыдущих варианта были хуже:
+	// ключ без набора вообще отдавал всем ответ, собранный для первого зрителя
+	// (чужие выключения, новый источник не появлялся ни у кого), а ключ по
+	// личному набору дробил кэш — p90 /lite/events уехал с 3 мс до 6 с, упираясь
+	// в checksearchTotalDeadline на каждой новой комбинации.
+	allow := make(map[string]struct{}, len(items))
+	for _, it := range items {
+		allow[it.Balanser] = struct{}{}
+	}
+	full := make(map[string]struct{}, len(fullItems))
+	for _, it := range fullItems {
+		full[it.Balanser] = struct{}{}
+	}
+	target, subset := fullItems, true
+	for b := range allow {
+		if _, ok := full[b]; !ok {
+			// Зритель включил источник, которого в наборе группы нет, — такой
+			// ответ делить не с кем, считаем и кэшируем его отдельно.
+			target, subset = items, false
+			break
+		}
+	}
+	if subset {
+		cacheKey += "|s=" + eventsItemsFingerprint(fullItems)
+	} else {
+		cacheKey += "|u=" + eventsItemsFingerprint(items)
+	}
+	needFilter := subset && len(allow) != len(full)
+
+	write := func(body []byte, hit bool) {
+		if needFilter {
+			body = filterEventsBody(body, allow)
+		}
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		if hit {
+			w.Header().Set("X-Cache", "hit")
+		}
+		w.WriteHeader(http.StatusOK)
+		w.Write(body)
+	}
+
 	// Try cache first. Entry is stale if its version is older than the
 	// current global version (admin saved config since).
 	eventsResponseCache.RLock()
@@ -1063,25 +1157,41 @@ func writeChecksearchEventsResponse(w http.ResponseWriter, r *http.Request, cfg 
 	ce, ok := eventsResponseCache.items[cacheKey]
 	eventsResponseCache.RUnlock()
 	if ok && time.Now().Before(ce.expiresAt) && ce.version == currentVersion {
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		w.Header().Set("X-Cache", "hit")
-		w.WriteHeader(http.StatusOK)
-		w.Write(ce.body)
+		write(ce.body, true)
 		return
 	}
 
-	// Singleflight: only one goroutine probes for the same (query, group).
+	// Singleflight: only one goroutine probes for the same (query, group, set).
 	result, _, _ := eventsResponseSF.Do(cacheKey, func() (any, error) {
-		complete := applyCheckOnlineSearch(r.Context(), cfg, proxyLinks, dynRoutes, items, r.URL.Query())
-		sortItemsByShowAndQuality(items, !cfg.Online.CustomOrder)
-		body, _ := stdjson.Marshal(items)
+		complete := applyCheckOnlineSearch(r.Context(), cfg, proxyLinks, dynRoutes, target, r.URL.Query())
+		sortItemsByShowAndQuality(target, !cfg.Online.CustomOrder)
+		body, _ := stdjson.Marshal(target)
 		storeEventsResponseCache(cacheKey, body, !complete)
 		return body, nil
 	})
-	body := result.([]byte)
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	w.Write(body)
+	write(result.([]byte), false)
+}
+
+// filterEventsBody оставляет в готовом ответе только источники зрителя.
+// Порядок и поле index не трогаем: клиент и так получает несплошные индексы
+// после сортировки по show/качеству. Тело, которое не разобралось, отдаём как
+// есть — лучше лишний источник в списке, чем пустой экран.
+func filterEventsBody(body []byte, allow map[string]struct{}) []byte {
+	var items []liteEventItem
+	if err := stdjson.Unmarshal(body, &items); err != nil {
+		return body
+	}
+	out := make([]liteEventItem, 0, len(allow))
+	for _, it := range items {
+		if _, ok := allow[it.Balanser]; ok {
+			out = append(out, it)
+		}
+	}
+	filtered, err := stdjson.Marshal(out)
+	if err != nil {
+		return body
+	}
+	return filtered
 }
 
 // sortItemsByShowAndQuality re-orders items so:
@@ -1251,8 +1361,13 @@ var pluginPrettyNames = map[string]string{
 	"iremux":    "iRemux",
 	"mirkino":   "Мир Кино",
 	"anwap":     "Anwap",
+	"rudub":     "RuDub",
+	"anidub":    "AniDUB",
+	"zagonka":   "Zagonka",
+	"smotrim":   "Смотрим",
 	"zetflixdb": "ZetflixDB",
 	"uakino":    "UaKino (Українською)",
+	"pidtor":    "AlcoTor", // torrent source; internal key stays "pidtor" (config/routes/kit maps)
 }
 
 func pluginDisplayName(plugin string) string {
@@ -1575,7 +1690,11 @@ func runCheckOnlineSearch(ctx context.Context, cfg config.Config, proxyLinks *pr
 			show, rch, quality, _ := probeCheckSearch(probesCtx, lite, lbHost, target, balKey)
 
 			// Probe remote cluster nodes in parallel and merge.
-			if len(remoteNodes) > 0 {
+			//
+			// Кроме источников, которые эти ноды обслуживать не будут (см.
+			// liteSkipNodeFanout): их «есть» ничего не значит, а сама проба —
+			// лишний запрос к апстриму с адреса ноды.
+			if len(remoteNodes) > 0 && !liteSkipNodeFanout(items[idx].Balanser) {
 				balanser := items[idx].Balanser
 				remoteURL := "/lite/" + balanser
 				if needClarification(extra.Get("original_language"), balanser) {

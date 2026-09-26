@@ -32,9 +32,13 @@ var serverStartTime = time.Now()
 // publication, replace the whole struct, don't poke fields in place.
 func tgAdminStatsHandler(store *tgauth.Store, adminStore *tgauth.AdminIDStore, pl *proxylink.Manager) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		_, _, ok := tgAdminAuthCheck(w, r, store, adminStore)
-		if !ok {
-			return
+		// X-Cluster-Key вместо входа админа: тот же внутренний доступ, что уже
+		// открывает /lite/* для запросов внутри кластера. Нужен, чтобы снимать
+		// показания по источникам скриптом, не заводя человеку сессию в панели.
+		if !isTrustedClusterRequest(r) {
+			if _, _, ok := tgAdminAuthCheck(w, r, store, adminStore); !ok {
+				return
+			}
 		}
 
 		var m runtime.MemStats
@@ -174,9 +178,11 @@ func tgAdminStatsHandler(store *tgauth.Store, adminStore *tgauth.AdminIDStore, p
 
 func tgAdminDashboardHandler(store *tgauth.Store, adminStore *tgauth.AdminIDStore, pl *proxylink.Manager) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		_, _, ok := tgAdminAuthCheck(w, r, store, adminStore)
-		if !ok {
-			return
+		// См. tgAdminStatsHandler: ключ кластера — тот же внутренний доступ.
+		if !isTrustedClusterRequest(r) {
+			if _, _, ok := tgAdminAuthCheck(w, r, store, adminStore); !ok {
+				return
+			}
 		}
 
 		var m runtime.MemStats

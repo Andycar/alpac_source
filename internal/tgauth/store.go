@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -16,6 +17,41 @@ import (
 // a different token (cub-backup-clones-UID case). The caller should signal the
 // client to regenerate its UID instead of silently sharing it across accounts.
 var ErrUIDCrossToken = errors.New("uid already bound to another token")
+
+// ErrDeviceRevoked is returned by AddDevice when the device (by UID, precise
+// fingerprint or stable fingerprint) was explicitly unbound from this token and
+// has not since been re-approved through the bot. Unbinding used to be
+// cosmetic: the device still held the shared account token and silently
+// re-attached on its next request. Now it has to show a QR code again.
+var ErrDeviceRevoked = errors.New("device was unbound and must be re-paired through the bot")
+
+// StableFPNativePrefix marks a stable fingerprint that folds in a NATIVE device
+// id (webOS LGUDID / Tizen DUID / Android bridge). Only such values are accepted
+// for account recovery: a stable fp built from screen/cores/platform/timezone
+// alone is shared by every unit of the same TV or PC model (one value was seen
+// on 100 accounts in production), so it identifies a model, not a device.
+const StableFPNativePrefix = "n:"
+
+// maxRevokedPerToken bounds the revocation list; the oldest entries fall off.
+const maxRevokedPerToken = 64
+
+// approvedGrace is how long an explicit bot approval of a device UID lifts the
+// revocation for that UID — long enough for the client to poll /check, receive
+// the token and hit the gate, aligned with the approved-pending lifetime.
+const approvedGrace = time.Hour
+
+// RevokedDevice remembers a device the user (or an admin) explicitly unbound.
+// Any later attempt to attach a device matching its UID, fingerprint or stable
+// fingerprint to the same token is refused until the device is re-approved via
+// the bot. The fingerprints are kept because a wiped client shows up with a
+// fresh UID but the same hardware hash.
+type RevokedDevice struct {
+	UID         string    `json:"uid,omitempty"`
+	Fingerprint string    `json:"fingerprint,omitempty"`
+	StableFP    string    `json:"stable_fp,omitempty"`
+	Label       string    `json:"label,omitempty"`
+	RevokedAt   time.Time `json:"revoked_at"`
+}
 
 // DeviceInfo describes a single bound device (identified by lampac_unic_id).
 type DeviceInfo struct {
@@ -33,6 +69,36 @@ type DeviceInfo struct {
 	// left to re-identify a physical TV. Looked up ONLY when the precise
 	// Fingerprint fails, and only when it maps to a single account.
 	StableFP string `json:"stable_fp,omitempty"`
+	// ProofKey — ПЕРСОНАЛЬНЫЙ ключ аттестации этого устройства (hex, 32 байта).
+	// До него аттестация подписывалась одним секретом, зашитым во ВСЕ клиенты:
+	// строка лежала открытым текстом в js-бандле и в APK, вынималась за минуту,
+	// и подделать заголовок мог кто угодно. Персональный ключ выдаётся сервером
+	// один раз по уже авторизованному каналу и в сборке клиента не существует —
+	// разбор приложения не даёт ничего. Украсть можно только ключ КОНКРЕТНОГО
+	// устройства, и тогда отзывается одно устройство, а не защита целиком.
+	ProofKey string `json:"proof_key,omitempty"`
+	// PubKey — публичная часть ключевой пары, СОЗДАННОЙ ВНУТРИ AndroidKeyStore
+	// этого устройства (DER SubjectPublicKeyInfo, base64).
+	//
+	// Зачем ещё один ключ, когда есть ProofKey. ProofKey — обычная строка в
+	// SharedPreferences, то есть в каталоге данных приложения. Мод, который
+	// разбирали 2026-09-11, ничего не взламывал: он положил внутрь APK zip со
+	// слепком этого каталога (токен, uid, proof_key) и распаковывал его при
+	// первом запуске. Аттестация отрабатывала честно — ключ настоящий, подпись
+	// верная, просто устройств с одним ключом стало много.
+	//
+	// Приватная часть ключа из Keystore не покидает устройство в принципе: у
+	// API нет операции экспорта, а сам материал лежит в /data/misc/keystore
+	// (с TEE — вообще в отдельном сопроцессоре), то есть ВНЕ каталога
+	// приложения. Слепок каталога данных такой ключ не увозит, и скопированная
+	// установка подписать им ничего не может.
+	PubKey string `json:"pub_key,omitempty"`
+	// KeyHardware — Keystore подтвердил, что ключ лежит в защищённом железе
+	// (TEE/StrongBox). На дешёвых боксах без сертификации бывает софтовый
+	// фолбэк: он всё равно вне каталога приложения и этот трюк ломает, но
+	// различать их стоит — по таким устройствам разумнее держать более строгие
+	// пороги.
+	KeyHardware bool `json:"key_hardware,omitempty"`
 }
 
 // ApprovedToken represents an authorized device token created after admin approval.
@@ -77,6 +143,41 @@ type ApprovedToken struct {
 	// (the device still presents its CUB token). Cleared by an explicit
 	// re-link (SetCubUser); honored only by the passive path (SetCubUserAuto).
 	CubAutoLinkOptOut bool `json:"cub_optout,omitempty"`
+	// Revoked lists devices explicitly unbound from this token. See RevokedDevice.
+	Revoked []RevokedDevice `json:"revoked,omitempty"`
+}
+
+// revokedEntry returns the index of the first revocation matching any of the
+// given non-empty identifiers, or -1.
+//
+// A UID match always counts. A fingerprint / stable-fp match counts ONLY when
+// no device still BOUND to this token carries the same hash: hashes are shared
+// by every unit of one model, so if the owner keeps an identical TV bound, the
+// hash proves nothing about which unit is knocking. Without this rule the
+// 2026-09-01 cleanup locked out the owners' own second TVs and every web client
+// (which sends an unbound shared uid plus the TV's hash) — 324 token drops on 29
+// clients in 90 minutes. A wiped stranger twin slips through here; its intact
+// uid still does not.
+func (t *ApprovedToken) revokedEntry(uid, fp, sfp string) int {
+	fpBound, sfpBound := false, false
+	if fp != "" || sfp != "" {
+		for _, d := range t.Devices {
+			if fp != "" && d.Fingerprint == fp {
+				fpBound = true
+			}
+			if sfp != "" && d.StableFP == sfp {
+				sfpBound = true
+			}
+		}
+	}
+	for i, rd := range t.Revoked {
+		if (uid != "" && rd.UID == uid) ||
+			(fp != "" && !fpBound && rd.Fingerprint == fp) ||
+			(sfp != "" && !sfpBound && rd.StableFP == sfp) {
+			return i
+		}
+	}
+	return -1
 }
 
 // EffectiveGroupID returns the group the user is effectively in, taking
@@ -91,6 +192,11 @@ func (t *ApprovedToken) EffectiveGroupID(premiumGroupID string) string {
 	return t.GroupID
 }
 
+type approvedUID struct {
+	token string
+	at    time.Time
+}
+
 // Store persists approved tokens to a JSON file and provides thread-safe lookups.
 // Optimized for scale: O(1) lookups via indexes, batched file writes.
 type Store struct {
@@ -102,9 +208,26 @@ type Store struct {
 	byToken    map[string]int // token string → index in tokens slice
 	byTGID     map[int64]int  // telegram_id → index in tokens slice (first non-expired)
 	byUID      map[string]int // device UID → index in tokens slice
+	// uidOwners — у СКОЛЬКИХ токенов записано устройство с таким uid. byUID хранит
+	// только последний, и по нему коллизию не видно, а она массовая: замер 20.09.2026
+	// дал 88 значений на 329 аккаунтов (рекорд — один uid у 70 аккаунтов, от iPhone
+	// до Hisense, то есть это скопированный каталог данных, а не совпадение железа).
+	// По такому uid нельзя опознать никого, и восстановление сессии по нему должно
+	// отказывать, а не выбирать первого попавшегося владельца.
+	uidOwners map[string]int
 	byFP       map[string]int // device fingerprint → index in tokens slice
 	byStableFP map[string]int // device stable fingerprint → index in tokens slice
 	byCubUID   map[string]int // CUB user id → index in tokens slice
+
+	// approvedUIDs remembers device UIDs the user just approved through the
+	// bot (QR code / device code). An approval lifts the revocation for that
+	// UID for approvedGrace so the freshly paired device can attach even
+	// though its fingerprint is still on the revoked list. In-memory only: an
+	// approval lost to a restart just means one more QR.
+	approvedUIDs map[string]approvedUID
+	// approvedIPs is the same grant keyed by token+client IP, for approvals
+	// of pendings that carry no uid (the /tg/auth browser page pairs by IP).
+	approvedIPs map[string]approvedUID
 
 	// --- Batched persistence ---
 	dirty    bool          // true if in-memory state differs from disk
@@ -117,15 +240,18 @@ type Store struct {
 // Existing tokens are loaded from disk on creation; duplicates are merged.
 func NewStore(dbDir string) *Store {
 	s := &Store{
-		filePath:   filepath.Join(dbDir, "database", "tgauth", "tokens.json"),
-		byToken:    make(map[string]int),
-		byTGID:     make(map[int64]int),
-		byUID:      make(map[string]int),
-		byFP:       make(map[string]int),
-		byStableFP: make(map[string]int),
-		byCubUID:   make(map[string]int),
-		saveStop:   make(chan struct{}),
-		saveDone:   make(chan struct{}),
+		filePath:     filepath.Join(dbDir, "database", "tgauth", "tokens.json"),
+		byToken:      make(map[string]int),
+		byTGID:       make(map[int64]int),
+		byUID:        make(map[string]int),
+		uidOwners:    make(map[string]int),
+		byFP:         make(map[string]int),
+		byStableFP:   make(map[string]int),
+		byCubUID:     make(map[string]int),
+		approvedUIDs: make(map[string]approvedUID),
+		approvedIPs:  make(map[string]approvedUID),
+		saveStop:     make(chan struct{}),
+		saveDone:     make(chan struct{}),
 	}
 	if err := s.load(); err != nil {
 		log.Warn().Err(err).Str("path", s.filePath).Msg("tgauth: failed to load tokens (starting empty)")
@@ -198,6 +324,7 @@ func (s *Store) rebuildIndexes() {
 	s.byToken = make(map[string]int, len(s.tokens))
 	s.byTGID = make(map[int64]int, len(s.tokens))
 	s.byUID = make(map[string]int, len(s.tokens)*2)
+	s.uidOwners = make(map[string]int, len(s.tokens)*2)
 	s.byFP = make(map[string]int, len(s.tokens)*2)
 	s.byStableFP = make(map[string]int, len(s.tokens)*2)
 	s.byCubUID = make(map[string]int, len(s.tokens))
@@ -219,9 +346,16 @@ func (s *Store) rebuildIndexes() {
 				s.byTGID[t.TelegramID] = i
 			}
 		}
+		seenUID := make(map[string]bool, len(t.Devices))
 		for _, d := range t.Devices {
 			if d.UID != "" {
 				s.byUID[d.UID] = i
+				// Один и тот же uid внутри ОДНОГО токена считаем один раз: интересно
+				// число разных владельцев, а не число записей.
+				if !seenUID[d.UID] {
+					seenUID[d.UID] = true
+					s.uidOwners[d.UID]++
+				}
 			}
 			if d.Fingerprint != "" {
 				// Keep last-seen entry for fingerprint (within same token = same user).
@@ -356,6 +490,18 @@ func (s *Store) FindTokenByDeviceUID(uid string) string {
 // FindDeviceByUID returns (token, device, ok) for the device that has the given UID.
 // Returns ok=false if the UID is not bound or its token has expired.
 // The returned DeviceInfo is a copy — safe to inspect without holding the lock.
+// DeviceUIDOwners возвращает, скольким РАЗНЫМ токенам известно устройство с таким
+// uid. 0 — никому, 1 — нормальный случай, больше — uid «отравлен» и опознавать по
+// нему нельзя.
+func (s *Store) DeviceUIDOwners(uid string) int {
+	if uid == "" {
+		return 0
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.uidOwners[uid]
+}
+
 func (s *Store) FindDeviceByUID(uid string) (string, *DeviceInfo, bool) {
 	if uid == "" {
 		return "", nil, false
@@ -402,6 +548,11 @@ func (s *Store) FindTokenByDeviceFingerprint(fp string) (string, *DeviceInfo, bo
 		if now.After(s.tokens[i].ExpiresAt) {
 			continue
 		}
+		if s.tokens[i].revokedEntry("", fp, "") >= 0 {
+			// The user unbound a device with this hardware hash from this
+			// account — it must not walk back in through recovery.
+			continue
+		}
 		for j := range s.tokens[i].Devices {
 			if s.tokens[i].Devices[j].Fingerprint != fp {
 				continue
@@ -434,6 +585,12 @@ func (s *Store) FindTokenByStableFP(sfp string) (string, *DeviceInfo, bool) {
 	if sfp == "" {
 		return "", nil, false
 	}
+	// A stable fp without a native device id is a model signature, not a
+	// device one (see StableFPNativePrefix): still stored for dedup within
+	// one account, never used to pick an account.
+	if !strings.HasPrefix(sfp, StableFPNativePrefix) {
+		return "", nil, false
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	if _, ok := s.byStableFP[sfp]; !ok {
@@ -444,6 +601,9 @@ func (s *Store) FindTokenByStableFP(sfp string) (string, *DeviceInfo, bool) {
 	var foundDev *DeviceInfo
 	for i := range s.tokens {
 		if now.After(s.tokens[i].ExpiresAt) {
+			continue
+		}
+		if s.tokens[i].revokedEntry("", "", sfp) >= 0 {
 			continue
 		}
 		for j := range s.tokens[i].Devices {
@@ -771,6 +931,46 @@ func (s *Store) FindDeviceByLabel(token, label string) *DeviceInfo {
 	return nil
 }
 
+// DeviceAlreadyKnown reports whether AddDevice would attach to an EXISTING
+// device record instead of appending a new one. Повторяет дедуп самого
+// AddDevice — по uid, по точному и по стабильному отпечатку, и по метке для
+// записей вовсе без отпечатков.
+//
+// Нужен ровно для лимита устройств: проверять его надо ТОЛЬКО перед появлением
+// новой записи. Если спросить «сколько устройств» у аккаунта на потолке и
+// отказать, не разобравшись, окажется, что своя же коробка, потерявшая uid,
+// перестанет восстанавливаться — при том что число устройств от её возврата не
+// выросло бы вовсе.
+func (s *Store) DeviceAlreadyKnown(token, uid, fp, sfp, label string) bool {
+	if token == "" {
+		return false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	idx, ok := s.byToken[token]
+	if !ok {
+		return false
+	}
+	for j := range s.tokens[idx].Devices {
+		d := &s.tokens[idx].Devices[j]
+		if uid != "" && d.UID == uid {
+			return true
+		}
+		if fp != "" && d.Fingerprint == fp {
+			return true
+		}
+		if sfp != "" && d.StableFP == sfp {
+			return true
+		}
+		// Метка склеивает только записи БЕЗ отпечатков — там же, где это делает
+		// AddDevice. Иначе два одинаковых телефона схлопнулись бы в один слот.
+		if label != "" && fp == "" && d.Label == label && d.Fingerprint == "" {
+			return true
+		}
+	}
+	return false
+}
+
 // AddDevice appends a device to the token's Devices list and persists.
 // Returns (true, nil) if the device was added, (false, nil) if it was
 // already bound (duplicate UID).
@@ -817,6 +1017,15 @@ func (s *Store) AddDevice(token string, dev DeviceInfo) (bool, error) {
 			}
 			return false, nil // already bound
 		}
+	}
+	// Revoked device (unbound by the user, same UID or same hardware hash):
+	// refuse unless the user just re-approved this UID through the bot, in
+	// which case the approval consumes the revocation.
+	if s.tokens[idx].revokedEntry(dev.UID, dev.Fingerprint, dev.StableFP) >= 0 {
+		if !s.approvedLocked(token, dev.UID, dev.LastIP) {
+			return false, ErrDeviceRevoked
+		}
+		s.clearRevokedLocked(idx, dev.UID, dev.Fingerprint, dev.StableFP)
 	}
 	// Fingerprint dedup: if the same precise OR stable fingerprint exists under
 	// a different UID, migrate it (same physical device that lost its UID).
@@ -899,6 +1108,7 @@ func (s *Store) RemoveDevice(token string, uid string) error {
 	removed := false
 	for j := range devices {
 		if devices[j].UID == uid {
+			s.revokeLocked(idx, devices[j])
 			s.tokens[idx].Devices = append(devices[:j], devices[j+1:]...)
 			s.rebuildIndexes()
 			s.markDirty()
@@ -931,6 +1141,7 @@ func (s *Store) RemoveAllDevices(token string) int {
 	gone := make([]string, 0, len(s.tokens[idx].Devices))
 	for _, d := range s.tokens[idx].Devices {
 		gone = append(gone, d.UID)
+		s.revokeLocked(idx, d)
 	}
 	s.tokens[idx].Devices = nil
 	s.rebuildIndexes()
@@ -943,6 +1154,176 @@ func (s *Store) RemoveAllDevices(token string) int {
 		}
 	}
 	return len(gone)
+}
+
+// revokeLocked records d on the token's revocation list. Must be called with
+// s.mu held for writing. Entries with none of uid/fp/sfp are useless and skipped.
+func (s *Store) revokeLocked(idx int, d DeviceInfo) {
+	if d.UID == "" && d.Fingerprint == "" && d.StableFP == "" {
+		return
+	}
+	t := &s.tokens[idx]
+	// Drop stale entries for the same identifiers so the list holds one row
+	// per device and the timestamp reflects the latest unbind.
+	s.clearRevokedLocked(idx, d.UID, d.Fingerprint, d.StableFP)
+	t.Revoked = append(t.Revoked, RevokedDevice{
+		UID: d.UID, Fingerprint: d.Fingerprint, StableFP: d.StableFP,
+		Label: d.Label, RevokedAt: time.Now().UTC(),
+	})
+	if n := len(t.Revoked) - maxRevokedPerToken; n > 0 {
+		t.Revoked = append([]RevokedDevice(nil), t.Revoked[n:]...)
+	}
+	// A previous approval must not outlive a fresh unbind of the same UID.
+	if d.UID != "" {
+		delete(s.approvedUIDs, d.UID)
+	}
+}
+
+// clearRevokedLocked deletes every revocation matching any of the given
+// non-empty identifiers and returns how many went away. Must hold s.mu.
+func (s *Store) clearRevokedLocked(idx int, uid, fp, sfp string) int {
+	t := &s.tokens[idx]
+	if len(t.Revoked) == 0 {
+		return 0
+	}
+	kept := t.Revoked[:0]
+	removed := 0
+	for _, rd := range t.Revoked {
+		if (uid != "" && rd.UID == uid) ||
+			(fp != "" && rd.Fingerprint == fp) ||
+			(sfp != "" && rd.StableFP == sfp) {
+			removed++
+			continue
+		}
+		kept = append(kept, rd)
+	}
+	if removed > 0 {
+		if len(kept) == 0 {
+			t.Revoked = nil
+		} else {
+			t.Revoked = kept
+		}
+		s.markDirty()
+	}
+	return removed
+}
+
+// uidApprovedLocked reports whether uid was approved for token within
+// approvedGrace. Must hold s.mu (read is enough).
+func (s *Store) uidApprovedLocked(uid, token string) bool {
+	if uid == "" {
+		return false
+	}
+	a, ok := s.approvedUIDs[uid]
+	return ok && a.token == token && time.Since(a.at) < approvedGrace
+}
+
+// approvedLocked reports whether the device is inside an approval window for
+// token — by its uid, or by the client IP an uid-less pending was approved
+// from. Must hold s.mu.
+func (s *Store) approvedLocked(token, uid, ip string) bool {
+	if s.uidApprovedLocked(uid, token) {
+		return true
+	}
+	if ip == "" {
+		return false
+	}
+	a, ok := s.approvedIPs[token+"|"+ip]
+	return ok && time.Since(a.at) < approvedGrace
+}
+
+// IsDeviceRevoked reports whether a device with any of the given identifiers
+// was unbound from token and has not been re-approved since (by uid, or by an
+// approval from the same client ip). Callers that hold a valid account token
+// for an UNBOUND uid must check this before attaching the device: the token
+// alone no longer proves the device is welcome.
+func (s *Store) IsDeviceRevoked(token, uid, fp, sfp, ip string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	idx, ok := s.byToken[token]
+	if !ok {
+		return false
+	}
+	if s.tokens[idx].revokedEntry(uid, fp, sfp) < 0 {
+		return false
+	}
+	return !s.approvedLocked(token, uid, ip)
+}
+
+// ApproveDeviceFromIP records an owner approval of a pending that carried no
+// device uid (the browser /tg/auth page pairs by client IP). Any device
+// attaching to token from that ip within approvedGrace may consume a
+// revocation, the same as an uid approval.
+func (s *Store) ApproveDeviceFromIP(token, ip string) {
+	if token == "" || ip == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.byToken[token]; !ok {
+		return
+	}
+	now := time.Now()
+	for k, a := range s.approvedIPs {
+		if now.Sub(a.at) >= approvedGrace {
+			delete(s.approvedIPs, k)
+		}
+	}
+	s.approvedIPs[token+"|"+ip] = approvedUID{token: token, at: now}
+}
+
+// ApproveDevice records that the account owner explicitly approved device uid
+// for token (QR code confirmed in the bot, device code entered). It clears any
+// revocation keyed by that UID and opens the approvedGrace window in which a
+// revocation keyed only by fingerprint is consumed by AddDevice.
+func (s *Store) ApproveDevice(token, uid string) {
+	if token == "" || uid == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	idx, ok := s.byToken[token]
+	if !ok {
+		return
+	}
+	s.clearRevokedLocked(idx, uid, "", "")
+	now := time.Now()
+	for k, a := range s.approvedUIDs {
+		if now.Sub(a.at) >= approvedGrace {
+			delete(s.approvedUIDs, k)
+		}
+	}
+	s.approvedUIDs[uid] = approvedUID{token: token, at: now}
+}
+
+// IsDeviceApproved reports whether uid is inside its approval window for token.
+func (s *Store) IsDeviceApproved(token, uid string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.uidApprovedLocked(uid, token)
+}
+
+// ClearRevoked removes revocations matching any of the identifiers and returns
+// how many were removed.
+func (s *Store) ClearRevoked(token, uid, fp, sfp string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	idx, ok := s.byToken[token]
+	if !ok {
+		return 0
+	}
+	return s.clearRevokedLocked(idx, uid, fp, sfp)
+}
+
+// RevokedDevices returns a copy of the token's revocation list.
+func (s *Store) RevokedDevices(token string) []RevokedDevice {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	idx, ok := s.byToken[token]
+	if !ok || len(s.tokens[idx].Revoked) == 0 {
+		return nil
+	}
+	return append([]RevokedDevice(nil), s.tokens[idx].Revoked...)
 }
 
 // MigrateDeviceUID atomically changes the UID of an existing device
@@ -1179,6 +1560,30 @@ func (s *Store) UpdateLastSeen(token, uid string) {
 	}
 }
 
+// PersistLastSeen просит сохранить уже проставленный LastSeen на диск.
+//
+// UpdateLastSeen намеренно пишет только в память — иначе стор дёргался бы на
+// каждом запросе. Но тогда активность не переживала рестарт: в кабинете время
+// откатывалось назад. Вызывающий решает, как часто просить сохранение
+// (см. devActPersist в httpapi/device_activity.go).
+func (s *Store) PersistLastSeen(token, uid string) {
+	if token == "" || uid == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	idx, ok := s.byToken[token]
+	if !ok {
+		return
+	}
+	for j := range s.tokens[idx].Devices {
+		if s.tokens[idx].Devices[j].UID == uid {
+			s.markDirty()
+			return
+		}
+	}
+}
+
 // UpdateDeviceIP updates the LastIP for a device (batched persist).
 func (s *Store) UpdateDeviceIP(token, uid, ip string) {
 	if token == "" || uid == "" || ip == "" {
@@ -1303,6 +1708,13 @@ func (s *Store) MergeByTelegramID() int {
 				if d.UID != "" && !uidSet[d.UID] {
 					s.tokens[bestIdx].Devices = append(s.tokens[bestIdx].Devices, d)
 					uidSet[d.UID] = true
+				}
+			}
+			// Carry revocations over too — a device the user threw out of the
+			// losing token must not resurface on the merged one.
+			for _, rd := range s.tokens[idx].Revoked {
+				if s.tokens[bestIdx].revokedEntry(rd.UID, rd.Fingerprint, rd.StableFP) < 0 {
+					s.tokens[bestIdx].Revoked = append(s.tokens[bestIdx].Revoked, rd)
 				}
 			}
 			keep[idx] = false

@@ -1,6 +1,7 @@
 package litesrc
 
 import (
+	"bytes"
 	"context"
 	stdjson "encoding/json"
 	"fmt"
@@ -12,6 +13,8 @@ import (
 	"time"
 
 	"github.com/rs/zerolog/log"
+
+	"lampac-go/internal/browsertmp"
 )
 
 // kinobaseBrowser extracts player data from kinobase.org using a headless Chrome
@@ -195,6 +198,17 @@ func (kb *kinobaseBrowser) ensurePuppeteer(dir string) error {
 	return nil
 }
 
+// kinobaseProfilePrefix names the Chrome profile directories this source owns.
+// Registered in browsertmp.Prefixes so a hard kill still gets them swept.
+const kinobaseProfilePrefix = "kinobase-chrome-"
+
+// kinobaseBrowserTimeout bounds one extraction. It must stay BELOW the caller's
+// budget — a capi drill gives each source 25s — so our own cleanup runs before
+// the parent context cancels us. When the two deadlines coincide node dies
+// mid-close and the browser is orphaned, which is exactly how this source used
+// to leak Chrome processes.
+const kinobaseBrowserTimeout = 20 * time.Second
+
 // Extract runs the Puppeteer script and returns the player file data.
 // proxyAddr is optional SOCKS5 address like "socks5://127.0.0.1:40001"
 func (kb *kinobaseBrowser) Extract(ctx context.Context, filmURL, proxyAddr string) (string, error) {
@@ -202,22 +216,31 @@ func (kb *kinobaseBrowser) Extract(ctx context.Context, filmURL, proxyAddr strin
 		return "", err
 	}
 
-	args := []string{kb.scriptPath, filmURL, kb.chromePath}
-	if proxyAddr != "" {
-		args = append(args, proxyAddr)
+	// Own the profile directory rather than letting Puppeteer mint an unmanaged
+	// /tmp/puppeteer_dev_chrome_profile-*. Those belonged to nobody, were skipped
+	// by both janitors, and cost ~130MB each.
+	profileDir, err := browsertmp.New(kinobaseProfilePrefix)
+	if err != nil {
+		return "", fmt.Errorf("kinobase profile dir: %w", err)
 	}
+	defer func() { go browsertmp.Remove(profileDir) }()
 
-	execCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	// Positional argv: the script reads proxy at [4] and profile dir at [5], so
+	// the proxy slot is always passed even when empty.
+	args := []string{kb.scriptPath, filmURL, kb.chromePath, proxyAddr, profileDir}
+
+	execCtx, cancel := context.WithTimeout(ctx, kinobaseBrowserTimeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(execCtx, kb.nodePath, args...)
+	cmd := exec.Command(kb.nodePath, args...)
 	cmd.Dir = os.TempDir()
 	// Set NODE_PATH so require('puppeteer-core') works
 	cmd.Env = append(os.Environ(),
 		"NODE_PATH="+filepath.Join(os.TempDir(), "node_modules"),
 	)
+	setProcGroup(cmd)
 
-	out, err := cmd.CombinedOutput()
+	out, err := runKinobaseNode(execCtx, cmd)
 	if err != nil {
 		return "", fmt.Errorf("puppeteer exec: %w: %s", err, string(out))
 	}
@@ -240,17 +263,51 @@ func (kb *kinobaseBrowser) Extract(ctx context.Context, filmURL, proxyAddr strin
 	return result.File, nil
 }
 
+// runKinobaseNode is exec.Cmd.CombinedOutput with a deadline that kills the
+// whole process group instead of just the child.
+//
+// exec.CommandContext cannot be used here: its cancel path calls
+// Process.Kill(), which reaches node and leaves the Chrome node spawned running
+// under init. Both streams share one buffer, the same trick CombinedOutput uses
+// so os/exec serialises them through a single pipe.
+func runKinobaseNode(ctx context.Context, cmd *exec.Cmd) ([]byte, error) {
+	var buf bytes.Buffer
+	cmd.Stdout = &buf
+	cmd.Stderr = &buf
+
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+
+	select {
+	case err := <-done:
+		return buf.Bytes(), err
+	case <-ctx.Done():
+		killProcGroup(cmd)
+		<-done // reap the child so buf is no longer written to
+		return buf.Bytes(), ctx.Err()
+	}
+}
+
 // kinobaseExtractScript is the Node.js Puppeteer script embedded as a constant.
-// It receives: <filmUrl> <chromePath> [socks5ProxyAddr]
+// It receives: <filmUrl> <chromePath> <socks5ProxyAddr|""> <profileDir>
 // It outputs: JSON { "file": "...", "error": "" }
+//
+// Every timeout below is sized to finish inside kinobaseBrowserTimeout so the
+// script closes its own browser; the Go-side process-group kill is the backstop,
+// not the normal path.
 const kinobaseExtractScript = `
 const puppeteer = require('puppeteer-core');
 const filmUrl = process.argv[2];
 const chromePath = process.argv[3];
 const proxyAddr = process.argv[4] || '';
+const profileDir = process.argv[5] || '';
 
 if (!filmUrl || !chromePath) {
-    console.log(JSON.stringify({ error: 'usage: <url> <chromePath> [socks5://host:port]' }));
+    console.log(JSON.stringify({ error: 'usage: <url> <chromePath> <proxy|""> <profileDir>' }));
     process.exit(1);
 }
 
@@ -262,17 +319,38 @@ if (!filmUrl || !chromePath) {
                   '--no-first-run', '--mute-audio'];
     if (proxyAddr) args.push('--proxy-server=' + proxyAddr);
 
-    const browser = await puppeteer.launch({
+    const launchOpts = {
         executablePath: chromePath,
         headless: 'new',
         args: args
-    });
+    };
+    // Given a userDataDir Puppeteer reuses it instead of creating its own
+    // throwaway profile — that is what keeps the directory owned by Go, which
+    // deletes it through browsertmp.
+    if (profileDir) launchOpts.userDataDir = profileDir;
+
+    const browser = await puppeteer.launch(launchOpts);
+
+    // browser.close() can hang when a page is still busy, and a hung close was
+    // how Chrome survived node's death. Race it, then SIGKILL what is left.
+    const hardClose = async () => {
+        try {
+            await Promise.race([
+                browser.close(),
+                new Promise((r) => setTimeout(r, 3000))
+            ]);
+        } catch(e) {}
+        try {
+            const proc = browser.process();
+            if (proc && !proc.killed) proc.kill('SIGKILL');
+        } catch(e) {}
+    };
 
     const timeout = setTimeout(async () => {
         console.log(JSON.stringify({ error: 'timeout' }));
-        try { await browser.close(); } catch(e) {}
+        await hardClose();
         process.exit(1);
-    }, 25000);
+    }, 15000);
 
     try {
         const page = await browser.newPage();
@@ -312,9 +390,9 @@ if (!filmUrl || !chromePath) {
             req.continue();
         });
 
-        await page.goto(filmUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
+        await page.goto(filmUrl, { waitUntil: 'domcontentloaded', timeout: 9000 });
         try {
-            await page.waitForSelector('#playerjsfile', { timeout: 15000 });
+            await page.waitForSelector('#playerjsfile', { timeout: 5000 });
             const file = await page.$eval('#playerjsfile', el => el.textContent);
             clearTimeout(timeout);
             console.log(JSON.stringify({ file: file }));
@@ -328,7 +406,7 @@ if (!filmUrl || !chromePath) {
         clearTimeout(timeout);
         console.log(JSON.stringify({ error: e.message }));
     } finally {
-        try { await browser.close(); } catch(e) {}
+        await hardClose();
     }
 })();
 `

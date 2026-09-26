@@ -93,28 +93,36 @@ func filmixAdvanceHost(hosts []string, failed string) {
 }
 
 type filmixChecker struct {
-	client   *http.Client
-	hosts    []string // failover-ordered API mirrors (configured first)
-	token    string
-	tokens   []string
-	pro      bool
-	reserve  bool
-	hls      bool
-	rhub     bool
-	userIDs  sync.Map
-	tokenMux sync.Mutex
+	client *http.Client
+	hosts  []string // failover-ordered API mirrors (configured first)
+	token  string
+	tokens []string
+	// reserveTokens — другая учётка, только для перевыпуска ссылки на 429 (filmix_remint.go).
+	reserveTokens []string
+	pro           bool
+	// fxPrimary keeps the old api-fx-first order (config fx_mode = 'primary');
+	// default is legacy first with api-fx as the fallback.
+	fxPrimary bool
+	reserve   bool
+	hls       bool
+	rhub      bool
+	userIDs   sync.Map
+	tokenMux  sync.Mutex
 
 	// api.filmix.tv (api-fx) state — the path that still serves >720p, see filmix_fx.go.
-	fxHost          string
-	fxUser          string
-	fxPasswd        string
-	fxDirectLampa   bool  // отдавать Lampa рецепт для клиентского минта (архитектура B)
-	fxProgressive   *bool // прогрессивный MP4 вместо HLS (nil = авто при наличии кредов)
-	fxMu            sync.Mutex
-	fxHash          string    // /api-fx/request-token session hash
-	fxHashAt        time.Time // когда hash выпущен (для диагностики)
-	fxHashDead      bool      // сессия не прошла проверку живости — разрешён перевыпуск
-	fxAliveFails    int       // подряд идущие явные отказы /api-fx/me
+	fxHost        string
+	fxUser        string
+	fxPasswd      string
+	fxDirectLampa bool  // отдавать Lampa рецепт для клиентского минта (архитектура B)
+	fxProgressive *bool // прогрессивный MP4 вместо HLS (nil = авто при наличии кредов)
+	fxMu          sync.Mutex
+	fxHash        string    // /api-fx/request-token session hash
+	fxHashAt      time.Time // когда hash выпущен (для диагностики)
+	fxHashDead    bool      // сессия не прошла проверку живости — разрешён перевыпуск
+	fxAliveFails  int       // подряд идущие явные отказы /api-fx/me
+	// fxUpstreamBusy — подряд идущие 429/5xx от апстрима. Нужен только для лога:
+	// одиночный отказ ничего не значит, а серия означает, что филмикс нас режет.
+	fxUpstreamBusy  int
 	fxLoginAt       time.Time // когда последний раз тратили слот устройства
 	fxAliveAt       time.Time // когда живость проверялась
 	fxHashFetchedAt time.Time
@@ -264,13 +272,26 @@ func NewFilmixChecker(cfg config.Config) *filmixChecker {
 		tokens = append(tokens, item)
 		seen[item] = struct{}{}
 	}
+	// Запасные — только для перевыпуска на 429 (filmix_remint.go); совпавшие с обычными не берём.
+	var reserveTokens []string
+	for _, item := range cfg.Online.Filmix.ReserveTokens {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		if _, ok := seen[item]; ok {
+			continue
+		}
+		reserveTokens = append(reserveTokens, item)
+		seen[item] = struct{}{}
+	}
 
 	fxHost := strings.TrimRight(strings.TrimSpace(cfg.Online.FilmixTV.Host), "/")
 	if fxHost == "" {
 		fxHost = "https://api.filmix.tv"
 	}
 
-	return &filmixChecker{
+	f := &filmixChecker{
 		// Dynamic: a SOCKS5/vless mapped to "filmix" in the admin Proxy panel
 		// applies live. Needed because api.filmix.tv geo-blocks non-RU/datacenter
 		// IPs (video-links answers "Видео заблокировано!" even for free titles) —
@@ -279,7 +300,9 @@ func NewFilmixChecker(cfg config.Config) *filmixChecker {
 		hosts:         hosts,
 		token:         token,
 		tokens:        tokens,
+		reserveTokens: reserveTokens,
 		pro:           cfg.Online.Filmix.Pro,
+		fxPrimary:     strings.EqualFold(strings.TrimSpace(cfg.Online.Filmix.FXMode), "primary"),
 		reserve:       cfg.Online.Filmix.Reserve,
 		hls:           cfg.Online.Filmix.HLS,
 		rhub:          cfg.Online.Filmix.Rhub,
@@ -290,6 +313,12 @@ func NewFilmixChecker(cfg config.Config) *filmixChecker {
 		fxProgressive: cfg.Online.Filmix.Progressive,
 		fxStatePath:   fxStatePath(cfg.Compat.RepoRoot),
 	}
+	// Проверка токенов — с самого старта, а не с первого запроса: на primary /lite/filmix
+	// уезжает на ноды раньше обработчика, и его токены иначе остались бы непроверенными.
+	f.startTokenProbe()
+	// 429 CDN → та же ссылка, подписанная другой учёткой (прокси зовёт на горячем пути).
+	proxylink.RegisterTargetRefresher("filmix", f.remint)
+	return f
 }
 
 // apiHost returns the sticky-selected Filmix API mirror.
@@ -302,13 +331,14 @@ func (f *filmixChecker) apiHost() string {
 
 func (f *filmixChecker) Handle(cfg config.Config, links *proxylink.Manager) http.HandlerFunc {
 	return func(w http.ResponseWriter, req *http.Request) {
+		f.startTokenProbe()
 		if parseBoolParam(req.URL.Query().Get("checksearch")) {
 			show := f.checkSearch(req.Context(), req.URL.Query())
 			badge := "SD"
 			if f.token != "" || len(f.tokens) > 0 {
 				badge = "HD"
 			}
-			if f.pro || (f.fxUser != "" && f.fxPasswd != "") {
+			if f.legacyRights() || (f.fxUser != "" && f.fxPasswd != "") {
 				badge = "4K"
 			}
 			writeCheckSearchResponse(w, show, badge)
@@ -386,40 +416,90 @@ func (f *filmixChecker) index(w http.ResponseWriter, req *http.Request, links *p
 
 	// Прямой CDN (архитектура B): клиент, умеющий сам минтить hash, просит fxdirect=1 и получает
 	// РЕЦЕПТ вместо проксированных потоков — дальше он качает CDN напрямую, минуя сервер (см.
-	// filmix_direct.go). Без флага поведение прежнее, поэтому старые клиенты не ломаются.
-	if parseBoolParam(q.Get("fxdirect")) {
+	// filmix_direct.go).
+	//
+	// ★Ветка обязана смотреть на флаг, а не только на параметр. Сниппет живёт СТАТИКОЙ в
+	// plugins/online.js, поэтому Лампа продолжает просить `fxdirect=1` и после выключения
+	// `direct_lampa` — раньше сервер честно отдавал рецепт, браузеры минтили сами и упирались в
+	// 429 от werkecdn, тогда как приложение (параметр не шлёт) спокойно играло через /proxy.
+	// Теперь выключатель работает без переката клиентов, как и обещано в config.go.
+	if parseBoolParam(q.Get("fxdirect")) && f.fxDirectLampa {
 		f.writeFilmixDirect(w, req, postID)
 		return
 	}
 
-	// api-fx first: since 2026-07 the legacy /s/ hashes are capped at 720p server-side
-	// (higher qualities stream a "купите премиум" stub mp4), while video-links returns
-	// working per-quality HLS including 4K. Legacy stays as the fallback — RKN-blocked
-	// titles without account credentials, api.filmix.tv outages.
-	//
-	// Geo guard: api.filmix.tv serves non-RU/datacenter IPs a degraded answer —
-	// some titles "Видео заблокировано!", others a 480p-only preview list. A
-	// 480p-capped fx answer must not shadow the legacy path (720p with a token),
-	// so fx wins only when it actually offers ≥720p; otherwise it's just the
-	// fallback of last resort. Fix the root cause by routing the "filmix"
-	// balancer through a RU exit (admin Proxy panel / vless balancers list).
-	movies, serial, fxOK := f.fxVideoLinks(ctx, postID)
-	if fxOK && fxMaxQuality(movies, serial) >= 720 {
-		f.writeFX(w, req, rjson, movies, serial, postID, title, originalTitle, t, sSet, s, links)
-		return
-	}
-
-	post, ok := f.post(ctx, postID, token)
-	if !ok {
-		if fxOK {
+	if f.fxPrimary {
+		// fx_mode = 'primary' — the pre-2026-09 order. api-fx first: since 2026-07
+		// the legacy /s/ hashes are capped at 720p server-side (higher qualities
+		// stream a "купите премиум" stub mp4), while video-links returns per-quality
+		// HLS including 4K. Geo guard: api.filmix.tv serves non-RU/datacenter IPs
+		// a degraded answer (480p-only or "Видео заблокировано!"), so fx wins only
+		// when it actually offers ≥720p; legacy is the fallback.
+		movies, serial, fxOK := f.fxVideoLinks(ctx, postID)
+		if fxOK && fxMaxQuality(movies, serial) >= 720 {
 			f.writeFX(w, req, rjson, movies, serial, postID, title, originalTitle, t, sSet, s, links)
 			return
 		}
-		writeGetsTVEmpty(w, rjson)
+		post, ok := f.post(ctx, postID, token)
+		if !ok {
+			if fxOK {
+				f.writeFX(w, req, rjson, movies, serial, postID, title, originalTitle, t, sSet, s, links)
+				return
+			}
+			writeGetsTVEmpty(w, rjson)
+			return
+		}
+		f.writeTpl(w, req, rjson, post, postID, title, originalTitle, t, sSet, s, token, links)
 		return
 	}
 
-	f.writeTpl(w, req, rjson, post, postID, title, originalTitle, t, sSet, s, token, links)
+	// Default (fx_mode = 'fallback'): the legacy filmixapp API is the stable
+	// backend — its /s/ links play reliably (≤720p with a token). api.filmix.tv
+	// is consulted only when legacy cannot serve the title: the API refused
+	// (403 / outage), the title is RKN-blocked there, or every row is a
+	// "купите премиум" stub. Mirrors lampac-nextgen, where Filmix (legacy +
+	// pro token) and the api-fx contour are separate and legacy is the default.
+	post, ok := f.post(ctx, postID, token)
+	if ok && f.legacyPlayable(post) {
+		f.writeTpl(w, req, rjson, post, postID, title, originalTitle, t, sSet, s, token, links)
+		return
+	}
+	movies, serial, fxOK := f.fxVideoLinks(ctx, postID)
+	if fxOK {
+		log.Info().Int("post_id", postID).Bool("legacy_ok", ok).
+			Msg("filmix: legacy has nothing playable, falling back to api-fx")
+		f.writeFX(w, req, rjson, movies, serial, postID, title, originalTitle, t, sSet, s, links)
+		return
+	}
+	if ok {
+		// Neither backend has streams — let the legacy writer produce its own
+		// (blocked / empty) answer so the client sees the same shape as before.
+		f.writeTpl(w, req, rjson, post, postID, title, originalTitle, t, sSet, s, token, links)
+		return
+	}
+	writeGetsTVEmpty(w, rjson)
+}
+
+// legacyPlayable reports whether the legacy post carries at least one row the
+// legacy writer would actually emit: a movie translation that is not blocked
+// and not a premium stub, or a serial with a playlist.
+func (f *filmixChecker) legacyPlayable(root filmixPostRoot) bool {
+	if root.PlayerLinks == nil {
+		return false
+	}
+	if len(root.PlayerLinks.Movie) > 0 {
+		if len(root.PlayerLinks.Movie) == 1 &&
+			strings.HasPrefix(strings.ToLower(strings.TrimSpace(root.PlayerLinks.Movie[0].Translation)), "заблокировано ") {
+			return false
+		}
+		for _, m := range root.PlayerLinks.Movie {
+			if !f.filmixHideUnplayable(m.Translation, m.Link) {
+				return true
+			}
+		}
+		return false
+	}
+	return len(root.PlayerLinks.Playlist) > 0
 }
 
 func (f *filmixChecker) checkSearch(ctx context.Context, q url.Values) bool {
@@ -613,6 +693,15 @@ func (f *filmixChecker) buildSearchResult(
 // /capi proxy must replay this when fetching segments (see capiStreamHeaders).
 const filmixCDNUserAgent = "Dalvik/2.1.0 (Linux; U; Android 11; Xiaomi Build/RP1A.200720.011)"
 
+// filmixStreamHeaders are baked into every filmix /proxy token so the proxy
+// replays the Dalvik UA on segment fetches for ANY client. Until 2026-09 only
+// the /capi path did this (capiStreamHeaders); Lampa clients got header-less
+// tokens and the CDN answered 403 — 100+ «upstream blocked playback» a day,
+// all werkecdn/cdnsqu with token_headers=0.
+func filmixStreamHeaders() map[string]string {
+	return map[string]string{"User-Agent": filmixCDNUserAgent}
+}
+
 // filmixHeaderMap is the single source of truth for filmix request headers,
 // shared by the direct path and the rch path. The Dalvik UA is required —
 // desktop UAs get empty player_links from filmix.
@@ -659,6 +748,12 @@ func (f *filmixChecker) apiGet(ctx context.Context, path string, qs url.Values, 
 			}
 			defer resp.Body.Close()
 			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+				// 429 отделяем от прочих кодов: «нас режут» и «источник сломался» —
+				// разные беды, и лечатся по-разному. Без этого в логе была бы одна
+				// безликая строка про статус.
+				if resp.StatusCode == http.StatusTooManyRequests {
+					log.Warn().Str("url", u.String()).Msg("filmix: апстрим ограничивает запросы (429)")
+				}
 				return "", fmt.Errorf("filmix: status %d", resp.StatusCode)
 			}
 			b, err := io.ReadAll(io.LimitReader(resp.Body, maxBody))
@@ -712,6 +807,9 @@ func (f *filmixChecker) searchFallback(ctx context.Context, story string) ([]fil
 		}
 		defer resp.Body.Close()
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			if resp.StatusCode == http.StatusTooManyRequests {
+				log.Warn().Msg("filmix: апстрим ограничивает поиск (429)")
+			}
 			return "", fmt.Errorf("filmix: searchFallback status %d", resp.StatusCode)
 		}
 		b, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
@@ -816,10 +914,10 @@ func (f *filmixChecker) writeTpl(
 		return
 	}
 
-	// NOTE: the response "quality" field is no longer usable for pro detection —
+	// NOTE: the response "quality" field is not usable for pro detection —
 	// since 2026-07 it reports the CONTENT's max quality ("2160" even anonymous),
-	// not the account tier, and the legacy /s/ hashes cap at 720p regardless of
-	// subscription. allowQuality enforces that cap; >720p lives in filmix_fx.go.
+	// not the account tier. The tier comes from config (`pro`) and is applied by
+	// allowQuality; see its doc for the 2026-09 re-verification of legacy 4K.
 
 	if len(root.PlayerLinks.Movie) > 0 {
 		f.writeMovie(w, req, rjson, root.PlayerLinks.Movie, postID, title, originalTitle, token, links)
@@ -861,9 +959,10 @@ func (f *filmixChecker) writeMovie(
 		if len(streams) == 0 {
 			continue
 		}
+		filmixRememberMint(streams, postID, token)
 
 		for i := range streams {
-			streams[i]["url"] = streamProxyURL(req, streams[i]["url"], "filmix", links)
+			streams[i]["url"] = streamProxyURLWithHeaders(req, streams[i]["url"], "filmix", links, filmixStreamHeaders())
 		}
 
 		name := strings.TrimSpace(movie.Translation)
@@ -1076,9 +1175,10 @@ func (f *filmixChecker) writeSerial(
 		if len(streams) == 0 {
 			continue
 		}
+		filmixRememberMint(streams, postID, token)
 
 		for i := range streams {
-			streams[i]["url"] = streamProxyURL(req, streams[i]["url"], "filmix", links)
+			streams[i]["url"] = streamProxyURLWithHeaders(req, streams[i]["url"], "filmix", links, filmixStreamHeaders())
 		}
 
 		episodeNum := filmixEpisodeOrder(key, len(episodeData)+1)
@@ -1229,9 +1329,20 @@ func (f *filmixChecker) pickToken() string {
 		return f.tokens[0]
 	}
 
+	// Мёртвые и бесправные токены — в самый конец: пока есть хоть один живой PRO, выбираем
+	// среди живых. Все мёртвые — берём любой: ≤720p по нему всё ещё настоящие.
+	usable := make([]string, 0, len(f.tokens))
+	for _, tok := range f.tokens {
+		if f.tokenUsable(tok) {
+			usable = append(usable, tok)
+		}
+	}
+	if len(usable) == 0 {
+		usable = f.tokens
+	}
 	f.tokenMux.Lock()
 	defer f.tokenMux.Unlock()
-	return f.tokens[mathrand.Intn(len(f.tokens))]
+	return usable[mathrand.Intn(len(usable))]
 }
 
 func (f *filmixChecker) userDevID(token string) string {
@@ -1258,15 +1369,29 @@ func randomHex16() string {
 	return hex.EncodeToString(b[:])
 }
 
-// allowQuality gates the LEGACY filmixapp.cyou path. Since 2026-07 its /s/
-// hashes never authorize >720p — even active PRO+ tokens get a ~10MB "купите
-// премиум" stub mp4 there (verified live), so emitting those rows would play
-// the stub. 4K/1080 go through api-fx (filmix_fx.go); the old pro auto-detect
-// by the post "quality" field is gone — that field now reports the content's
-// max quality even for anonymous requests.
+// allowQuality gates the LEGACY filmixapp.cyou path.
+//
+//   - no token: 480p only (filmix's free tier);
+//   - token without `pro`: up to 720p;
+//   - token + `pro = true`: every quality the link template lists — the same
+//     rule lampac-nextgen applies (`if (!pro) cap at 720`).
+//
+// The 2026-07 note that /s/ hashes "never authorize >720p" was re-verified
+// 2026-09-02 against the production pro token: SDR rips stream the real file
+// (Дюна 2160p = 7.7 GB, 1440p = 5.8 GB, 1080p = 3.6 GB, all HTTP 206). What
+// DOES stub without subscription rights is the HEVC/HDR/Dolby family — those
+// rows are still filtered by filmixHideUnplayable, not by a quality cap. The
+// post "quality" field is not consulted: it reports the content's max quality
+// even for anonymous requests.
+//
+// 22.09.2026: права — ещё и по здоровью токена (filmix_tokens.go): по мёртвому/бесправному
+// токену CDN отдаёт ≤720p настоящими, а выше — заглушку, так что `pro` из конфига ему не указ.
 func (f *filmixChecker) allowQuality(q int, token string) bool {
-	if strings.TrimSpace(token) == "" && q > 480 {
-		return false
+	if strings.TrimSpace(token) == "" {
+		return q <= 480
+	}
+	if f.pro && f.tokenUsable(token) {
+		return true
 	}
 	return q <= 720
 }
@@ -1317,7 +1442,10 @@ func (f *filmixChecker) buildMovieStreams(movie filmixMovie, token string, cdns 
 		return nil
 	}
 
-	qualities := []int{720, 480}
+	// Every quality filmix knows, highest first; the link template
+	// (`…_[2160,1440,1080,720,480,].mp4`) says which ones this rip has and
+	// allowQuality says which ones this account may play.
+	qualities := []int{2160, 1440, 1080, 720, 480}
 	out := make([]map[string]string, 0, len(qualities))
 	for _, q := range qualities {
 		if !f.allowQuality(q, token) {

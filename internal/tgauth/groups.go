@@ -95,6 +95,29 @@ func (s *GroupStore) ensureDefault() {
 	}
 }
 
+// Reload перечитывает groups.json поверх списка в памяти — пара к SIGHUP,
+// см. cluster.Store.Reload. Пустой или битый файл игнорируем намеренно:
+// обнулить группы значит раздать всем права по умолчанию, а это тише и опаснее,
+// чем остаться на прежнем списке из-за опечатки в редакторе.
+func (s *GroupStore) Reload() error {
+	data, err := os.ReadFile(s.filePath)
+	if err != nil {
+		return err
+	}
+	var next []UserGroup
+	if err := json.Unmarshal(data, &next); err != nil {
+		return err
+	}
+	if len(next) == 0 {
+		return fmt.Errorf("groups.json пуст — оставляю прежние группы")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.groups = next
+	s.ensureDefault()
+	return nil
+}
+
 // List returns all groups.
 func (s *GroupStore) List() []UserGroup {
 	s.mu.RLock()

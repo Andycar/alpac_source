@@ -227,7 +227,15 @@ func storeLiveConfig(cfg config.Config) {
 
 // tgAdminAuthCheck forwards to the injected host gate; the unwired default
 // fail-closes (403, ok=false).
+// TrustedRequest — проверка «запрос пришёл изнутри кластера» (X-Cluster-Key).
+// Ставится из httpapi: у этого пакета нет доступа к настройкам кластера.
+// Нужна, чтобы снимать показания панели скриптом, не заводя сессию админа.
+var TrustedRequest func(*http.Request) bool
+
 func tgAdminAuthCheck(w http.ResponseWriter, r *http.Request, store *tgauth.Store, adminStore *tgauth.AdminIDStore) (int64, bool, bool) {
+	if TrustedRequest != nil && TrustedRequest(r) {
+		return 0, true, true
+	}
 	if deps.AdminAuthCheck != nil {
 		return deps.AdminAuthCheck(w, r, store, adminStore)
 	}

@@ -497,8 +497,13 @@ func (k *KodikChecker) writeSerialResults(w http.ResponseWriter, req *http.Reque
 				vLink := fmt.Sprintf("%s/lite/kodik?rjson=%v&imdb_id=%s&kinopoisk_id=%s&title=%s&original_title=%s&clarification=%d&pick=%s&s=%d&kid=%s",
 					host, rjson, url.QueryEscape(imdbID), url.QueryEscape(kpIDStr), encTitle, encOrigTitle, clarification, encPick, s, url.QueryEscape(ve.id))
 				vRows = append(vRows, map[string]any{
-					"method":   "link",
-					"url":      vLink,
+					"method": "link",
+					"url":    vLink,
+					// The voice-selector contract keys are name/active — capi's drill (and Lampa's
+					// rjson consumers) read ONLY those, so title/selected alone made every kodik dub
+					// invisible («0 озвучек» при живых 5 дубляжах). Legacy keys kept alongside.
+					"name":     ve.name,
+					"active":   ve.id == kid,
 					"title":    ve.name,
 					"selected": ve.id == kid,
 				})

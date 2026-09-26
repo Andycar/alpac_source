@@ -404,7 +404,8 @@ func (v *videodbChecker) manifestMulti(w http.ResponseWriter, req *http.Request,
 			if !v.useHLS && !isAuto {
 				ext = ".mp4"
 			}
-			target = host + "/lite/" + v.plugin + "/manifest" + ext + "?link=" + url.QueryEscape(target)
+			// edge= — резолвить на добывшей ноде (см. liteEdgeHint).
+			target = host + "/lite/" + v.plugin + "/manifest" + ext + "?link=" + url.QueryEscape(target) + liteEdgeHint()
 			qualityMap[label] = target
 		} else if videodbIsCollapsCDN(target) && v.links != nil {
 			// Collaps CDN (interkh.com): wrap with kinogo.media origin headers.
@@ -908,12 +909,21 @@ func (v *videodbChecker) writeMovie(w http.ResponseWriter, r *http.Request, rjso
 	labels := make([]string, 0, len(rows))
 	baseTitle := getsTVJoinName(title, originalTitle)
 
-	for _, row := range rows {
+	// Voice names arrive tagged — "(RU) DUB | Paragraph Media". Clean them as a
+	// SET, not one by one: the shortening has to know about the other names to
+	// avoid merging two tracks of one studio (see videodbCleanVoiceNames).
+	rawNames := make([]string, len(rows))
+	for i, row := range rows {
+		rawNames[i] = row.Title
+	}
+	cleanNames := videodbCleanVoiceNames(rawNames)
+
+	for i, row := range rows {
 		streams := videodbParseStreams(row.File)
 		if len(streams) == 0 {
 			continue
 		}
-		name := strings.TrimSpace(row.Title)
+		name := strings.TrimSpace(cleanNames[i])
 		if name == "" {
 			name = "По умолчанию"
 		}
@@ -1754,7 +1764,8 @@ func (v *videodbChecker) proxyStreams(r *http.Request, streams []map[string]stri
 	if hasObrut && len(qualLinks) > 0 {
 		// Build one manifest URL with all quality links encoded as JSON.
 		linksJSON, _ := stdjson.Marshal(qualLinks)
-		manifestURL := host + "/lite/" + v.plugin + "/manifest?links=" + url.QueryEscape(string(linksJSON))
+		// edge= — манифест должен прийти на ЭТУ ноду: ссылка obrut привязана к её адресу (liteEdgeHint).
+		manifestURL := host + "/lite/" + v.plugin + "/manifest?links=" + url.QueryEscape(string(linksJSON)) + liteEdgeHint()
 		// play=true triggers redirect mode for external players
 		manifestPlayURL := manifestURL + "&play=true"
 

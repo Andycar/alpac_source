@@ -188,10 +188,55 @@ func allohaResolveViaBrowserFull(ctx context.Context, linkHost, token, tokenMovi
 			log.Debug().Msgf("[chromedp-alloha] "+format, args...)
 		}),
 	)
+	// The player inside this tab opens its own WS with the stream's sid, and the
+	// CDN keeps ONE connection per sid: a second one is closed with 4005. So our
+	// Go WS client (which outlives the tab and carries the heartbeat for the
+	// proxied playback) must not run while the tab is alive. Any client left
+	// from an earlier resolve of this stream is closed now, and the one minted
+	// from this tab's /movies/ answer is parked in pendingWS and started only
+	// after the tab is gone (below, or when a keepopen tab expires).
+	streamWSKey := allohaStreamKey(tokenMovie, translation, season, episode)
+	CloseEdgeHashClient(streamWSKey)
+	var pendingWSMu sync.Mutex
+	var pendingWS *mirageWSClient
+	// For titles whose /movies/ answer carries no wsUrl/sid (only hlsSource/
+	// tracks/skipTime — «playback will die when the fallback token expires», the
+	// 6–7 minute deaths), the player STILL opens a WS: it knows the sid from
+	// elsewhere. The WS spy below records the URL it used; on tab close we build
+	// our client from that instead of running with no session at all.
+	var spyWSURL, spySID string
+	startPendingWS := func() {
+		pendingWSMu.Lock()
+		c := pendingWS
+		pendingWS = nil
+		if c == nil && spySID != "" && spyWSURL != "" {
+			c = newMirageWSClient(spyWSURL, spySID, linkHost, socksProxy)
+			RegisterEdgeHashClient(c, streamWSKey, tokenMovie, linkHost)
+			log.Info().Str("wsUrl", spyWSURL).Int("sidLen", len(spySID)).Str("stream", streamWSKey).
+				Msg("alloha: WS client built from the player's own socket (no params in /movies/)")
+		}
+		pendingWSMu.Unlock()
+		if c != nil {
+			go c.Run()
+			// Hold the resolve until this client has ITS edge_hash (a few hundred
+			// ms after connect). The tab's hash died with the tab, and the first
+			// proxied master request must not go out under a foreign one: on
+			// 2026-09-02 00:30 that single mismatched request (ac from another
+			// stream) was answered 403, and every later request with the correct
+			// hash on that URL was 403 too — the CDN drops the session.
+			deadline := time.Now().Add(4 * time.Second)
+			for c.EdgeHash() == "" && time.Now().Before(deadline) {
+				time.Sleep(100 * time.Millisecond)
+			}
+			log.Info().Str("token_movie", tokenMovie).Bool("hash_ready", c.EdgeHash() != "").
+				Msg("alloha: browser tab closed — WS client for edge_hash started")
+		}
+	}
 	browserCanceled := false
 	defer func() {
 		if !browserCanceled {
 			cancel()
+			startPendingWS()
 		}
 	}()
 
@@ -274,6 +319,38 @@ func allohaResolveViaBrowserFull(ctx context.Context, linkHost, token, tokenMovi
 		switch e := ev.(type) {
 		case *network.EventRequestWillBeSent:
 			log.Debug().Str("method", e.Request.Method).Str("url", e.Request.URL).Msg("alloha: request sent")
+
+		// WS spy: the real player's WebSocket session as the CDN sees it. Our own
+		// Go WS client (mirage_ws.go) is closed by the server within a second on
+		// virtually every connect (472/476 in 6 h, codes 4005/4003, 2026-09-02),
+		// so playback dies once the edge_hash expires. The player JS is
+		// obfuscated; this is the cheapest way to learn the live URL params,
+		// handshake frames and close code to bring our client back in line.
+		case *network.EventWebSocketCreated:
+			log.Info().Str("url", e.URL).Msg("alloha-ws-spy: created")
+			// Remember the player's real WS endpoint + sid (see spyWSURL above).
+			if u, err := url.Parse(e.URL); err == nil && strings.Contains(u.Path, "/ws") {
+				if sid := u.Query().Get("sid"); sid != "" {
+					pendingWSMu.Lock()
+					spySID = sid
+					spyWSURL = u.Scheme + "://" + u.Host + u.Path
+					pendingWSMu.Unlock()
+				}
+			}
+		case *network.EventWebSocketHandshakeResponseReceived:
+			if e.Response != nil {
+				log.Info().Int64("status", e.Response.Status).Msg("alloha-ws-spy: handshake response")
+			}
+		case *network.EventWebSocketFrameSent:
+			if e.Response != nil {
+				log.Info().Str("payload", capiTruncBody([]byte(e.Response.PayloadData), 400)).Msg("alloha-ws-spy: frame sent")
+			}
+		case *network.EventWebSocketFrameReceived:
+			if e.Response != nil {
+				log.Info().Str("payload", capiTruncBody([]byte(e.Response.PayloadData), 400)).Msg("alloha-ws-spy: frame received")
+			}
+		case *network.EventWebSocketClosed:
+			log.Info().Msg("alloha-ws-spy: closed")
 
 		case *fetch.EventRequestPaused:
 			go func() {
@@ -415,11 +492,18 @@ func allohaResolveViaBrowserFull(ctx context.Context, linkHost, token, tokenMovi
 								// Pass alloha's local socks so WS shares the
 								// browser's exit IP — see newMirageWSClient docs.
 								wsClient := newMirageWSClient(wsURL, wsSID, linkHost, socksProxy)
-								go wsClient.Run()
+								// Not started yet — the tab's own player holds this sid
+								// until the tab closes (see pendingWS at the top).
+								pendingWSMu.Lock()
+								if pendingWS != nil {
+									pendingWS.Close()
+								}
+								pendingWS = wsClient
+								pendingWSMu.Unlock()
 								// Identity = this stream; the rest are lookup aliases
 								// (aliases never close a live session).
 								RegisterEdgeHashClient(wsClient, wsKey, tokenMovie, linkHost)
-								log.Info().Str("wsUrl", wsURL).Int("sidLen", len(wsSID)).Str("stream", wsKey).Msg("alloha: started WS client for edge_hash")
+								log.Info().Str("wsUrl", wsURL).Int("sidLen", len(wsSID)).Str("stream", wsKey).Msg("alloha: WS client for edge_hash parked until the tab closes")
 							}
 						} else {
 							log.Debug().Msg("alloha: WS client alive, skipping restart")
@@ -806,6 +890,8 @@ func allohaResolveViaBrowserFull(ctx context.Context, linkHost, token, tokenMovi
 					cancel() // close browser tab
 					close(updateCh)
 					log.Info().Str("token_movie", tokenMovie).Int("sec", keepopenSec).Msg("alloha: keepopen session expired, browser tab closed")
+					// The tab's WS is gone with it — our client takes over the sid.
+					startPendingWS()
 				}()
 
 				res.headerUpdates = updateCh

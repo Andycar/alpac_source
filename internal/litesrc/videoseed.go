@@ -4,6 +4,7 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/base64"
+	"encoding/hex"
 	stdjson "encoding/json"
 	"fmt"
 	"io"
@@ -38,10 +39,15 @@ var (
 )
 
 type videoseedChecker struct {
-	client      *http.Client // standard client for API (videoseed.tv)
-	cdnClient   *http.Client // uTLS client for CDN (kinoserial.net) — Chrome TLS fingerprint
-	host        string
-	token       string // API key for apiv2.php
+	client    *http.Client // standard client for API (videoseed.tv)
+	cdnClient *http.Client // uTLS client for CDN (kinoserial.net) — Chrome TLS fingerprint
+	host      string
+	token     string // API key for apiv2.php
+	// limitUntil — до этого момента API отвечает «request limit expired» на
+	// ВСЁ. Без этой памяти каждый промах делал три платных запроса (kp, imdb,
+	// title) и получал три отказа, а в журнале это выглядело как «пусто».
+	limitMu     sync.Mutex
+	limitUntil  time.Time
 	playerToken string // separate embed/player key (optional; iframes carry their own)
 	rhub        bool
 
@@ -385,7 +391,19 @@ func (v *videoseedChecker) index(w http.ResponseWriter, req *http.Request) {
 }
 
 func (v *videoseedChecker) video(w http.ResponseWriter, req *http.Request, enc string, links *proxylink.Manager) {
-	iframe := videoseedDecode(strings.TrimSpace(enc))
+	// Deferred form: /lite/videoseed/video/<enc>.m3u8?track=N&name=<voice>.
+	// The CDN links storage.videoseedcdn.com hands out outlive neither the
+	// 5-minute /capi/streams cache nor a paused episode: viewers hit 404 on a
+	// link resolved a minute earlier (10–40 «proxy: upstream 404» an hour). So
+	// the client is given THIS url instead of the CDN link and the redirect
+	// below re-resolves (90 s track cache, then a fresh embed) at play time —
+	// the same deferred pattern alloha and vibix use.
+	enc = strings.TrimSpace(enc)
+	deferred := strings.HasSuffix(strings.ToLower(enc), ".m3u8")
+	if deferred {
+		enc = enc[:len(enc)-len(".m3u8")]
+	}
+	iframe := videoseedDecode(enc)
 	if iframe == "" {
 		writeJSON(w, http.StatusOK, map[string]any{})
 		return
@@ -425,6 +443,30 @@ func (v *videoseedChecker) video(w http.ResponseWriter, req *http.Request, enc s
 
 	firstURL := tracks[0].URL
 
+	if deferred {
+		// Pick the voice by name first (the list order can change between
+		// resolves), then by index, then the first track.
+		chosen := tracks[0]
+		wantName := strings.ToLower(strings.TrimSpace(req.URL.Query().Get("name")))
+		matched := false
+		if wantName != "" {
+			for _, t := range tracks {
+				if strings.ToLower(strings.TrimSpace(t.Name)) == wantName {
+					chosen, matched = t, true
+					break
+				}
+			}
+		}
+		if !matched {
+			if idx, err := strconv.Atoi(strings.TrimSpace(req.URL.Query().Get("track"))); err == nil && idx >= 0 && idx < len(tracks) {
+				chosen = tracks[idx]
+			}
+		}
+		w.Header().Set("Cache-Control", "no-store")
+		http.Redirect(w, req, chosen.URL, http.StatusFound)
+		return
+	}
+
 	if parseBoolParam(req.URL.Query().Get("play")) {
 		http.Redirect(w, req, firstURL, http.StatusFound)
 		return
@@ -437,11 +479,18 @@ func (v *videoseedChecker) video(w http.ResponseWriter, req *http.Request, enc s
 	// drill with one named row per voice; Lampa keeps the play shape below.
 	if parseBoolParam(req.URL.Query().Get("rjson")) {
 		rows := make([]map[string]any, 0, len(tracks))
-		for _, t := range tracks {
+		host := hostFromRequest(req)
+		for i, t := range tracks {
 			name := strings.TrimSpace(t.Name)
 			if name == "" {
 				name = "По умолчанию"
 			}
+			// The drill gets the DEFERRED url (see the top of video()): the CDN
+			// link is re-resolved when the viewer presses play, not when the
+			// title was drilled. .m3u8 in the path keeps capi's stream sniff happy;
+			// capiSameOrigin passes /lite/videoseed/video/ through unwrapped.
+			deferredURL := host + "/lite/videoseed/video/" + videoseedEncodeHex(iframe) + ".m3u8?track=" + strconv.Itoa(i) +
+				"&name=" + url.QueryEscape(strings.TrimSpace(t.Name))
 			// Deliberately NO "title": with an empty/movie response type the drill
 			// arms its wrong-film guard on each item's title, and a voice label
 			// ("LostFilm") matches no requested title — every row would be dropped.
@@ -449,8 +498,8 @@ func (v *videoseedChecker) video(w http.ResponseWriter, req *http.Request, enc s
 			rows = append(rows, map[string]any{
 				"method":  "play",
 				"name":    name,
-				"url":     t.URL,
-				"quality": map[string]string{"auto": t.URL},
+				"url":     deferredURL,
+				"quality": map[string]string{"auto": deferredURL},
 			})
 		}
 		// Deliberately NO "type" either: this endpoint serves both movies and
@@ -831,6 +880,9 @@ func (v *videoseedChecker) search(
 	}
 
 	trySearch := func(arg string) (videoseedDataNode, bool) {
+		if v.quotaExhausted() {
+			return videoseedDataNode{}, false // квота кончилась на прошлой попытке — не жечь остаток
+		}
 		if arg == "" {
 			return videoseedDataNode{}, false
 		}
@@ -869,11 +921,28 @@ func (v *videoseedChecker) search(
 			return videoseedDataNode{}, false
 		}
 
-		var root videoseedSearchRoot
-		if err := stdjson.Unmarshal([]byte(body), &root); err != nil {
+		// На ошибке API кладёт в data СТРОКУ («request limit expired»), а не
+		// список — прямой Unmarshal в videoseedSearchRoot падал, и причина отказа
+		// терялась. Сначала снимаем статус, потом разбираем данные.
+		var head struct {
+			Status string             `json:"status"`
+			Data   stdjson.RawMessage `json:"data"`
+		}
+		if err := stdjson.Unmarshal([]byte(body), &head); err != nil {
 			return videoseedDataNode{}, false
 		}
-		if strings.EqualFold(strings.TrimSpace(root.Status), "error") {
+		if strings.EqualFold(strings.TrimSpace(head.Status), "error") {
+			var msg string
+			_ = stdjson.Unmarshal(head.Data, &msg)
+			if strings.Contains(strings.ToLower(msg), "limit") {
+				v.noteQuotaExhausted(msg)
+			} else {
+				log.Warn().Str("api_error", truncStr(msg, 120)).Msg("videoseed: API отказал")
+			}
+			return videoseedDataNode{}, false
+		}
+		var root videoseedSearchRoot
+		if err := stdjson.Unmarshal([]byte(body), &root); err != nil {
 			return videoseedDataNode{}, false
 		}
 		if len(root.Data) == 0 {
@@ -881,6 +950,11 @@ func (v *videoseedChecker) search(
 		}
 		v.learnPlayerToken(root.Data[0])
 		return root.Data[0], true
+	}
+
+	if v.quotaExhausted() {
+		// Квота API кончилась: любой запрос вернёт тот же отказ, но спишется.
+		return videoseedDataNode{}, false
 	}
 
 	if kinopoiskID > 0 {
@@ -1119,8 +1193,24 @@ func videoseedEncode(v string) string {
 	return url.QueryEscape(v)
 }
 
+// videoseedHexPrefix marks the hex form of the embed url used by the deferred
+// stream link (see video()). Hex is chosen because the route lowercases the
+// path and reverse proxies may normalise percent-escapes — both are harmless to
+// [0-9a-f], while base64url or %2F would not survive.
+const videoseedHexPrefix = "h."
+
+func videoseedEncodeHex(v string) string {
+	return videoseedHexPrefix + hex.EncodeToString([]byte(v))
+}
+
 func videoseedDecode(v string) string {
 	if v == "" {
+		return ""
+	}
+	if rest, ok := strings.CutPrefix(v, videoseedHexPrefix); ok {
+		if b, err := hex.DecodeString(rest); err == nil && strings.TrimSpace(string(b)) != "" {
+			return string(b)
+		}
 		return ""
 	}
 	if u, err := url.QueryUnescape(v); err == nil && strings.TrimSpace(u) != "" {
@@ -1251,4 +1341,26 @@ func (v *videoseedChecker) probe(req *http.Request, method, target string) bool 
 		return false
 	}
 	return len(strings.TrimSpace(string(body))) > 0
+}
+
+// videoseedQuotaHold — сколько не трогать API после «request limit expired».
+// Квота у videoseed суточная, но точное время сброса неизвестно; десять минут
+// между пробами не дают выжечь остаток и при этом быстро замечают возврат.
+const videoseedQuotaHold = 10 * time.Minute
+
+func (v *videoseedChecker) noteQuotaExhausted(msg string) {
+	v.limitMu.Lock()
+	fresh := time.Now().After(v.limitUntil)
+	v.limitUntil = time.Now().Add(videoseedQuotaHold)
+	v.limitMu.Unlock()
+	if fresh {
+		log.Warn().Str("api", truncStr(msg, 80)).Dur("hold", videoseedQuotaHold).
+			Msg("videoseed: квота API исчерпана — источник молчит, пока квота не вернётся")
+	}
+}
+
+func (v *videoseedChecker) quotaExhausted() bool {
+	v.limitMu.Lock()
+	defer v.limitMu.Unlock()
+	return time.Now().Before(v.limitUntil)
 }

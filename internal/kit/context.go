@@ -101,6 +101,13 @@ func BalancerVisible(ctx context.Context, pluginKey string) (visible bool, confi
 	if v, found := vis[pluginKey]; found {
 		return v, true
 	}
+	// Не в карте. Сначала проверяем, а был ли этот источник вообще, когда
+	// пользователь сохранял набор: чего он не видел, того он и не выключал.
+	// Новый источник — «не настроен», решает глобальный дефолт (см. catalog.go).
+	if !knownAtSave(m, pluginKey) {
+		return false, false
+	}
+
 	// Not in map. Detect mode: any value=true → whitelist mode → hide.
 	for _, v := range vis {
 		if v {

@@ -25,6 +25,10 @@ func RegisterRoutes(router chi.Router, cfg config.Config, hostDeps Deps) *skipdb
 	})
 	router.Get("/api/skip", skipLookupHandler(db, cfg))
 	router.Post("/api/skip/mark", skipMarkHandler(db))
+	// Авто-детект заставок по звуку (introdetect): клиент присылает адреса серий пака.
+	if det := newDetector(cfg, db); det != nil {
+		router.Post("/api/skip/detect", skipDetectHandler(db, det))
+	}
 	shows, eps := db.Stats()
 	log.Info().Int("shows", shows).Int("episodes", eps).Msg("skipdb: loaded")
 	return db

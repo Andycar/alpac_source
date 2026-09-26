@@ -32,6 +32,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -99,6 +100,10 @@ import (
 )
 
 var json = jsoniter.ConfigCompatibleWithStandardLibrary
+
+// tmdbGroupsRef — список антологий для TMDB-прокси (см. tmdb_groups.go). Держим ссылкой,
+// чтобы reloadDiskStores мог перечитать его по SIGHUP.
+var tmdbGroupsRef *tmdbGroupStore
 
 // groupStoreRef holds a reference to the user groups store.
 // Used by lite_events, ts_api, auth for group-based access control.
@@ -367,9 +372,21 @@ func NewServer(opts Options) (*Server, error) {
 		VerifyIP:     cfg.ProxyLink.VerifyIP,
 		EncryptAES:   cfg.ProxyLink.EncryptAES,
 		SharedSecret: cfg.ProxyLink.SharedSecret,
+		TTLHours:     cfg.ProxyLink.TTLHours,
+
+		RequireTTLPlugins:  cfg.ProxyLink.RequireTTLPlugins,
+		BindNetworkPlugins: cfg.ProxyLink.BindNetworkPlugins,
+		SessionPlugins:     cfg.ProxyLink.SessionPlugins,
+		SessionFlipSec:     cfg.ProxyLink.SessionFlipSec,
+		SessionIdleMin:     cfg.ProxyLink.SessionIdleMin,
+		TrustedNetworks:    cfg.ProxyLink.TrustedNetworks,
 	})
 	if err != nil {
 		log.Warn().Err(err).Str("cache_dir", cfg.ProxyLink.CacheDir).Msg("proxylink manager disabled")
+	}
+	if proxyLinks != nil && cfg.Cluster.Mode == "node" && strings.TrimSpace(cfg.Cluster.EdgeURL) != "" {
+		proxyLinks.SetEdge(cfg.Cluster.EdgeURL)
+		log.Info().Str("edge", cfg.Cluster.EdgeURL).Msg("proxylink: ссылки подписываются адресом этой ноды")
 	}
 
 	// --- Telegram Auth ---
@@ -385,9 +402,11 @@ func NewServer(opts Options) (*Server, error) {
 	if cfg.TelegramAuth.Enable && cfg.TelegramAuth.BotToken != "" && cfg.TelegramAuth.AdminID > 0 {
 		tgTokenStore = tgauth.NewStore(cfg.Compat.RepoRoot)
 		tgTokenStoreRef = tgTokenStore
+		tgServerMaxDevices = cfg.TelegramAuth.MaxDevicesPerUser
 		tgPending = tgauth.NewPendingStore()
 		tgDevicePending = tgauth.NewDevicePendingStore()
 		tgLangStore = tgauth.NewLangStore(cfg.Compat.RepoRoot)
+		initEdgePrefs(cfg.Compat.RepoRoot)
 		tgBot = tgauth.NewBot(tgauth.BotConfig{
 			Token:             cfg.TelegramAuth.BotToken,
 			AdminID:           cfg.TelegramAuth.AdminID,
@@ -741,6 +760,10 @@ func NewServer(opts Options) (*Server, error) {
 
 	authMiddleware := auth.New(authOpts...)
 	proxyHandler := uproxy.New(proxyLinks)
+	// Страна зрителя для гео-ограничений нод (stream_edge_geo_deny) — до создания
+	// хендлера, чтобы первый же запрос уже учитывал правила.
+	setEdgeGeoDB(geoDB)
+	proxyapi.SetGeoLookup(countryForEdge)
 	proxyAPIHandler := proxyapi.New(cfg, proxyLinks)
 	proxyAPIHandler.EdgeHashLookup = func(_ string) string {
 		return litesrc.GetAnyEdgeHash()
@@ -748,6 +771,7 @@ func NewServer(opts Options) (*Server, error) {
 	proxyapi.TrafficRecorder = func(plugin string, bytes int64, isError bool) {
 		runtimeTrafficStats.RecordProxy(plugin, bytes, isError)
 	}
+	proxyapi.OffloadRecorder = runtimeTrafficStats.RecordOffload
 	proxyapi.ActiveStreamCounter = runtimeTrafficStats.BeginProxy
 	proxyapi.LatencyRecorder = func(plugin string, elapsed time.Duration, status int) {
 		runtimeRequestStats.observeProxyPL(plugin, status, elapsed)
@@ -801,6 +825,11 @@ func NewServer(opts Options) (*Server, error) {
 	if cfg.Kit.Enable {
 		kitStore = kit.NewStore(cfg.Compat.RepoRoot, time.Duration(cfg.Kit.CacheToSeconds)*time.Second, cfg.Kit.Encrypt)
 		router.Use(kitMiddleware(kitStore, cfg))
+		// Публикуем каталог источников: по нему kit отличает «пользователь
+		// выключил» от «источника ещё не было, когда он настраивал». Без этого
+		// белый список видимости навсегда запирал пользователя в каталоге того
+		// дня — см. kit/catalog.go.
+		kit.SetBalancerCatalog(allBalancerKeys())
 		log.Info().Msg("kit: per-user balancer settings enabled")
 	}
 
@@ -981,6 +1010,10 @@ func NewServer(opts Options) (*Server, error) {
 	var clusterFwd *cluster.Forwarder
 	var clusterStore *cluster.Store
 	router.Get("/api/cluster/ping", clusterPingHandler())
+	// Build distribution: nodes compare their binary hash with the primary's
+	// and pull it when they differ (see cluster_update.go).
+	router.Get("/api/cluster/release", clusterReleaseHandler())
+	router.Get("/api/cluster/binary", clusterBinaryHandler())
 	router.Post("/api/cluster/userdata/delete", clusterUserdataDeleteHandler())
 	router.Get("/api/servers/info", publicServerInfoHandler())
 	router.Get("/api/servers/list", publicServerListHandler())
@@ -1037,9 +1070,18 @@ func NewServer(opts Options) (*Server, error) {
 			clusterPool = cluster.NewPool(cfg.Cluster, clusterStore)
 		}
 		clusterFwd = cluster.NewForwarder(clusterPool)
+		// Let the pool warn when a node runs a different binary than this one.
+		clusterPool.SetLocalBuild(selfBuildShort())
 		clusterPool.Start()
 		router.Get("/api/cluster/status", clusterStatusHandler(clusterPool))
-		log.Info().Int("nodes", len(clusterPool.Nodes())).Msg("cluster: primary mode enabled")
+		log.Info().Int("nodes", len(clusterPool.Nodes())).Str("build", selfBuildShort()).
+			Msg("cluster: primary mode enabled")
+	}
+
+	// Nodes keep themselves on the primary's build. No-op on the primary and
+	// whenever [cluster] auto_update is off.
+	if cfg.Cluster.Enable && !strings.EqualFold(strings.TrimSpace(cfg.Cluster.Mode), "primary") {
+		newClusterSelfUpdater(func() config.Config { return liveConfig(cfg) }).Start()
 	}
 
 	router.Get("/_lampac/modules", modulesHandler(manifest))
@@ -1067,7 +1109,7 @@ func NewServer(opts Options) (*Server, error) {
 	router.Get("/lite/js", liteJSHandler(cfg))
 	router.Get("/lite/js/{token}", liteJSHandler(cfg))
 	// ALPAC web/TV client forwards its in-app weblog here → terminal (journalctl). See weblog_collect.go.
-	router.Post("/lite/weblog", weblogCollectHandler(cfg))
+	router.Post("/lite/weblog", weblogCollectHandler(cfg, tgBot))
 	// Playback capability telemetry: one structured report per playback attempt,
 	// aggregated so "no sound in torrents" becomes a codec/device histogram
 	// instead of a weblog archaeology exercise.
@@ -1081,6 +1123,9 @@ func NewServer(opts Options) (*Server, error) {
 	// tgBot/tgTokenStore enable the Telegram alert + admin→user reply (NotifyUserContext).
 	router.Post("/lite/incident", incidentReceiveHandler(cfg, opts.LogBuffer, tgBot, tgTokenStore))
 	router.Get("/lite/incident/status", incidentStatusHandler(cfg)) // «Мои обращения»: status of the caller's own ids
+	// Матрица диагностики сети: клиент по событию (столл, отвал хоста, фон) присылает
+	// DNS/TCP/TLS/HTTP по нашим хостам; сервер дописывает провайдера (netdiag.go).
+	router.Post("/lite/netdiag", netDiagReceiveHandler(cfg))
 	// Lampac plugin templates expect {localhost} to be the server origin.
 	dlnaTM, dlnaCG, dlnaUPnP := dlnahttp.RegisterRoutes(router, cfg, dlnahttp.Deps{PluginJS: genericPluginJSHandler})
 	transSvc := transcodesvc.RegisterRoutes(router, cfg, transcodesvc.Deps{
@@ -1128,7 +1173,11 @@ func NewServer(opts Options) (*Server, error) {
 		tsBalancerPool = torrbalancer.NewPool(st)
 		tsBalancerPoolRef = tsBalancerPool
 		tsBalancerPool.OnZombie = tsZombieHandler(tsBalancerPool) // alert + optional auto-restart on stream circuit-breaker trip
+		tsBalancerPool.OnChronic = tsChronicHandler(tsBalancerPool)
 		tsBalancerPool.Start()
+		// Торренты из /proxy — зрителю прямо с бэкенда ([proxy_link] torrent_direct).
+		proxyapi.DirectRedirect = torrentDirectRedirect(tsBalancerPool)
+		proxyapi.DirectRecorder = runtimeTrafficStats.RecordDirect
 	}
 	registerTSRoutes(router, cfg)
 	// CUB account validator — resolves CUB tokens to stable user ids for the
@@ -1154,7 +1203,10 @@ func NewServer(opts Options) (*Server, error) {
 		imgCacheDir = filepath.Join(cfg.Compat.RepoRoot, "database", "tmdb-img")
 	}
 	tmdbImgCache := tmdbcache.NewImageCache(imgCacheDir, cfg.TMDBProxy.ImgCacheMaxMB)
-	router.Handle("/tmdb/*", tmdbProxyHandler(tmdbCacheInst, tmdbPoolInst, tmdbImgCache, cfg.TMDBProxy.APIKey, cfg.TMDBProxy.CacheTTLMin))
+	// Антологии («Монстр» = четыре карточки TMDB) склеиваются в франшизу прокси-слоем,
+	// поэтому список групп нужен ему же. Перечитывается по SIGHUP — см. reloadDiskStores.
+	tmdbGroupsRef = newTmdbGroupStore(cfg.Compat.RepoRoot)
+	router.Handle("/tmdb/*", tmdbProxyHandler(tmdbCacheInst, tmdbPoolInst, tmdbImgCache, cfg.TMDBProxy.APIKey, cfg.TMDBProxy.CacheTTLMin, litesrc.SharedTrailerFinder(cfg), tmdbGroupsRef))
 	router.Post("/bookmark/add", userdata.BookmarkAddHandler(false))
 	router.HandleFunc("/bookmark/added", userdata.BookmarkAddHandler(true))
 	router.Get("/bookmark/list", userdata.BookmarkListHandler())
@@ -1363,7 +1415,36 @@ func NewServer(opts Options) (*Server, error) {
 		}
 		return id
 	})
-	iptvhttp.RegisterRoutes(router, cfg, iptvhttp.Deps{LiveConfig: liveConfig, ServerReady: serverReady, ClientIP: clientIP}, tgTokenStore, proxyLinks, transSvc)
+	// Аттестация v2: ключ у КАЖДОГО устройства свой. Резолвер отдаётся сюда
+	// функцией, чтобы iptvhttp не тянул на себя весь tgauth-стор.
+	iptvhttp.SetDeviceProofKeyResolver(func(uid string) (string, bool) {
+		if tgTokenStore == nil {
+			return "", false
+		}
+		return tgTokenStore.ProofKeyOf(uid)
+	})
+	// Аттестация v3: публичный ключ пары, созданной ВНУТРИ AndroidKeyStore
+	// устройства. Приватная часть каталог приложения не покидает, поэтому
+	// слепок этого каталога (то, чем работал мод) подписать ею не может.
+	iptvhttp.SetDevicePubKeyResolver(func(uid string) (string, bool, bool) {
+		if tgTokenStore == nil {
+			return "", false, false
+		}
+		return tgTokenStore.DevicePubKeyOf(uid)
+	})
+	iptvhttp.RegisterRoutes(router, cfg, iptvhttp.Deps{
+		LiveConfig: liveConfig, ServerReady: serverReady, ClientIP: clientIP,
+		// Предел одновременных потоков = оплаченное число устройств профиля.
+		// Считается тем же effectiveDeviceLimit, что и привязка устройств, —
+		// иначе «три устройства» в боте и «три потока» в плеере разъехались бы.
+		DeviceLimit: func(r *http.Request) int {
+			tok := streamTokenOf(r)
+			if tok == "" || tgTokenStore == nil {
+				return 0
+			}
+			return effectiveDeviceLimit(tgTokenStore, tok, tgServerMaxDevices)
+		},
+	}, tgTokenStore, proxyLinks, transSvc)
 	registerWinkRoutes(router, cfg, proxyLinks)
 	opensubs.RegisterRoutes(router, cfg)
 
@@ -1506,6 +1587,16 @@ func NewServer(opts Options) (*Server, error) {
 		// the mini-app so nobody has to type a command and copy a code out of
 		// a chat message.
 		registerKitYouTubeRoutes(router, cfg, ytProvider)
+
+		// Self-test loop + admin alerting. Every YouTube outage this month was reported by a user
+		// first; the watchdog resolves a known video and pulls past the POT-less byte window every
+		// 10 minutes, and tells the admins when that flips.
+		if yt := litesrc.GetGlobalYTChecker(); yt != nil {
+			if tgBot != nil {
+				litesrc.SetYouTubeAlert(func(text string) { tgBot.NotifyAdmins(text) })
+			}
+			yt.StartYouTubeWatchdog()
+		}
 		log.Info().Msg("youtube oauth: enabled")
 	}
 
@@ -1562,6 +1653,143 @@ func NewServer(opts Options) (*Server, error) {
 
 	router.Get("/version", versionHandler)
 	router.Get("/ping", pingHandler)
+
+	// Ноды, с которых этому клиенту могут отдавать поток. Нужен приложению:
+	// замер скорости обязан мерить ТО, что реально будет отдавать видео, а не
+	// хост API. Список публичный по составу — это те же адреса, которые клиент
+	// и так увидит в редиректе, — поэтому отдаётся без авторизации.
+	router.Get("/api/edges", func(w http.ResponseWriter, r *http.Request) {
+		// Подписи — города из nodes.json (edge_label). Список строит edgeOptions.
+		type edgeOut struct {
+			URL   string `json:"url"`
+			Label string `json:"label"`
+		}
+		out := []edgeOut{}
+		for _, e := range edgeOptions(clusterPool, clientIP(r)) {
+			out = append(out, edgeOut{URL: e.URL, Label: e.Label})
+		}
+		primary := strings.TrimSpace(cfg.Cluster.EdgeLabel)
+		if primary == "" {
+			primary = "Основной"
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"edges":   out,
+			"primary": map[string]string{"label": primary},
+			"param":   "edge",
+			// Что этот зритель уже отключил — чтобы экран «Проверка связи»
+			// рисовал галочки, а не спрашивал заново. Неавторизованному пусто.
+			"skipped": edgeSkippedFor(r),
+			// Закреплённая вручную нода: приложение показывает её помеченной и не
+			// сбивает суточным перезамером.
+			"pinned": edgePinnedJSON(r),
+			// Имя параметра-запрета отдаём здесь же: приложение узнаёт о
+			// поддержке отключения нод по факту, а не по договорённости с
+			// конкретной версией сервера. Список через запятую.
+			"param_skip": "edge_skip",
+		})
+	})
+
+	// Сохранить отключённые ноды за аккаунтом. Пишут сюда и телевизор, и бот
+	// (бот — напрямую в то же хранилище), поэтому список везде один.
+	router.Post("/api/edges/skip", edgeSkipSaveHandler)
+
+	// Тестовый файл для замера скорости ДО КАЖДОЙ ноды. У /ts/download/N на
+	// нодах нет TorrServer'а (502), а мерить надо именно ту машину, которая
+	// потом отдаст видео. Байты псевдослучайные: сжатие по дороге не должно
+	// рисовать скорость, которой нет. Потолок 64 МБ — приложение просит 48.
+	router.Get("/api/edges/speed/{mb}", func(w http.ResponseWriter, r *http.Request) {
+		mb, _ := strconv.Atoi(chi.URLParam(r, "mb"))
+		if mb <= 0 {
+			mb = 8
+		}
+		if mb > 64 {
+			mb = 64
+		}
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Content-Length", strconv.Itoa(mb<<20))
+		w.WriteHeader(http.StatusOK)
+		buf := make([]byte, 64<<10)
+		var x uint64 = 0x9E3779B97F4A7C15 ^ uint64(time.Now().UnixNano())
+		for sent := 0; sent < mb<<20; sent += len(buf) {
+			for i := 0; i < len(buf); i += 8 {
+				x ^= x << 13
+				x ^= x >> 7
+				x ^= x << 17
+				buf[i] = byte(x)
+				buf[i+1] = byte(x >> 8)
+				buf[i+2] = byte(x >> 16)
+				buf[i+3] = byte(x >> 24)
+				buf[i+4] = byte(x >> 32)
+				buf[i+5] = byte(x >> 40)
+				buf[i+6] = byte(x >> 48)
+				buf[i+7] = byte(x >> 56)
+			}
+			if _, err := w.Write(buf); err != nil {
+				return
+			}
+		}
+	})
+
+	// Замер по ВРЕМЕНИ, а не по объёму — облегчённая замена /api/edges/speed/48.
+	//
+	// Фиксированные 48 МБ стоят ровно столько, сколько тянет самая медленная
+	// нода: замер по кластеру дал 1.2 с на Париже и 18.6 с на Франкфурте, и
+	// всё это время приложение выглядит зависшим. Здесь сервер льёт
+	// псевдослучайные байты без Content-Length, пока не истечёт срок, а
+	// клиенту достаточно читать и считать: быстрый канал и медленный
+	// укладываются в одинаковые полторы секунды, разница видна в байтах.
+	//
+	// Клиент может и не ждать конца: оборванное чтение — штатный выход,
+	// Write вернёт ошибку, и обработчик просто закончит.
+	router.Get("/api/edges/speed", func(w http.ResponseWriter, r *http.Request) {
+		ms, _ := strconv.Atoi(r.URL.Query().Get("ms"))
+		if ms <= 0 {
+			ms = 1500
+		}
+		if ms > 10000 {
+			ms = 10000 // потолок: ручка не должна становиться качалкой
+		}
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("X-Speed-Window-Ms", strconv.Itoa(ms))
+		w.WriteHeader(http.StatusOK)
+
+		flusher, _ := w.(http.Flusher)
+		buf := make([]byte, 64<<10)
+		var x uint64 = 0x9E3779B97F4A7C15 ^ uint64(time.Now().UnixNano())
+		deadline := time.Now().Add(time.Duration(ms) * time.Millisecond)
+		// Потолок по объёму нужен вдобавок к окну времени: за окно сервер
+		// успевает залить в буферы (ядро + nginx) сотни мегабайт, и клиент
+		// потом выкачивает их уже ПОСЛЕ того, как обработчик закончил —
+		// проба на 300 мс тянулась через сеть двенадцать секунд. 96 МБ
+		// хватает, чтобы измерить даже гигабитный канал за полторы секунды.
+		const maxBytes = 96 << 20
+		sent := 0
+		for sent < maxBytes && time.Now().Before(deadline) {
+			for i := 0; i < len(buf); i += 8 {
+				x ^= x << 13
+				x ^= x >> 7
+				x ^= x << 17
+				buf[i] = byte(x)
+				buf[i+1] = byte(x >> 8)
+				buf[i+2] = byte(x >> 16)
+				buf[i+3] = byte(x >> 24)
+				buf[i+4] = byte(x >> 32)
+				buf[i+5] = byte(x >> 40)
+				buf[i+6] = byte(x >> 48)
+				buf[i+7] = byte(x >> 56)
+			}
+			n, err := w.Write(buf)
+			if err != nil {
+				return // клиент оборвал чтение — так и задумано
+			}
+			sent += n
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+	})
 
 	// Fallback strategy for parity migration.
 	router.NotFound(notFoundHandler(cfg, customPlugins))
@@ -1987,6 +2215,55 @@ func (s *Server) Addr() string {
 // ReloadProxies stops the current proxy pool, re-reads config, and starts new
 // sidecar processes. This allows changing proxy URIs / balancers without restarting
 // the entire server.
+
+// reloadDiskStores перечитывает JSON-сторы и переприменяет раздачу потока с нод.
+// Пулы сверяются тем же Reconcile, которым это делает админка: у уже известных
+// нод сохраняются счётчики, здоровье и статистика, новые добавляются, снятые уходят.
+// Ошибку каждого стора логируем отдельно и идём дальше — одна битая правка не должна
+// отменять остальные.
+func (s *Server) reloadDiskStores(cfg config.Config) {
+	if s.clusterStore != nil {
+		if err := s.clusterStore.Reload(); err != nil {
+			log.Error().Err(err).Msg("reload: nodes.json перечитать не вышло")
+		} else if s.clusterPool != nil {
+			nodes := s.clusterStore.Snapshot()
+			s.clusterPool.ApplySettings(s.clusterStore.Settings())
+			s.clusterPool.Reconcile(nodes)
+			log.Info().Int("nodes", len(nodes)).Msg("reload: ноды кластера перечитаны")
+		}
+	}
+	if s.tsBalancerStore != nil {
+		if err := s.tsBalancerStore.Reload(); err != nil {
+			log.Error().Err(err).Msg("reload: backends.json перечитать не вышло")
+		} else if s.tsBalancerPool != nil {
+			backends := s.tsBalancerStore.Snapshot()
+			s.tsBalancerPool.ApplySettings(s.tsBalancerStore.Settings())
+			s.tsBalancerPool.Reconcile(backends)
+			log.Info().Int("backends", len(backends)).Msg("reload: торрент-бэкенды перечитаны")
+		}
+	}
+	if groupStoreRef != nil {
+		if err := groupStoreRef.Reload(); err != nil {
+			log.Warn().Err(err).Msg("reload: groups.json не перечитан, оставил прежние группы")
+		} else {
+			log.Info().Int("groups", len(groupStoreRef.List())).Msg("reload: группы доступа перечитаны")
+		}
+	}
+	if tmdbGroupsRef != nil {
+		if err := tmdbGroupsRef.Reload(); err != nil && !errors.Is(err, os.ErrNotExist) {
+			log.Warn().Err(err).Msg("reload: группы антологий не перечитаны")
+		}
+	}
+	// Ноды раздачи живут в config.toml, но применялись только при старте.
+	proxyapi.ApplyEdgeConfig(cfg.ProxyLink.StreamEdges, cfg.ProxyLink.StreamEdgePlugins,
+		cfg.ProxyLink.StreamEdgeExclude, cfg.ProxyLink.StreamEdgeGeoDeny)
+	// Справочники tmdb→kp (бейдж качества на постерах + ярус резолвера kp id) — тоже: раньше только
+	// при старте, и включение бейджа стоило рестарта со всеми оборванными потоками.
+	if setKpByTmdbEndpoints(cfg.Kinopoisk.KpByTmdb) {
+		log.Info().Int("endpoints", len(kpByTmdbList())).Msg("reload: справочники kp_by_tmdb перечитаны, кэш бейджей сброшен")
+	}
+}
+
 func (s *Server) ReloadProxies() error {
 	// 1. Stop existing pool.
 	if s.proxyPool != nil {
@@ -2168,6 +2445,13 @@ func (s *Server) Reload() error {
 	s.cfg = newCfg
 	s.cfgPtr.Store(&newCfg)
 
+	// Log level, like the rest of config.toml. Without this it was read once at
+	// start-up, so raising it to "debug" during a live incident did nothing
+	// visible until a restart — and a restart is exactly what you avoid mid-incident.
+	if lvl, changed := config.ApplyLogLevel(newCfg.Observability.LogLevel); changed {
+		log.Info().Str("level", lvl.String()).Msg("config: log level reloaded")
+	}
+
 	// Re-apply browser engine selection. Live-swap of pools is not
 	// supported in v1 — the new selection takes effect for new sessions,
 	// running browsers keep their original engine until they exit.
@@ -2215,17 +2499,29 @@ func (s *Server) Reload() error {
 	// node add), re-derive AES key/IV so /proxy/<enc> tokens minted by
 	// cluster peers can be decoded here. Existing tokens become invalid,
 	// but active streams will re-resolve.
+	plOpts := proxylink.Options{
+		CacheDir:     newCfg.ProxyLink.CacheDir,
+		VerifyIP:     newCfg.ProxyLink.VerifyIP,
+		EncryptAES:   newCfg.ProxyLink.EncryptAES,
+		SharedSecret: newCfg.ProxyLink.SharedSecret,
+		TTLHours:     newCfg.ProxyLink.TTLHours,
+
+		RequireTTLPlugins:  newCfg.ProxyLink.RequireTTLPlugins,
+		BindNetworkPlugins: newCfg.ProxyLink.BindNetworkPlugins,
+		SessionPlugins:     newCfg.ProxyLink.SessionPlugins,
+		SessionFlipSec:     newCfg.ProxyLink.SessionFlipSec,
+		SessionIdleMin:     newCfg.ProxyLink.SessionIdleMin,
+		TrustedNetworks:    newCfg.ProxyLink.TrustedNetworks,
+	}
 	if oldCfg.ProxyLink.SharedSecret != newCfg.ProxyLink.SharedSecret && s.proxyLinks != nil {
-		if err := s.proxyLinks.Reload(proxylink.Options{
-			CacheDir:     newCfg.ProxyLink.CacheDir,
-			VerifyIP:     newCfg.ProxyLink.VerifyIP,
-			EncryptAES:   newCfg.ProxyLink.EncryptAES,
-			SharedSecret: newCfg.ProxyLink.SharedSecret,
-		}); err != nil {
+		if err := s.proxyLinks.Reload(plOpts); err != nil {
 			log.Error().Err(err).Msg("reload: proxylink key reload failed")
 		} else {
 			log.Info().Bool("shared_secret_set", newCfg.ProxyLink.SharedSecret != "").Msg("reload: proxylink AES key rotated")
 		}
+	} else if s.proxyLinks != nil {
+		// Ключи прежние — применяем только политику (свои сети, привязка к сети, TTL, сессии).
+		s.proxyLinks.ApplyPolicy(plOpts)
 	}
 
 	// --- Proxy pool ---
@@ -2344,6 +2640,12 @@ func (s *Server) Reload() error {
 			log.Info().Int("nodes", len(s.clusterPool.Nodes())).Msg("reload: cluster pool restarted")
 		}
 	}
+
+	// --- Сторы на диске: nodes.json, backends.json, groups.json + stream_edges ---
+	// load() у них зовётся только из конструктора, а configureEdges — только из
+	// proxyapi.New. Поэтому правка файла мимо админки доезжала лишь перезапуском,
+	// а он рвёт все живые /proxy-потоки (на проде это ~1300 соединений разом).
+	s.reloadDiskStores(newCfg)
 
 	// --- Sync cron ---
 	if syncConfigChanged(oldCfg, newCfg) {

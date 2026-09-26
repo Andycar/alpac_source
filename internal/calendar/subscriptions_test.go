@@ -56,7 +56,7 @@ func TestResubscribeKeepsTrackingState(t *testing.T) {
 	s := New(t.TempDir())
 	sub := Subscription{TmdbID: 7, TrackVoices: true, Title: "T"}
 	s.Subscribe(1, sub)
-	s.UpdateVoices(sub.Key(), []string{"Дубляж", "LostFilm"})
+	s.UpdateVoices(sub.Key(), []string{"Дубляж", "LostFilm"}, 1, 1)
 	s.UpdateLastEpisode(7, 2, 5)
 
 	s.Subscribe(1, Subscription{TmdbID: 7, TrackVoices: true, Title: "T (обновлённое)"})

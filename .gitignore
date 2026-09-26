@@ -28,3 +28,6 @@ node_modules/
 # OS / editor
 .DS_Store
 *.swp
+
+# IPTV EPG cache written by tests
+internal/iptv/epg_cache/

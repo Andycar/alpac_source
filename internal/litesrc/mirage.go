@@ -1453,7 +1453,7 @@ func (m *MirageChecker) rewriteM3UForStreamSelfWithBase(src string, r *http.Requ
 		// → "/cdn-stream/9a6-f80-500gv/0/TOKEN/seg.ts"
 		if cdnBasePath != "" && !isM3U8URI(uri) {
 			// When no_stream_proxy is active: direct CDN URL (client browser
-			// fetches with injected edge_hash header via cdn_direct.js plugin).
+			// fetches with injected edge_hash header — клиентский плагин cdn_direct.js удалён 2026-08-22.
 			if isStreamProxyDisabled(m.prefix) {
 				return prefix + cdnBasePath + uri
 			}
@@ -1514,7 +1514,7 @@ func isM3U8URI(uri string) bool {
 
 // cdnToNginxProxy converts a CDN base URL to a /cdn-stream/ nginx proxy path.
 // Input:  "https://9a6-f80-500gv.stream-balancer-allo-1.live/0/TOKEN/"
-// Output: "https://beta.l-vid.online/cdn-stream/9a6-f80-500gv/0/TOKEN/"
+// Output: "https://beta.example.com/cdn-stream/9a6-f80-500gv/0/TOKEN/"
 // The nginx location /cdn-stream/{node}/ proxies to https://{node}.stream-balancer-allo-1.live/
 // with the correct Origin header.
 func cdnToNginxProxy(cdnBasePath, serverHost string) string {

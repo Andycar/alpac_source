@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"lampac-go/internal/auth"
 	"lampac-go/internal/config"
 )
 
@@ -28,12 +29,9 @@ func testAccsdbHandler() http.HandlerFunc {
 			cfg := liveConfig(config.Config{})
 			if cfg.TelegramAuth.BotName != "" {
 				hasTGToken := false
-				if c, err := r.Cookie("lampac_token"); err == nil {
-					token := strings.TrimSpace(c.Value)
-					if token != "" {
-						if _, ok := kitTGTokenStore.Lookup(token); ok {
-							hasTGToken = true
-						}
+				if token := auth.ExtractToken(r); token != "" {
+					if _, ok := kitTGTokenStore.Lookup(token); ok {
+						hasTGToken = true
 					}
 				}
 				if !hasTGToken {

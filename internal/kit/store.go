@@ -122,6 +122,11 @@ func (s *Store) Save(tgID string, raw []byte) error {
 		return fmt.Errorf("kit: invalid JSON: %w", err)
 	}
 
+	// Рядом с выбором видимости кладём снимок каталога: без него каждый
+	// источник, добавленный ПОСЛЕ этого сохранения, навсегда прятался бы
+	// белым списком (см. kit/catalog.go).
+	stampCatalog(m)
+
 	// Write encrypted data to disk.
 	diskData := m
 	if s.crypto != nil {

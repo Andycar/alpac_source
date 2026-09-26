@@ -34,6 +34,12 @@ import (
 // is exhausted.  The HTTP layer turns this into a 503 + Retry-After: 5.
 var ErrSchedulerBusy = errors.New("scheduler busy: max concurrent transcoding jobs reached")
 
+// ErrTorrentNoData: a TorrServer-backed source (pidtor / /ts) delivered no bytes
+// within the patient probe budget — the torrent's metadata/pieces never arrived
+// from the swarm. Surfaced as 502 by the start handlers so players fail over
+// instead of waiting on a hung best-effort ffmpeg.
+var ErrTorrentNoData = errors.New("torrent gave no data: metadata/seeds unavailable")
+
 // availableMemBytesFn is the memory probe, indirected so tests can inject a
 // value (the real availableMemBytes is /proc/meminfo, Linux-only).
 var availableMemBytesFn = availableMemBytes

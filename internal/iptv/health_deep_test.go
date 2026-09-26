@@ -32,10 +32,10 @@ func TestProbeAliveDeepCatchesDeadSegments(t *testing.T) {
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
-	if alive := newHealthStore(t, false, false).probeAlive(context.Background(), srv.URL+"/live.m3u8", "", ""); !alive {
+	if alive := newHealthStore(t, false, false).probeAlive(context.Background(), srv.URL+"/live.m3u8", "", "", false); !alive {
 		t.Error("shallow probe should still pass — that is exactly the blind spot")
 	}
-	if alive := newHealthStore(t, true, false).probeAlive(context.Background(), srv.URL+"/live.m3u8", "", ""); alive {
+	if alive := newHealthStore(t, true, false).probeAlive(context.Background(), srv.URL+"/live.m3u8", "", "", false); alive {
 		t.Error("deep probe must fail a channel whose segments 403")
 	}
 }
@@ -51,7 +51,7 @@ func TestProbeAliveDeepAcceptsWorkingChannel(t *testing.T) {
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
-	if alive := newHealthStore(t, true, false).probeAlive(context.Background(), srv.URL+"/live.m3u8", "", ""); !alive {
+	if alive := newHealthStore(t, true, false).probeAlive(context.Background(), srv.URL+"/live.m3u8", "", "", false); !alive {
 		t.Error("a working channel was marked dead")
 	}
 }
@@ -67,7 +67,7 @@ func TestProbeAliveDeepFallsBackForNonHLS(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	if alive := newHealthStore(t, true, false).probeAlive(context.Background(), srv.URL+"/stream.ts", "", ""); !alive {
+	if alive := newHealthStore(t, true, false).probeAlive(context.Background(), srv.URL+"/stream.ts", "", "", false); !alive {
 		t.Error("raw TS channel marked dead")
 	}
 }
@@ -86,7 +86,7 @@ func TestProbeAlivePassesUserAgentAndReferer(t *testing.T) {
 	defer srv.Close()
 
 	// Providers gate on these; a probe that drops them measures the wrong thing.
-	newHealthStore(t, true, false).probeAlive(context.Background(), srv.URL+"/live.m3u8", "MyPlayer/1.0", "https://provider.example/")
+	newHealthStore(t, true, false).probeAlive(context.Background(), srv.URL+"/live.m3u8", "MyPlayer/1.0", "https://provider.example/", false)
 	if gotUA != "MyPlayer/1.0" || gotRef != "https://provider.example/" {
 		t.Errorf("ua=%q ref=%q", gotUA, gotRef)
 	}
@@ -150,7 +150,7 @@ func TestDeepProbeRecordsStreamCodecs(t *testing.T) {
 	defer srv.Close()
 
 	s := newHealthStore(t, true, false)
-	if !s.probeAlive(context.Background(), srv.URL+"/live.m3u8", "", "") {
+	if !s.probeAlive(context.Background(), srv.URL+"/live.m3u8", "", "", false) {
 		t.Fatal("channel should be alive")
 	}
 

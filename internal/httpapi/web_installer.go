@@ -540,7 +540,7 @@ const BALANCERS = {
     { id:'videocdn', name:'VideoCDN', fields:[{k:'token',l:'Token'}] },
     { id:'alloha', name:'Alloha', fields:[{k:'token',l:'Token'}] },
     { id:'veoveo', name:'VeoVeo', fields:[] },
-    { id:'pidtor', name:'PidTor', fields:[{k:'enable',l:'Enable',type:'toggle'},{k:'redapi',l:'RedAPI',def:'https://jacred.stream'},{k:'apikey',l:'API Key',def:'pp'}] },
+    { id:'pidtor', name:'AlcoTor', fields:[{k:'enable',l:'Enable',type:'toggle'},{k:'redapi',l:'RedAPI',def:'https://jacred.stream'},{k:'apikey',l:'API Key',def:'pp'}] },
     { id:'vokino', name:'Vokino', fields:[{k:'token',l:'Token'}] },
     { id:'vibix', name:'Vibix', fields:[{k:'token',l:'Token'}] },
     { id:'iframe_video', name:'IframeVideo', fields:[{k:'token',l:'Token'}] },

@@ -68,8 +68,14 @@ func globalCORSMiddleware(next http.Handler) http.Handler {
 		// when configured) preflight cross-origin — without these listed the
 		// browser silently drops the telemetry while playback itself works, which
 		// is the hardest kind of gap to notice.
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With, X-Kit-AesGcm, X-Lampac-Go, X-Telegram-Init-Data, X-Lampac-Token, X-Lampac-Profile-Session, X-Alpac-Token, X-Alpac-Profile-Session, X-User-Uid, X-Alpac-App, X-Alpac-Sid, X-Alpac-Ts, X-Alpac-Nonce, X-Alpac-Sig, CMCD-Object, CMCD-Request, CMCD-Session, CMCD-Status")
-		w.Header().Set("Access-Control-Expose-Headers", "Content-Length, Content-Range, Set-Cookie")
+		// X-App-Proof — аттестация официального приложения на /api/iptv/* (см.
+		// iptvhttp/iptv_stream_auth.go); store-виджет шлёт её кросс-ориджином.
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With, X-Kit-AesGcm, X-Lampac-Go, X-Telegram-Init-Data, X-Lampac-Token, X-Lampac-Profile-Session, X-Alpac-Token, X-Alpac-Profile-Session, X-User-Uid, X-Alpac-App, X-Alpac-Sid, X-Alpac-Ts, X-Alpac-Nonce, X-Alpac-Sig, X-App-Proof, CMCD-Object, CMCD-Request, CMCD-Session, CMCD-Status")
+		w.Header().Set("Access-Control-Expose-Headers", "Content-Length, Content-Range, Set-Cookie, X-Alpac-Up-Ms, X-Alpac-Node, X-Alpac-Src")
+		// Timing-Allow-Origin: без него браузер обнуляет кросс-ориджин тайминги Resource Timing
+		// (DNS/TCP/TLS/TTFB), а матрица сети веб-клиента (netdiag) меряет ноды именно ими —
+		// tv.example.com → edge-a.example.org это другой origin.
+		w.Header().Set("Timing-Allow-Origin", "*")
 
 		if r.Method == http.MethodOptions {
 			w.Header().Set("Access-Control-Max-Age", "86400")

@@ -320,7 +320,6 @@ func buildLampainitInitiale(lite bool, init config.InitPluginsConfig, tmdbMode s
 	if init.WebPlayer {
 		add(&items, `{"url": "{localhost}/webplayer.js","status": 1,"name": "Web Player","author": "lampac"}`)
 	}
-	add(&items, `{"url": "{localhost}/cdn_direct.js","status": 1,"name": "CDN Direct","author": "lampac"}`)
 	add(&items, `{"url": "{localhost}/anti-dmca.js","status": 1,"name": "Anti DMCA","author": "lampac"}`)
 	// KinoPub resume-bridge: opt-in via [web.plugins].kinopub_resume.
 	// When off the JS is still served at /kinopub_resume.js (so admins

@@ -76,7 +76,20 @@ func apiAuthWhoamiHandler(cfgPtr func() string) http.HandlerFunc {
 			// resolved nobody, honor an explicit token the same way
 			// /api/user/info does — account.js sends it as ?token= and in
 			// the X-Alpac-Token/X-Lampac-Token headers.
-			if tok := resolveOurToken(r); tok != "" && tgTokenStoreRef != nil {
+			// ★Запасной путь по устройству — тот же, что уже есть у
+			// /api/user/info. Клиент, потерявший токен при перезапуске
+			// (WebView выбрасывает Set-Cookie из XHR, а localStorage на части
+			// коробок не переживает перезапуск), продолжает знать свой uid —
+			// и сессия по нему восстанавливается. Без этого ответ был
+			// «не авторизован» у человека, которому /tg/auth/status в ту же
+			// секунду отвечал «авторизован»: отсюда пропавшая иконка профиля.
+			tok := resolveOurToken(r)
+			if tok == "" && tgTokenStoreRef != nil {
+				if uid := strings.TrimSpace(r.URL.Query().Get("uid")); uid != "" {
+					tok = tgTokenStoreRef.FindTokenByDeviceUID(uid)
+				}
+			}
+			if tok != "" && tgTokenStoreRef != nil {
 				if t, found := tgTokenStoreRef.Lookup(tok); found {
 					resp["authenticated"] = true
 					resp["type"] = "tg"

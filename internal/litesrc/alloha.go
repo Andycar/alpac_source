@@ -67,6 +67,15 @@ type allohaStreamEntry struct {
 	// Browser downloads segments at playback speed (~1 per 6s). Without throttle
 	// our proxy fires all segments as fast as possible → CDN bans.
 	lastSegmentAt int64 // atomic: unix nano of last segment request
+	// Token bucket behind allohaTakeSegmentToken: a burst of allohaSegBurst
+	// segments passes untouched, then one per allohaSegInterval. Replaces the
+	// fixed 2 s sleep per segment, which added 1.5–2 s of latency to EVERY
+	// fetch — on a 10 Mbit/s TV link a 6 s 1080p segment then took ~5 s to land
+	// and the buffer never rose above one segment (incident 0901-234541: «рывки
+	// по секунде», buf 2.4 s, stalls 2).
+	segMu     sync.Mutex
+	segTokens float64
+	segLast   time.Time
 	// lastNoWSSignalAt throttles the "no live edge_hash" re-resolve request.
 	// Since alloha stopped shipping wsUrl/sid in /bnsi/movies/, a re-resolve can
 	// no longer bring the WS back, so an unthrottled signal turns EVERY segment
@@ -217,7 +226,7 @@ func (a *allohaChecker) Handle(cfg config.Config, proxyLinks *proxylink.Manager)
 			return
 		}
 
-		// Resolved stream URL — polled by cdn_direct.js after iframe resolve.
+		// Resolved stream URL — раньше его опрашивал клиентский cdn_direct.js (удалён 2026-08-22).
 		if raw == "alloha/resolved" {
 			resolvedStreamsMu.Lock()
 			entry, ok := resolvedStreams["latest"]
@@ -278,14 +287,22 @@ func (a *allohaChecker) index(w http.ResponseWriter, r *http.Request) {
 	// mode AND this client advertised it can embed a webview (iframe=1). tvOS has
 	// no WKWebView, so its client never sends the flag and keeps the native path.
 	wantIframe := a.iframeMode && parseBoolParam(q.Get("iframe"))
+	// Тот же приём, что у iframe: возможность объявляет КЛИЕНТ. Браузеру Origin/Referer подменить
+	// нельзя (forbidden headers), поэтому веб флаг не шлёт и остаётся на проксировании, а нативные
+	// плееры (ExoPlayer/AVPlayer) заголовки ставят и качают сегменты сами.
+	wantDirect := a.directStream && parseBoolParam(q.Get("direct"))
 
-	if category == 1 || category == 3 {
-		a.writeMovie(w, rjson, capi, wantIframe, host, title, originalTitle, tokenMovie, kinopoiskID, data)
+	// Category alone lies for anime: v2 slugs (anime/cartoons) don't split movie vs serial —
+	// «Наруто» came back movie-categorized WITH a full seasons payload, the movie-shaped answer
+	// then died on capi's movie↔serial type guard (весь сериал «не находился» в capi). The
+	// payload knows best: a seasons map ⇒ serial, regardless of category.
+	if len(allohaMapField(data, "seasons")) == 0 && (category == 1 || category == 3) {
+		a.writeMovie(w, rjson, capi, wantIframe, wantDirect, host, title, originalTitle, tokenMovie, kinopoiskID, data)
 		return
 	}
 
 	// Serial
-	a.writeSerial(w, rjson, capi, wantIframe, host, title, originalTitle, tokenMovie, kinopoiskID, s, e, t, data)
+	a.writeSerial(w, rjson, capi, wantIframe, wantDirect, host, title, originalTitle, tokenMovie, kinopoiskID, s, e, t, data)
 }
 
 // ---------- Movie: list translations ----------
@@ -344,10 +361,15 @@ func allohaResolutionLabels(resolutions any, uhd bool, quality string) []string 
 // (streamHLS bootstraps the headless-Chrome resolve on first hit); the ?q= just
 // carries the label the client picked. This surfaces Alloha voices+qualities in
 // the /capi merge from the fast search — the expensive resolve runs on playback.
-func allohaCapiDeferredQuality(host, tokenMovie, tKey, kpParam string, s, e int, labels []string) map[string]string {
+func allohaCapiDeferredQuality(host, tokenMovie, tKey, kpParam string, s, e int, labels []string, direct bool) map[string]string {
 	base := host + "/lite/alloha/stream.m3u8?token_movie=" + url.QueryEscape(tokenMovie) + "&t=" + url.QueryEscape(tKey) + kpParam
 	if s > 0 {
 		base += "&s=" + strconv.Itoa(s) + "&e=" + strconv.Itoa(e)
+	}
+	// Клиент подтвердил, что умеет сам ставить CDN-заголовки → отдаём манифест, сегменты которого
+	// указывают прямо на CDN. Байты пойдут мимо нас; заголовки клиент берёт из /lite/alloha/auth.
+	if direct {
+		base += "&direct=1"
 	}
 	byq := map[string]string{}
 	for _, l := range labels {
@@ -359,7 +381,7 @@ func allohaCapiDeferredQuality(host, tokenMovie, tKey, kpParam string, s, e int,
 	return byq
 }
 
-func (a *allohaChecker) writeMovie(w http.ResponseWriter, rjson, capi, wantIframe bool, host, title, originalTitle, tokenMovie, kpID string, data map[string]any) {
+func (a *allohaChecker) writeMovie(w http.ResponseWriter, rjson, capi, wantIframe, wantDirect bool, host, title, originalTitle, tokenMovie, kpID string, data map[string]any) {
 	translations := allohaMapField(data, "translation_iframe")
 	if len(translations) == 0 {
 		writeGetsTVEmpty(w, rjson)
@@ -410,7 +432,7 @@ func (a *allohaChecker) writeMovie(w http.ResponseWriter, rjson, capi, wantIfram
 			resLabels := allohaResolutionLabels(inner["resolutions"], uhd, quality)
 			row := map[string]any{
 				"translate": name,
-				"quality":   allohaCapiDeferredQuality(host, tokenMovie, tKey, kpParam, 0, 0, resLabels),
+				"quality":   allohaCapiDeferredQuality(host, tokenMovie, tKey, kpParam, 0, 0, resLabels, wantDirect),
 				"title":     fmt.Sprintf("%s (%s)", baseTitle, name),
 			}
 			rows = append(rows, row)
@@ -457,7 +479,7 @@ func (a *allohaChecker) writeMovie(w http.ResponseWriter, rjson, capi, wantIfram
 
 // ---------- Serial: seasons → episodes ----------
 
-func (a *allohaChecker) writeSerial(w http.ResponseWriter, rjson, capi, wantIframe bool, host, title, originalTitle, tokenMovie, kpID string, s, e int, t string, data map[string]any) {
+func (a *allohaChecker) writeSerial(w http.ResponseWriter, rjson, capi, wantIframe, wantDirect bool, host, title, originalTitle, tokenMovie, kpID string, s, e int, t string, data map[string]any) {
 	kpParam := ""
 	if kpID != "" {
 		kpParam = "&kp=" + url.QueryEscape(kpID)
@@ -510,7 +532,7 @@ func (a *allohaChecker) writeSerial(w http.ResponseWriter, rjson, capi, wantIfra
 			labels := allohaResolutionLabels(inner["resolutions"], uhd, quality)
 			rows = append(rows, map[string]any{
 				"translate": name,
-				"quality":   allohaCapiDeferredQuality(host, tokenMovie, tKey, kpParam, s, e, labels),
+				"quality":   allohaCapiDeferredQuality(host, tokenMovie, tKey, kpParam, s, e, labels, wantDirect),
 				"title":     fmt.Sprintf("%s / %d сезон %d серия (%s)", baseTitle, s, e, name),
 				"s":         s,
 				"e":         e,
@@ -949,19 +971,13 @@ func allohaStreamKey(tokenMovie, t string, s, e int) string {
 	return tokenMovie + "|t=" + t + "|s=" + strconv.Itoa(s) + "|e=" + strconv.Itoa(e)
 }
 
-// allohaEdgeHash returns the edge_hash of THIS stream's own WS session, falling
-// back to any live session's hash.
-//
-// edge_hash arrives on a WS keyed by the sid of this stream's /bnsi/movies/
-// response, so with one session per stream the session-scoped value is the one
-// the CDN expects to see. The fallback covers the window before this stream's WS
-// has received its first config_update — and, when the hash turns out to be
-// edge-scoped rather than session-scoped, both paths return the same value.
+// allohaEdgeHash returns the live edge_hash of THIS stream's WS session, or ""
+// so the caller falls back to the Guard token. It deliberately does NOT borrow
+// another stream's hash any more: the hash is per session, and one request
+// carrying a foreign hash made the CDN answer 403 to every later request on
+// that URL — even with the correct hash (2026-09-02 00:30, 4K «Prada 2»).
 func allohaEdgeHash(streamKey, tokenMovie string) string {
-	if h := GetEdgeHash(streamKey, tokenMovie); h != "" {
-		return h
-	}
-	return GetAnyEdgeHash()
+	return GetEdgeHash(streamKey, tokenMovie)
 }
 
 // bootstrapStreamEntry resolves a stream on demand (headless Chrome) and caches
@@ -1142,14 +1158,12 @@ func (a *allohaChecker) streamHLS(w http.ResponseWriter, r *http.Request) {
 		mirageUpdateCurrentTimeForKeys(targetURL, streamKey, tokenMovie)
 	}
 
-	// Segment throttle: prevent burst downloads that trigger CDN rate limits.
+	// Segment throttle: prevent burst downloads that trigger CDN rate limits —
+	// but only real bursts. A player refilling its buffer at up to
+	// allohaSegBurst segments, or fetching just-in-time, must not pay latency.
 	if isSegment {
-		const allohaSegmentThrottle = 2 * time.Second
-		if lastAt := atomic.LoadInt64(&entry.lastSegmentAt); lastAt > 0 {
-			elapsed := time.Duration(time.Now().UnixNano() - lastAt)
-			if wait := allohaSegmentThrottle - elapsed; wait > 0 {
-				time.Sleep(wait)
-			}
+		if wait := allohaTakeSegmentToken(entry, time.Now()); wait > 0 {
+			time.Sleep(wait)
 		}
 		atomic.StoreInt64(&entry.lastSegmentAt, time.Now().UnixNano())
 	}
@@ -1638,6 +1652,52 @@ func allohaNonVideoContentType(ct string) bool {
 
 // allohaRewriteM3U rewrites all sub-URLs in an m3u8 playlist to route through
 // our /lite/alloha/stream.m3u8?sub= endpoint.
+const (
+	// allohaSegInterval is the steady-state segment rate the CDN tolerates
+	// (segments are 6 s, so this is still 3× realtime).
+	allohaSegInterval = 2 * time.Second
+	// allohaSegBurst is how many segments may be fetched back-to-back before
+	// the rate applies — enough for a player to prime one buffer window.
+	allohaSegBurst = 3.0
+)
+
+// allohaTakeSegmentToken implements the per-stream token bucket described on
+// the entry fields. It returns how long the caller must sleep before fetching
+// (0 = go now). Callers that have to wait consume the token that accrues during
+// the wait, so concurrent fetches queue at the steady rate instead of firing
+// together when the sleep ends.
+func allohaTakeSegmentToken(e *allohaStreamEntry, now time.Time) time.Duration {
+	e.segMu.Lock()
+	defer e.segMu.Unlock()
+	if e.segLast.IsZero() {
+		e.segTokens = allohaSegBurst
+		e.segLast = now
+	}
+	if el := now.Sub(e.segLast); el > 0 {
+		e.segTokens += el.Seconds() / allohaSegInterval.Seconds()
+		if e.segTokens > allohaSegBurst {
+			e.segTokens = allohaSegBurst
+		}
+		e.segLast = now
+	}
+	if e.segTokens >= 1 {
+		e.segTokens--
+		return 0
+	}
+	// Reserve the next token: it becomes available (1-tokens) intervals after
+	// the last accounting point, which may already lie in the future when
+	// earlier callers are queued — so concurrent fetches line up one interval
+	// apart instead of all waking at once.
+	readyAt := e.segLast.Add(time.Duration((1 - e.segTokens) * float64(allohaSegInterval)))
+	e.segTokens = 0
+	e.segLast = readyAt
+	wait := readyAt.Sub(now)
+	if wait < 0 {
+		wait = 0
+	}
+	return wait
+}
+
 func (a *allohaChecker) allohaRewriteM3U(src string, r *http.Request, tokenMovie, quality, upstreamURL string) string {
 	host := hostFromRequest(r)
 	streamBase := host + "/lite/alloha/stream.m3u8?token_movie=" + url.QueryEscape(tokenMovie) + "&q=" + url.QueryEscape(quality)

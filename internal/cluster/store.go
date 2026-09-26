@@ -21,12 +21,19 @@ import (
 // StoredNode is the on-disk representation of a cluster node.
 // Runtime stats (active conns, latency, health) live separately on *Node.
 type StoredNode struct {
-	ID        string    `json:"id"`
-	Name      string    `json:"name"`
-	Host      string    `json:"host"`
-	Weight    int       `json:"weight"`
-	Enabled   bool      `json:"enabled"`
-	Region    string    `json:"region,omitempty"`
+	ID      string `json:"id"`
+	Name    string `json:"name"`
+	Host    string `json:"host"`
+	Weight  int    `json:"weight"`
+	Enabled bool   `json:"enabled"`
+	Region  string `json:"region,omitempty"`
+	// EdgeURL — клиентский адрес ноды (https://edge-a.example.org): по нему primary
+	// понимает, какую ноду просит зритель параметром edge=, и куда можно
+	// отправлять /lite источников, чей поток привязан к добывшему серверу.
+	EdgeURL string `json:"edge_url,omitempty"`
+	// EdgeLabel — как ноду называть зрителю («Санкт-Петербург»): домен на
+	// экране телевизора ничего человеку не говорит, город — говорит.
+	EdgeLabel string    `json:"edge_label,omitempty"`
 	Notes     string    `json:"notes,omitempty"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
@@ -56,6 +63,25 @@ type Settings struct {
 	// PublicHosts: if true, expose node hosts in the public list (allows the
 	// Lampa widget to direct-ping nodes).
 	PublicHosts bool `json:"public_hosts"`
+	// LinkMbps — ширина канала хостов для сводки мощностей: id ноды (или
+	// "primary") → Мбит/с. Без неё вердикт «канал забит» вынести нельзя, и
+	// сводка лишь показывает пик и просит задать значение.
+	LinkMbps map[string]int `json:"link_mbps,omitempty"`
+	// LocalWeight is the primary's capacity relative to a node of weight 1.
+	// Pick() scores local as localConns/LocalWeight against each node's
+	// conns/latency score, so leaving this at 1 declares an 8-core primary to be
+	// exactly as capable as a 2-core node.
+	//
+	// Measured on prod 2026-09-01 with LocalWeight=1: the primary kept only 1081
+	// of ~15900 /lite/ requests per 10 min (7%) while sitting at 3% CPU pressure
+	// on 8 cores, and the 2-core nodes it fed ran at 41% and 71% pressure,
+	// answering 94-99% of requests slower than 5 seconds. Local stopped winning
+	// the comparison at ~24 in-flight requests while the nodes were allowed 35
+	// and 44.
+	//
+	// Set it to roughly the core-count ratio (8-core primary, 2-core nodes → 4).
+	// 0 or negative is normalised to 1, which reproduces the old behaviour.
+	LocalWeight int `json:"local_weight"`
 	// ForceNode: testing mode that always forwards to a node when one is
 	// available, ignoring the primary's local-vs-node score comparison.
 	// Useful for proving the cluster path works end-to-end.
@@ -71,12 +97,23 @@ type Settings struct {
 //   - "node"    — must go through any healthy node (skip primary)
 //   - "local"   — must be handled locally on primary (skip all nodes)
 //   - "node-id" — must go through the named node (by ID); falls back to
-//                 "node" behaviour if that node is unhealthy/disabled
+//     "node" behaviour if that node is unhealthy/disabled
+//   - "sticky"  — one title/post always resolves on the same node (weighted rendezvous
+//     hash of postid or title+year, see Pool.pickStickySkip); NodeIDs optionally narrow
+//     the ring. For CDNs that pin a signed link to the first IP per account+post
+//     (Filmix, 22.09.2026): spreading a post over several nodes sharing an account
+//     turns every other node's viewers into 429s.
+//   - "nodes"   — only the listed nodes (NodeIDs) may resolve it; the viewer's
+//     edge hint is honoured only when it names one of them; none healthy →
+//     primary. For sources whose links are bound to the resolver AND not every
+//     node gets playable ones (AhueRezka: 3 of 9 on 21.09.2026) — "edge" would
+//     happily pick a node that only ever gets dead links.
 type RoutingRule struct {
-	Balancer string `json:"balancer"`            // e.g. "kinotochka"
-	Target   string `json:"target"`              // "node" | "local" | "node-id"
-	NodeID   string `json:"node_id,omitempty"`   // when Target == "node-id"
-	Comment  string `json:"comment,omitempty"`   // optional human note
+	Balancer string   `json:"balancer"`           // e.g. "kinotochka"
+	Target   string   `json:"target"`             // "node" | "local" | "node-id" | "nodes" | "edge" | "sticky"
+	NodeID   string   `json:"node_id,omitempty"`  // when Target == "node-id"
+	NodeIDs  []string `json:"node_ids,omitempty"` // when Target == "nodes" | "sticky" (optional ring)
+	Comment  string   `json:"comment,omitempty"`  // optional human note
 }
 
 // DefaultSettings returns sane defaults.
@@ -84,6 +121,7 @@ func DefaultSettings() Settings {
 	return Settings{
 		Strategy:         "hybrid",
 		LatencyWeight:    0.4,
+		LocalWeight:      1,
 		FailThreshold:    3,
 		RecoverThreshold: 2,
 		ProbeIntervalSec: 30,
@@ -181,6 +219,16 @@ func (s *Store) load() error {
 	}
 	s.nodes = list
 	return nil
+}
+
+// Reload перечитывает nodes.json и settings.json с диска поверх копии в памяти.
+// Нужен для SIGHUP: load() зовётся только из конструктора, поэтому правка файла
+// мимо админки раньше доезжала лишь перезапуском — а он рвёт все живые /proxy-потоки.
+// Битый или пропавший файл load() переживает сам, оставляя прежний список.
+func (s *Store) Reload() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.load()
 }
 
 func (s *Store) persist() error {
@@ -372,6 +420,9 @@ func (s *Store) SortedByName() []StoredNode {
 func (st *Settings) normalize() {
 	if st.Strategy != "least-conns" && st.Strategy != "latency" && st.Strategy != "hybrid" {
 		st.Strategy = "hybrid"
+	}
+	if st.LocalWeight < 1 {
+		st.LocalWeight = 1
 	}
 	if st.LatencyWeight < 0 {
 		st.LatencyWeight = 0

@@ -228,6 +228,17 @@ func generateAnnotatedTOML(cfg config.Config) string {
 		{name: "anwap", comment: "Anwap (без выбора качества, ~SD)", lines: []string{
 			fmt.Sprintf("host = %s", str(cfg.Online.Anwap.Host)),
 		}},
+		{name: "smotrim", comment: "Смотрим/ВГТРК (открытый архив; подписочное не отдаётся)", lines: []string{
+			fmt.Sprintf("host = %s", str(cfg.Online.Smotrim.Host)),
+			fmt.Sprintf("player_api = %s", str(cfg.Online.Smotrim.PlayerAPI)),
+		}},
+		{name: "anidub", comment: "AniDUB Online (аниме, дорамы, азиатское кино)", lines: []string{
+			fmt.Sprintf("host = %s", str(cfg.Online.Anidub.Host)),
+		}},
+		{name: "rudub", comment: "RuDub.TV (только сериалы, озвучка студии)", lines: []string{
+			fmt.Sprintf("host = %s  # плеерный сайт, номер в домене растёт", str(cfg.Online.Rudub.Host)),
+			fmt.Sprintf("tracker_host = %s  # витрина, у неё спрашивается новый адрес плеера", str(cfg.Online.Rudub.TrackerHost)),
+		}},
 		{name: "ahuerezka", comment: "AhueRezka (HDRezka через воркер по Kinopoisk ID)", lines: []string{
 			fmt.Sprintf("host = %s", str(cfg.Online.AhueRezka.Host)),
 			fmt.Sprintf("hosts = %s  # запасные зеркала воркера", strArr(cfg.Online.AhueRezka.Hosts)),
@@ -250,6 +261,7 @@ func generateAnnotatedTOML(cfg config.Config) string {
 			fmt.Sprintf("reserve = %s", boolStr(cfg.Online.Filmix.Reserve)),
 			fmt.Sprintf("pro = %s  # filmixpro", boolStr(cfg.Online.Filmix.Pro)),
 			fmt.Sprintf("hls = %s", boolStr(cfg.Online.Filmix.HLS)),
+			fmt.Sprintf("fx_mode = %s  # fallback (по умолчанию): legacy первым, api-fx только при отказе; primary: api-fx первым", str(cfg.Online.Filmix.FXMode)),
 			fmt.Sprintf("user_apitv = %s  # логин аккаунта, нужен для 4K через api.filmix.tv", str(cfg.Online.Filmix.UserAPITV)),
 			fmt.Sprintf("passwd_apitv = %s", str(cfg.Online.Filmix.PasswdAPITV)),
 		}},
@@ -356,6 +368,7 @@ func generateAnnotatedTOML(cfg config.Config) string {
 		{name: "vibix", comment: "Vibix", lines: []string{
 			fmt.Sprintf("host = %s", str(cfg.Online.Vibix.Host)),
 			fmt.Sprintf("token = %s  # обязательный", str(cfg.Online.Vibix.Token)),
+			fmt.Sprintf("iframe_mode = %t  # true = плеер vibix встраивается у клиента (доход+статистика); домен должен быть зарегистрирован в кабинете vibix", cfg.Online.Vibix.IframeMode),
 		}},
 		{name: "moonanime", comment: "MoonAnime", lines: []string{
 			fmt.Sprintf("host = %s", str(cfg.Online.MoonAnime.Host)),

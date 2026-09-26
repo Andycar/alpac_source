@@ -150,6 +150,10 @@ func NewMirkinoChecker(cfg config.Config) *mirkinoChecker {
 		token:     strings.TrimSpace(cfg.Online.Mirkino.Token),
 		userID:    strings.TrimSpace(cfg.Online.Mirkino.UserID),
 	}
+	// Переминт протухших билетов: источник выдаёт mediaSourceId на ~60 секунд,
+	// и без этого фильм отваливался в 401 на первой же перемотке.
+	m.registerRefresher()
+
 	// If the config didn't pin a token, reuse the last one we persisted so the
 	// login endpoint (rate-limited) is hit at most once ever.
 	fromFile := false
@@ -825,6 +829,10 @@ func (m *mirkinoChecker) buildStreams(req *http.Request, itemID string, sources 
 		label := mirkinoQualityLabel(src.Name, height)
 		raw := fmt.Sprintf("%s/videos/%s/stream?static=true&mediaSourceId=%s&api_key=%s",
 			m.host, url.PathEscape(itemID), url.QueryEscape(src.ID), url.QueryEscape(token))
+		// mediaSourceId живёт у источника около минуты, поэтому в ссылку
+		// кладутся приметы дорожки — по ним прокси переминтит билет, когда
+		// тот протухнет посреди просмотра (см. mirkino_refresh.go).
+		raw = mirkinoDecorateStreamURL(raw, src)
 		proxied := streamProxyURL(req, raw, "mirkino", links)
 		variants = append(variants, variant{label: label, height: height, url: proxied})
 	}

@@ -373,6 +373,31 @@ func (v *vkMovieChecker) checkSearch(req *http.Request) bool {
 }
 
 // vkItemMatch checks whether a VK video result matches the search criteria.
+// vkMovieCommentaryMarkers are words that mark a VK video as being ABOUT a film
+// rather than being the film: watch-alongs, reviews, reactions, behind-the-scenes,
+// podcasts. Matched as word prefixes so «реакц» covers «реакция» and «реакции».
+//
+// They are checked with a leading word boundary, not as bare substrings: «стрим»
+// as a substring also fires on «экстрим», and a film called «Экстрим» would then
+// disappear from the source entirely.
+var vkMovieCommentaryMarkers = []string{
+	"разбор", "реакц", "смотрим", "смотрю", "стрим", "летсплей",
+	"закулисье", "закадр", "подкаст", "интервью", "тизер", "анонс",
+	"нарезк", "подборк", "объяснение", "концовк", "рецензи", "мнение",
+}
+
+// nameHasWordPrefixAny reports whether any prefix starts a word in name.
+// name must come from normalizeSearchTitle — single-space separated words.
+func nameHasWordPrefixAny(name string, prefixes ...string) bool {
+	padded := " " + name + " "
+	for _, p := range prefixes {
+		if strings.Contains(padded, " "+p) {
+			return true
+		}
+	}
+	return false
+}
+
 func vkItemMatch(video vkMovieVideo, compactSearch string, year int) bool {
 	compact := compactTitle(video.Title)
 	if compact == "" || !strings.Contains(compact, compactSearch) {
@@ -389,6 +414,20 @@ func vkItemMatch(video vkMovieVideo, compactSearch string, year int) bool {
 	// Use normalizeSearchTitle for keyword filtering (preserves word boundaries)
 	name := normalizeSearchTitle(video.Title)
 	if nameContainsAny(name, "трейлер", "trailer", "премьера", "обзор", "сезон", "сериал", "серия", "серий") {
+		return false
+	}
+	// VK is user-generated: most videos naming a film are ABOUT it, not it.
+	// Their titles legitimately contain the film name and its year, so the
+	// checks above pass them through — «Смотрим "Обсессия" 2026 г.» (a stream
+	// recording) and a review reached the picker as if they were the movie.
+	if nameHasWordPrefixAny(name, vkMovieCommentaryMarkers...) {
+		return false
+	}
+	// A compilation covering several films, e.g.
+	// «Хоррор №2026: Закулисье реальности/Обсессия/Убийца-психопат/Хокум».
+	// Releases legitimately use one slash for «русское / original» and
+	// occasionally two, so only three or more separators mean a list.
+	if strings.Count(video.Title, "/") >= 3 {
 		return false
 	}
 	if video.Files.MP4_2160 == "" &&

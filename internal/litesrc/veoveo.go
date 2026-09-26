@@ -36,6 +36,11 @@ type veoVeoChecker struct {
 
 	idCache      sync.Map // kp string -> veoVeoIDCacheEntry (online kp->movieID resolution)
 	qualityCache sync.Map // movieID int64 -> string badge (parsed from master playlist)
+	// qualityNegCache — movieID → time.Time: до какого момента НЕ пробовать бейдж
+	// снова. Кэшировался только успех, и с нод, откуда *.mvapspdmpg.com не отвечают
+	// (ch, de_nuxoa, fr, jp — разбор 22.09.2026), каждый checksearch стоил ровно
+	// бюджет проб: p50 = p95 = 5 с, ~2.5 тыс. запросов дольше 5 с за два часа.
+	qualityNegCache sync.Map
 }
 
 // veoVeoIDCacheEntry caches the result of an online kp->movieID resolution.
@@ -52,6 +57,15 @@ const veoVeoNegCacheTTL = 10 * time.Minute
 // veoVeoMaxQualityProbes caps how many variant master playlists are fetched when
 // determining the quality badge, bounding the work for titles with many dubs.
 const veoVeoMaxQualityProbes = 6
+
+const (
+	// veoVeoBadgeProbeBudget — сколько ждём мастер-плейлисты ради бейджа качества.
+	// Бейдж — украшение карточки, а не условие показа: 2 с хватает живому CDN,
+	// а мёртвый не должен держать checksearch 5 с.
+	veoVeoBadgeProbeBudget = 2 * time.Second
+	// veoVeoBadgeNegTTL — сколько помним «бейдж не определился» по тайтлу.
+	veoVeoBadgeNegTTL = 30 * time.Minute
+)
 
 // veoVeoMovieIDRe extracts the internal movieID from the iframe bootstrap
 // script, e.g. `window.MOVIE_ID=162545;`.
@@ -530,6 +544,12 @@ func (v *veoVeoChecker) detectQualityBadge(ctx context.Context, movieID int64, e
 	if ent, ok := v.qualityCache.Load(movieID); ok {
 		return ent.(string)
 	}
+	if until, ok := v.qualityNegCache.Load(movieID); ok {
+		if time.Now().Before(until.(time.Time)) {
+			return ""
+		}
+		v.qualityNegCache.Delete(movieID)
+	}
 
 	// Distinct HLS stream URLs across the first episode's variants, capped.
 	seen := make(map[string]struct{})
@@ -553,7 +573,7 @@ func (v *veoVeoChecker) detectQualityBadge(ctx context.Context, movieID int64, e
 	}
 
 	// Bound the extra probes so they never inflate checksearch latency much.
-	qctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	qctx, cancel := context.WithTimeout(ctx, veoVeoBadgeProbeBudget)
 	defer cancel()
 
 	badges := make([]string, len(files))
@@ -575,6 +595,8 @@ func (v *veoVeoChecker) detectQualityBadge(ctx context.Context, movieID int64, e
 	}
 	if best != "" {
 		v.qualityCache.Store(movieID, best)
+	} else {
+		v.qualityNegCache.Store(movieID, time.Now().Add(veoVeoBadgeNegTTL))
 	}
 	return best
 }

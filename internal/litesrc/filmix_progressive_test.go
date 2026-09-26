@@ -2,6 +2,7 @@ package litesrc
 
 import (
 	"context"
+	"strings"
 	"testing"
 )
 
@@ -89,5 +90,31 @@ func TestProgressiveCoversAllRips(t *testing.T) {
 		if _, ok := f.progressiveStreams(context.Background(), []map[string]string{{"quality": "2160p", "url": u}}); !ok {
 			t.Fatalf("рип обязан идти прогрессивом: %s", u)
 		}
+	}
+}
+
+// Дефектные разделы (сегменты без hash) обязаны уходить прогрессивом даже при выключенном
+// глобальном флаге: HLS у них не играет, а гнать 4K через сервер — терять весь смысл прямой отдачи.
+func TestProgressiveForcedForHashLessDirs(t *testing.T) {
+	f := &filmixChecker{fxUser: "u", fxPasswd: "p"} // progressive не включён
+
+	broken := []map[string]string{{"quality": "2160p", "url": "https://nl105.cdnsqu.com/hls/UHD_1313/Supergirl.2026_2160.mp4/index.m3u8?hash=FH.sig"}}
+	out, ok := f.progressiveStreams(context.Background(), broken)
+	if !ok {
+		t.Fatal("UHD_1313 обязан уходить прогрессивом при выключенном флаге")
+	}
+	if !strings.Contains(out[0]["url"], "/s/") {
+		t.Fatalf("ссылка не сконвертирована: %s", out[0]["url"])
+	}
+
+	// Исправные разделы при выключенном флаге остаются на HLS.
+	fine := []map[string]string{{"quality": "2160p", "url": "https://nl221.werkecdn.me/hls/hd_ukr/Film_2160.mp4/index.m3u8?hash=FH.sig"}}
+	if _, ok := f.progressiveStreams(context.Background(), fine); ok {
+		t.Fatal("исправный раздел не должен переводиться на прогрессив без флага")
+	}
+
+	// Без кредов принудительный режим не включается — иначе получим заглушку вместо фильма.
+	if _, ok := (&filmixChecker{}).progressiveStreams(context.Background(), broken); ok {
+		t.Fatal("без кредов прогрессив невозможен")
 	}
 }

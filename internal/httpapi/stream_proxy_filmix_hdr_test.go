@@ -39,3 +39,27 @@ func TestForceStreamProxyOnlyForFilmixFMP4(t *testing.T) {
 		t.Error("имя плагина сравнивается без учёта регистра")
 	}
 }
+
+// 2026-08-22: раздел UHD_1313 отдал 940 сегментов, и НИ У ОДНОГО не было `?hash=` — плеер шёл без
+// него и ловил 403. Сегмент с дописанным hash при этом отдавал 206, но дописать его можно лишь
+// переписав манифест, а CDN привязывает сегменты к IP, который манифест скачал. Значит такие
+// разделы обязаны идти через прокси целиком.
+func TestForceStreamProxyForHashLessDirs(t *testing.T) {
+	broken := "https://nl105.cdnsqu.com/hls/UHD_1313/Project.Hail.Mary.2026.MVO.ru.LostFilm.WEBDL.1080p_1080.mp4/index.m3u8?hash=FH.sig"
+	if !forceStreamProxy("filmix", broken) {
+		t.Fatal("UHD_1313 обязан идти через прокси")
+	}
+	// Исправные разделы того же тайтла остаются прямыми — они дописывают hash сами.
+	for _, ok := range []string{
+		"https://nl221.werkecdn.me/hls/hd_ukr/Film_1080.mp4/index.m3u8?hash=FH.sig",
+		"https://nl105.cdnsqu.com/hls/HD_45/Film_2160.mp4/index.m3u8?hash=FH.sig",
+	} {
+		if forceStreamProxy("filmix", ok) {
+			t.Errorf("исправный раздел не должен уходить через сервер: %s", ok)
+		}
+	}
+	// Правило по-прежнему только для filmix.
+	if forceStreamProxy("vibix", broken) {
+		t.Error("чужие балансёры не трогаем")
+	}
+}

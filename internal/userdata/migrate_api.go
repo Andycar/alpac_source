@@ -1,7 +1,9 @@
 package userdata
 
 import (
+	"context"
 	stdjson "encoding/json"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -11,6 +13,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"lampac-go/internal/auth"
@@ -36,7 +39,35 @@ var (
 	migrateMu        sync.Mutex
 	reOldUID         = regexp.MustCompile(`^[a-z0-9]{6,16}$`)
 	migrateRecordDir = filepath.Join("database", "migration")
-	migrateClient    = &http.Client{Timeout: 30 * time.Second}
+	// migrateClient ходит на адрес, который ввёл ПОЛЬЗОВАТЕЛЬ, поэтому адрес проверяется при
+	// соединении (migrateDialControl): validateServerURL видит только IP, записанный в URL
+	// буквально, а имя вида 127.0.0.1.nip.io или DNS-ребиндинг пропускал — сервер можно было
+	// заставить сходить в собственную внутреннюю сеть. Control срабатывает на уже разрешённом
+	// адресе, то есть и после редиректа.
+	migrateClient = &http.Client{
+		Timeout: 30 * time.Second,
+		Transport: &http.Transport{
+			Proxy:                 nil,
+			DialContext:           (&net.Dialer{Timeout: 10 * time.Second, Control: migrateDialControl}).DialContext,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ResponseHeaderTimeout: 20 * time.Second,
+			MaxIdleConns:          10,
+			IdleConnTimeout:       30 * time.Second,
+		},
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 5 {
+				return errors.New("too many redirects")
+			}
+			if req.URL.Scheme != "http" && req.URL.Scheme != "https" {
+				return errors.New("bad redirect scheme")
+			}
+			return nil
+		},
+	}
+
+	// migrateAllowPrivate снимает проверку адреса при соединении — только для тестов (httptest
+	// слушает 127.0.0.1).
+	migrateAllowPrivate = false
 
 	// Known storage paths used by sync v1 / v2 / backup.
 	knownStoragePaths = []string{
@@ -225,7 +256,7 @@ func MigrateFromServerHandler() http.HandlerFunc {
 		}
 
 		// 1. Fetch & merge bookmarks
-		mBookmarks := remoteImportBookmarks(oldServer, oldUID, newUserID)
+		mBookmarks, _ := remoteImportBookmarks(oldServer, oldUID, newUserID)
 
 		// 2. Fetch & merge timecodes (card IDs from bookmarks)
 		mTimecodes := remoteImportTimecodes(oldServer, oldUID, newUserID)
@@ -317,25 +348,27 @@ func migrateLocalStorage(oldUserID, newUserID string) bool {
 // Remote fetch functions
 // ---------------------------------------------------------------------------
 
-func remoteImportBookmarks(oldServer, oldUID, newUserID string) bool {
+// remoteImportBookmarks — закладки со старого сервера в Лампу-сторону нового пользователя. Второе
+// значение — сами закладки (объект «favorite»), чтобы переложить их и в списки ALPAC.
+func remoteImportBookmarks(oldServer, oldUID, newUserID string) (bool, map[string]any) {
 	// Fetch v2 bookmarks from /bookmark/list
 	u := oldServer + "/bookmark/list?uid=" + url.QueryEscape(oldUID)
 	data, err := remoteGet(u)
 	if err != nil || len(data) == 0 {
-		return false
+		return false, nil
 	}
 
 	var bookmarkData map[string]any
 	if stdjson.Unmarshal(data, &bookmarkData) != nil {
-		return false
+		return false, nil
 	}
 
 	// Check if it's "not initialized" or empty
 	if _, notInit := bookmarkData["dbInNotInitialization"]; notInit {
-		return false
+		return false, nil
 	}
 
-	return mergeBookmarksFromData(newUserID, bookmarkData)
+	return mergeBookmarksFromData(newUserID, bookmarkData), bookmarkData
 }
 
 func remoteImportTimecodes(oldServer, oldUID, newUserID string) bool {
@@ -461,7 +494,13 @@ func remoteHasBookmarks(oldServer, oldUID string) bool {
 }
 
 func remoteGet(rawURL string) ([]byte, error) {
-	req, err := http.NewRequest(http.MethodGet, rawURL, nil)
+	return remoteGetCtx(context.Background(), rawURL)
+}
+
+// remoteGetCtx — remoteGet с общим сроком на весь перенос: клиент ALPAC ждёт ответа, и девять
+// попыток по 30 с к зависшему серверу он не переживёт.
+func remoteGetCtx(ctx context.Context, rawURL string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -491,9 +530,11 @@ func mergeBookmarksFromData(newUserID string, oldData map[string]any) bool {
 	newData, _, _ := loadBookmarkUser(newUserID)
 	changed := false
 
-	// Merge cards
+	// Merge cards. ensureBookmarkCard/addBookmarkCategoryID кладут в НАЧАЛО списка, поэтому идём
+	// с конца: иначе перенесённые закладки вставали в обратном порядке — самые старые сверху.
 	if oldCards, ok := oldData["card"].([]any); ok {
-		for _, card := range oldCards {
+		for i := len(oldCards) - 1; i >= 0; i-- {
+			card := oldCards[i]
 			cardObj, ok := card.(map[string]any)
 			if !ok {
 				continue
@@ -510,8 +551,8 @@ func mergeBookmarksFromData(newUserID string, oldData map[string]any) bool {
 	// Merge categories
 	for _, cat := range bookmarkCategories {
 		if oldIDs, ok := oldData[cat].([]any); ok {
-			for _, id := range oldIDs {
-				idStr := toString(id)
+			for i := len(oldIDs) - 1; i >= 0; i-- {
+				idStr := toString(oldIDs[i])
 				if idStr != "" {
 					if addBookmarkCategoryID(newData, cat, idStr) {
 						changed = true
@@ -696,3 +737,42 @@ func localStorageExists(oldUserID string) bool {
 }
 
 // fileExists is defined in admin_manifest.go
+
+var errBlockedAddress = errors.New("private_ip_blocked")
+
+func migrateDialControl(_, address string, _ syscall.RawConn) error {
+	if migrateAllowPrivate {
+		return nil
+	}
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		return err
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || blockedRemoteIP(ip) {
+		return errBlockedAddress
+	}
+	return nil
+}
+
+// blockedRemoteIP — адреса, куда сервер по просьбе пользователя не ходит: своя машина, частные
+// сети, link-local, CGNAT и служебные диапазоны.
+func blockedRemoteIP(ip net.IP) bool {
+	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
+		ip.IsUnspecified() || ip.IsMulticast() || ip.IsInterfaceLocalMulticast() {
+		return true
+	}
+	if v4 := ip.To4(); v4 != nil {
+		switch {
+		case v4[0] == 0: // 0.0.0.0/8
+			return true
+		case v4[0] == 100 && v4[1]&0xC0 == 64: // 100.64.0.0/10 (CGNAT)
+			return true
+		case v4[0] == 192 && v4[1] == 0 && v4[2] == 0: // 192.0.0.0/24
+			return true
+		case v4[0] == 198 && (v4[1] == 18 || v4[1] == 19): // 198.18.0.0/15
+			return true
+		}
+	}
+	return false
+}

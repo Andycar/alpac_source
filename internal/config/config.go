@@ -103,8 +103,9 @@ type CapiConfig struct {
 	ResolveSources    []string `toml:"resolve_sources" json:"resolve_sources"`         // allowlist of balancer names /capi/streams may resolve server-side (empty = all). Curate to server-resolvable sources; exclude browser-heavy/broken ones (mirage/alloha).
 	TraktClientID     string   `toml:"trakt_client_id" json:"trakt_client_id"`         // Trakt.tv API client_id (free app registration) → unlocks the Trakt chart rows in /capi/collections; empty = CUB-only
 	TraktClientSecret string   `toml:"trakt_client_secret" json:"trakt_client_secret"` // Trakt app client_secret — REQUIRED for write-sync (OAuth device flow + scrobble). Empty = read-only charts only.
+	MDBListAPIKey     string   `toml:"mdblist_api_key" json:"mdblist_api_key"`         // mdblist.com API key (free, 1000 req/day) → «IMDb и Letterboxd» lists in the catalog's «Подборки»; empty = source hidden
 	TraktSync         bool     `toml:"trakt_sync" json:"trakt_sync"`                   // push a user's finished watches to their linked Trakt account. Needs client_id+secret; users link via /capi/trakt/link.
-	PublicHost        string   `toml:"public_host" json:"public_host"`                 // canonical SPA URL (e.g. "https://tv.alcopa.cc") for bot-built links: watch-party room invites → <public_host>/app/#/room/<code>. Falls back to [kit] server_host.
+	PublicHost        string   `toml:"public_host" json:"public_host"`                 // canonical SPA URL (e.g. "https://tv.example.com") for bot-built links: watch-party room invites → <public_host>/app/#/room/<code>. Falls back to [kit] server_host.
 	SoftDeadlineMS    int      `toml:"soft_deadline_ms" json:"soft_deadline_ms"`       // /capi/streams: return the first partial after this long if ≥1 voice landed (0 = default 4500). Fast hosts can shave it to ~3000 — the backfill publisher fills the rest.
 	HardDeadlineMS    int      `toml:"hard_deadline_ms" json:"hard_deadline_ms"`       // /capi/streams: absolute wait ceiling when NOTHING has landed yet (0 = default 8000). Must exceed soft_deadline_ms.
 }
@@ -213,7 +214,7 @@ type SecurityConfig struct {
 // Example: the main domain `lampa.li` is proxied through CloudFlare (orange);
 // add `[host.stream_aliases]` "lampa.li" = "s.lampa.li" so stream URLs the
 // server emits to clients point to a DNS-only subdomain that goes direct.
-// Requests via other hosts (e.g. beta.l-vid.online direct) are unaffected.
+// Requests via other hosts (e.g. beta.example.com direct) are unaffected.
 type HostConfig struct {
 	// StreamAliases is a map from request Host → stream subdomain. When the
 	// server emits a URL for a stream-bound endpoint and the request came in
@@ -510,38 +511,44 @@ type OnlineConfig struct {
 	Kinotochka    KinotochkaSource   `toml:"kinotochka"`
 	RutubeMovie   HostSource         `toml:"rutube_movie"`
 	Anwap         HostSource         `toml:"anwap"`
-	VKMovie       VKMovieSource      `toml:"vk_movie"`
-	HDVB          APIHostTokenSource `toml:"hdvb"`
-	Plvideo       HostSource         `toml:"plvideo"`
-	VDBmovies     HostSource         `toml:"vdbmovies"`
-	Kodik         APIHostTokenSource `toml:"kodik"`
-	Lumex         LumexSource        `toml:"lumex"`
-	VideoCDN      VideoCDNSource     `toml:"videocdn"`
-	Alloha        AllohaSource       `toml:"alloha"`
-	VeoVeo        VeoVeoSource       `toml:"veoveo"`
-	Ashdi         HostSource         `toml:"ashdi"`
-	Eneyida       HostSource         `toml:"eneyida"`
-	Kinogo        KinogoSource       `toml:"kinogo"`
-	UaKino        UaKinoSource       `toml:"uakino"`
-	Kinovod       HostSource         `toml:"kinovod"`
-	FanCDN        FanCDNSource       `toml:"fancdn"`
-	VideoDB       VideoDBSource      `toml:"videodb"`
-	Videoseed     HostTokenSource    `toml:"videoseed"`
-	Zetflix       ZetflixSource      `toml:"zetflix"`
-	ZetflixDB     ZetflixDBSource    `toml:"zetflixdb"`
-	CDNmovies     HostSource         `toml:"cdnmovies"`
-	CDNvideohub   HostSource         `toml:"cdnvideohub"`
-	Kubikvkube    KubikvkubeSource   `toml:"kubikvkube"`
-	Vibix         HostTokenSource    `toml:"vibix"`
-	Turbo         HostSource         `toml:"turbo"`
-	IframeVideo   IframeVideoSource  `toml:"iframe_video"`
-	GetsTV        HostTokenSource    `toml:"getstv"`
-	Mirage        MirageSource       `toml:"mirage"`
-	Aladdin       MirageSource       `toml:"aladdin"`
-	PidTor        PidTorSource       `toml:"pidtor"`
-	MoonAnime     HostTokenSource    `toml:"moonanime"`
-	IptvOnline    HostTokenSource    `toml:"iptv_online"`
-	Vokino        VokinoSource       `toml:"vokino"`
+	Rudub         RudubSource        `toml:"rudub"`
+	Anidub        HostSource         `toml:"anidub"`
+	// Zagonka — плеерная страница kinobadi.in (классические авторские озвучки,
+	// сериалы, потолок 720p). См. litesrc/zagonka.go.
+	Zagonka     HostSource         `toml:"zagonka"`
+	Smotrim     SmotrimSource      `toml:"smotrim"`
+	VKMovie     VKMovieSource      `toml:"vk_movie"`
+	HDVB        APIHostTokenSource `toml:"hdvb"`
+	Plvideo     HostSource         `toml:"plvideo"`
+	VDBmovies   HostSource         `toml:"vdbmovies"`
+	Kodik       APIHostTokenSource `toml:"kodik"`
+	Lumex       LumexSource        `toml:"lumex"`
+	VideoCDN    VideoCDNSource     `toml:"videocdn"`
+	Alloha      AllohaSource       `toml:"alloha"`
+	VeoVeo      VeoVeoSource       `toml:"veoveo"`
+	Ashdi       HostSource         `toml:"ashdi"`
+	Eneyida     HostSource         `toml:"eneyida"`
+	Kinogo      KinogoSource       `toml:"kinogo"`
+	UaKino      UaKinoSource       `toml:"uakino"`
+	Kinovod     HostSource         `toml:"kinovod"`
+	FanCDN      FanCDNSource       `toml:"fancdn"`
+	VideoDB     VideoDBSource      `toml:"videodb"`
+	Videoseed   HostTokenSource    `toml:"videoseed"`
+	Zetflix     ZetflixSource      `toml:"zetflix"`
+	ZetflixDB   ZetflixDBSource    `toml:"zetflixdb"`
+	CDNmovies   HostSource         `toml:"cdnmovies"`
+	CDNvideohub HostSource         `toml:"cdnvideohub"`
+	Kubikvkube  KubikvkubeSource   `toml:"kubikvkube"`
+	Vibix       VibixSource        `toml:"vibix"`
+	Turbo       HostSource         `toml:"turbo"`
+	IframeVideo IframeVideoSource  `toml:"iframe_video"`
+	GetsTV      HostTokenSource    `toml:"getstv"`
+	Mirage      MirageSource       `toml:"mirage"`
+	Aladdin     MirageSource       `toml:"aladdin"`
+	PidTor      PidTorSource       `toml:"pidtor"`
+	MoonAnime   HostTokenSource    `toml:"moonanime"`
+	IptvOnline  HostTokenSource    `toml:"iptv_online"`
+	Vokino      VokinoSource       `toml:"vokino"`
 	// Ukrainian balancers
 	Bamboo       HostSource     `toml:"bamboo"`
 	UAFilm       HostSource     `toml:"uafilm"`
@@ -559,6 +566,9 @@ type OnlineConfig struct {
 	Zona         ZonaSource     `toml:"zona"`
 	Lift         LiftSource     `toml:"lift"`
 	SakhTV       SakhTVSource   `toml:"sakhtv"`
+	SCTS         SCTSSource     `toml:"scts"`
+	KBTeam       KBTeamSource   `toml:"kbteam"`
+	Krasview     KrasviewSource `toml:"krasview"`
 	// English balancers (browser-scraped m3u8 via headless Chrome)
 	VidLink   HostSource `toml:"vidlink"`
 	Videasy   HostSource `toml:"videasy"`
@@ -585,6 +595,32 @@ type SakhTVSource struct {
 	Token        string `toml:"token"`
 	AppID        string `toml:"app_id"`
 	NoForceLogin bool   `toml:"no_force_login"`
+}
+
+// SCTSSource configures the SCTS balancer (community-каталог Sakhalin Cable TV,
+// нативный порт JS-модуля scts): thin-JSON каталог с хаба, прямые CDN-ссылки.
+type SCTSSource struct {
+	CatalogURL   string `toml:"catalog_url"`   // default https://hub.alcopa.cc/scts/scts-slim.json.gz
+	RefreshHours int    `toml:"refresh_hours"` // default 24
+}
+
+// KBTeamSource configures the kbteam balancer (kb-team.club MSX videocdn API,
+// нативный порт JS-модуля kbteam). Стримы ZeroCDN гео-ограничены (RU/CIS).
+type KBTeamSource struct {
+	APIHost  string `toml:"api_host"`  // default http://kb-team.club/msx/kinozal/videocdn.php
+	CacheTTL int    `toml:"cache_ttl"` // сек; auth-токены в URL живут ~1 час (default 1800)
+}
+
+// KrasviewSource configures the krasview balancer (сеть зеркал
+// hlamer/krasview/smartkino/sersoap/zseek, нативный порт JS-модуля krasview).
+// Сайты режут не-RU egress — на таких серверах обязателен socks_proxy (RU SOCKS5).
+type KrasviewSource struct {
+	SearchHost    string `toml:"search_host"`    // default https://hlamer.ru
+	MovieHost     string `toml:"movie_host"`     // default https://smartkino.ru
+	SerialHost    string `toml:"serial_host"`    // default https://sersoap.ru
+	StreamReferer string `toml:"stream_referer"` // default https://smartkino.ru/ (CDN режет hot-link)
+	SocksProxy    string `toml:"socks_proxy"`    // host:port RU SOCKS5; пусто = напрямую
+	PreferDASH    bool   `toml:"prefer_dash"`    // default false → .mpd переписывается в .m3u8
 }
 
 // LiftSource configures the Lift balancer.
@@ -617,6 +653,23 @@ type LiftSource struct {
 type HostSource struct {
 	Host string `toml:"host"`
 	Rhub bool   `toml:"rhub"` // route fetches through the reverse client hub (server->device->site)
+}
+
+// SmotrimSource configures the «Смотрим» (ВГТРК) balancer. Host — сам сайт
+// (там же индекс /sitemap), PlayerAPI — плеерное API, которое отдаёт потоки и
+// метку тарифа.
+type SmotrimSource struct {
+	Host      string `toml:"host"`
+	PlayerAPI string `toml:"player_api"`
+}
+
+// RudubSource configures the RuDub.TV balancer. Host is the player site
+// (play26.ru-dub.xyz — номер в домене растёт), TrackerHost — витрина
+// r4.rudub.world, у которой балансер спрашивает новый адрес плеера, когда
+// текущий перестал отвечать.
+type RudubSource struct {
+	Host        string `toml:"host"`
+	TrackerHost string `toml:"tracker_host"`
 }
 
 // KubikvkubeSource configures the KubikVKube scraper. Host is the DLE site
@@ -781,13 +834,22 @@ type WinkSource struct {
 }
 
 type FilmixSource struct {
-	Host    string   `toml:"host"`
-	Token   string   `toml:"token"`
-	Tokens  []string `toml:"tokens"`
-	Reserve bool     `toml:"reserve"`
-	Pro     bool     `toml:"pro"`
-	HLS     bool     `toml:"hls"`
-	Rhub    bool     `toml:"rhub"` // route API calls through the reverse client hub
+	Host   string   `toml:"host"`
+	Token  string   `toml:"token"`
+	Tokens []string `toml:"tokens"`
+	// ReserveTokens — токены ДРУГОЙ учётки только для перевыпуска ссылки на 429: CDN закрепляет
+	// подпись поста за первым IP учётки, и та же серия, подписанная другой учёткой, с этого же
+	// адреса играет (litesrc/filmix_remint.go). В обычную выдачу ссылок они не идут.
+	ReserveTokens []string `toml:"reserve_tokens"`
+	Reserve       bool     `toml:"reserve"`
+	Pro           bool     `toml:"pro"`
+	HLS           bool     `toml:"hls"`
+	Rhub          bool     `toml:"rhub"` // route API calls through the reverse client hub
+	// FXMode picks the order of the two filmix backends. "fallback" (default,
+	// empty): the legacy filmixapp API answers first and api.filmix.tv (api-fx)
+	// is consulted only when legacy fails — 403, blocked title, nothing playable.
+	// "primary": the pre-2026-09 behaviour, api-fx first when it offers ≥720p.
+	FXMode string `toml:"fx_mode"`
 	// Filmix account login/password for the api.filmix.tv (api-fx) flow. The legacy
 	// filmixapp.cyou /s/ hashes are capped at 720p server-side since 2026-07 — 4K/1080
 	// require an api-fx accessToken, which only login+password can obtain (the legacy
@@ -1020,6 +1082,31 @@ type AllohaSource struct {
 	DirectStream bool `toml:"direct_stream"`
 }
 
+// VibixSource configures the vibix.org balancer.
+//
+// Default (iframe_mode off): we resolve the Kinescope playlist server-side
+// through coldfilm.ink + rendex (see vibix_browser.go) and proxy the CDN. That
+// plays anywhere, but the vibix player never runs on the viewer — so vibix shows
+// no ads, counts no view, and pays nothing. Worse, the coldfilm resolve runs
+// under coldfilm's own publisher id, not ours.
+//
+// IframeMode returns the vibix player embed page (rendex <ins> widget built from
+// the publisher API's embed_code, which carries OUR publisher id) straight to
+// iframe-capable clients (web / Android webview / Lampa method:"iframe"). The
+// client embeds the page; vibix's player runs client-side, shows its ads and
+// counts the view against our publisher account — so /publisher/statistics and
+// revenue finally register. Clients that can't host a webview (tvOS, plain
+// hls.js) fall back to the server-resolve path. Off by default.
+//
+// Earning requires the serving domain (this server's public host) to be
+// registered and active in the vibix publisher dashboard — rendex validates the
+// embed's domain against the publisher account and attributes stats per domain.
+type VibixSource struct {
+	Host       string `toml:"host"`
+	Token      string `toml:"token"` // publisher API bearer ("<id>|<secret>")
+	IframeMode bool   `toml:"iframe_mode"`
+}
+
 type MirageSource struct {
 	APIHost    string   `toml:"api_host"`
 	LinkHost   string   `toml:"link_host"`
@@ -1059,6 +1146,14 @@ type PidTorSource struct {
 	// through untouched; only problem codecs are re-encoded). Needs
 	// [transcoding] enable=true + ffmpeg on the host.
 	Transcode bool `toml:"transcode"`
+	// TranscodeLampa: also hand the transcode wrapper to plain Lampa clients
+	// (/lite/pidtor outside a /capi drill). Off by default: Lampa's web player
+	// (hls.js, 10s manifest timeout, no caps= hint) can't wait out a cold
+	// torrent's probe and would have HEVC fully re-encoded, while TVs play the
+	// raw mkv natively — so Lampa gets the direct resolve URL (/lite/pidtor/s…
+	// → /proxy), exactly as before Transcode existed. capi is unaffected (it
+	// always needs the wrapper).
+	TranscodeLampa bool `toml:"transcode_lampa"`
 }
 
 type PidTorAuthEntry struct {
@@ -1097,6 +1192,100 @@ type ProxyLinkConfig struct {
 	// cluster forwarding is enabled. Leave empty for standalone instances —
 	// each lampac-go generates its own random key in cache_dir.
 	SharedSecret string `toml:"shared_secret"`
+	// TTLHours ограничивает срок жизни /proxy-токена, выданного БЕЗ привязки к
+	// IP (verify_ip=false у вызывающего — так делают IPTV и все lite-источники).
+	// Такой токен раньше был вечным предъявительским пропуском: утёкшая ссылка
+	// играла бесконечно с любого адреса (кража экспорта 2026-08-31, 3622 живых
+	// ссылки в чужом плейлисте). 0 = прежнее поведение (без срока).
+	// Постеры (plugin=posterapi) под TTL НЕ попадают — их клиенты кэшируют надолго.
+	TTLHours int `toml:"ttl_hours"`
+	// RequireTTLPlugins — плагины, чьи БЕССРОЧНЫЕ токены больше не принимаются.
+	// ttl_hours защищает только вновь выданные ссылки; уже утёкшие выданы без
+	// поля срока, а пустой срок = вечный. Список добивает такие ссылки точечно,
+	// не трогая кластерный shared_secret и ссылки прочих источников: легальный
+	// клиент перезапросит /play и получит свежий токен.
+	// Пример: require_ttl_plugins = ['iptv', 'iptv-ru']
+	RequireTTLPlugins []string `toml:"require_ttl_plugins"`
+	// StreamEdges — клиентские адреса нод, которым МОЖНО отдавать поток вместо
+	// primary. Пусто = функция выключена, всё как раньше.
+	//
+	// Зачем: сейчас все байты видео идут через main, хотя ноды кластера умеют
+	// отдавать те же ссылки — общий shared_secret позволяет любой из них
+	// расшифровать токен, выпущенный где угодно (проверено на проде: ссылка от
+	// main отдаётся нодой байт в байт). Разгружаем канал primary, перенаправляя
+	// клиента на ноду ОДНИМ 302 при запросе манифеста: дальше нода переписывает
+	// сегменты уже на себя, и лишних переходов на каждый сегмент не возникает.
+	//
+	// Адрес должен быть достижим КЛИЕНТОМ (не приватный адрес кластера) и, для
+	// веб-клиента, обязательно https — со страницы по https браузер не загрузит
+	// поток по http.
+	StreamEdges []string `toml:"stream_edges"`
+	// StreamEdgePlugins — БЕЛЫЙ список плагинов, чей поток разрешено выносить.
+	// '*' = все разрешённые. Пусто = никто (значение по умолчанию).
+	//
+	// Именно белый, а не чёрный: нода ходит к CDN со СВОЕГО адреса, а часть
+	// источников привязывает поток к IP, который скачал манифест (замерено на
+	// filmix: с чужого выхода CDN отвечает 429). Такой источник на ноде просто
+	// перестанет играть, поэтому каждый включается только после проверки.
+	StreamEdgePlugins []string `toml:"stream_edge_plugins"`
+	// StreamEdgeExclude — чего не выносить НИКОГДА, сильнее '*'.
+	//
+	// Нужен, чтобы белый список можно было поставить в '*' и не вести руками:
+	// источник, который ноды отдать не смогут, отключится сам по возвратам
+	// (см. edge.go). Но есть те, кого самоотключение не спасает, — их сюда:
+	// IPTV (сессия просмотра живёт в памяти выдавшего сервера) и YouTube
+	// (ссылка привязана к адресу, который её извлёк). У них возврат означал бы
+	// два лишних перехода на КАЖДОМ сегменте живого эфира.
+	StreamEdgeExclude []string `toml:"stream_edge_exclude"`
+	// TorrentDirect — потоки торрентов через /proxy (pidtor) отдавать зрителю
+	// прямо с бэкенда TorrServer подписанной ссылкой (302), как уже делает
+	// /ts/stream. Без этого каждый байт торрента проходит через main: замер
+	// 21.09.2026 — 56 % входящего канала main в вечерний пик. Работает только
+	// для бэкендов с direct_url; остальные — по-прежнему через main.
+	TorrentDirect bool `toml:"torrent_direct"`
+	// StreamEdgeGeoDeny — каким СТРАНАМ какую ноду не отдавать: имя ноды → коды стран
+	// (ISO 3166-1 alpha-2). Пусто = ограничений нет, поведение прежнее.
+	//
+	// Зачем: имя ноды может быть закрыто провайдерами целой страны по SNI, и тогда
+	// выданная на неё ссылка у такого зрителя мертва ГАРАНТИРОВАННО — TCP проходит,
+	// рукопожатие TLS обрывают. Замерено матрицей netdiag 2026-09-08: edge-a.example.org не
+	// открывается вообще у МегаФона, МТС, Вымпелкома и Таттелекома и открывается у
+	// четверти абонентов Ростелекома, при этом за пределами РФ та же нода даёт 100 %
+	// успеха, а edge-b.example.net:2053 из тех же отчётов — 97 %. То есть блокируют не нашу
+	// инфраструктуру, а конкретное имя, и снимать ноду целиком нельзя.
+	//
+	// Пример:
+	//   [proxy_link.stream_edge_geo_deny]
+	//   "https://edge-a.example.org" = ['RU']
+	StreamEdgeGeoDeny map[string][]string `toml:"stream_edge_geo_deny"`
+	// BindNetworkPlugins — плагины, чьи /proxy-токены привязываются к СЕТИ
+	// подписчика (/24 у IPv4, /48 у IPv6): ссылка играет только оттуда, где её
+	// получили. Это ответ на перепродажу плейлистов — украденный файл уносят в
+	// другую сеть, и там он мёртв, даже пока не истёк TTL.
+	//
+	// Ставить только для IPTV ('iptv', 'iptv-ru'). Кино сюда не годится: там
+	// ссылку нередко открывает не то устройство и не та сеть, что её получила.
+	// Привязка к сети, а не к точному адресу, нарочно: внутри /24 адрес абонента
+	// меняется сам (переподключение, CGNAT), и точная привязка рвала бы поток
+	// своим же зрителям.
+	BindNetworkPlugins []string `toml:"bind_network_plugins"`
+	// SessionPlugins — плагины, чьи ссылки обязаны нести живую потоковую
+	// сессию: /api/iptv/play выдаёт sid, сегменты его наследуют, и сервер
+	// сверяет поток целиком. Несостыковка (чередование сетей, погашенная или
+	// неизвестная сессия) гасит поток до перезапроса /play. Запрос без sid у
+	// такого плагина отвергается — иначе вор срезал бы параметр.
+	SessionPlugins []string `toml:"session_plugins"`
+	// SessionFlipSec — окно, в котором возврат в брошенную сеть считается
+	// чередованием (ссылку делят), а не переездом абонента. 0 = 90 с.
+	SessionFlipSec int `toml:"session_flip_sec"`
+	// SessionIdleMin — через сколько молчания сессия убирается. 0 = 12 ч.
+	SessionIdleMin int `toml:"session_idle_min"`
+	// TrustedNetworks — СВОЯ инфраструктура: адреса, которые нельзя считать
+	// «сетью абонента». Сервер ходит в собственный /proxy (вложенные плейлисты,
+	// транскодер, превью) и пробрасывает User-Agent клиента, поэтому снаружи
+	// такой запрос неотличим от зрителя — а привязка к сети его отвергала.
+	// Формат: CIDR или голый адрес. Петля и приватные диапазоны всегда включены.
+	TrustedNetworks []string `toml:"trusted_networks"`
 }
 
 // ---------------------------------------------------------------------------
@@ -1509,6 +1698,22 @@ type ClusterConfig struct {
 	Mode   string        `toml:"mode"    json:"mode"`    // "primary" | "node"
 	APIKey string        `toml:"api_key" json:"api_key"` // shared secret for inter-node auth
 	Nodes  []ClusterNode `toml:"nodes"   json:"nodes"`   // backend nodes (primary only)
+
+	// PrimaryHost is where a node reaches the primary, e.g. "https://tv.example.com".
+	// Nodes only — the primary is the source and never pulls.
+	PrimaryHost string `toml:"primary_host" json:"primary_host"`
+	// EdgeURL — клиентский адрес ЭТОЙ ноды (например "https://edge-a.example.org"), которым
+	// она подписывает добытые ссылки. Часть CDN привязывает поток к адресу,
+	// пришедшему за манифестом, и такую ссылку отдаст только добывший сервер:
+	// primary прочитает подпись и отправит зрителя сюда. Пусто = не подписывать.
+	EdgeURL string `toml:"edge_url" json:"edge_url"`
+	// EdgeLabel — как этот сервер называть зрителю в тесте скорости
+	// («Варшава»). У нод подпись живёт в nodes.json, у primary — здесь.
+	EdgeLabel string `toml:"edge_label" json:"edge_label"`
+	// AutoUpdate lets a node replace its binary with the primary's whenever the
+	// two differ. Off by default: adopting a build is the operator's call, and
+	// silently restarting a node that someone deployed by hand would be rude.
+	AutoUpdate bool `toml:"auto_update"  json:"auto_update"`
 }
 
 type ClusterNode struct {
@@ -1809,6 +2014,50 @@ type YouTubeConfig struct {
 	// "never" — жёстко запретить (старое поведение: до 2026-08-14 POT-URL были ядом,
 	// после — CDN отдаёт БЕЗ POT только первые ~20 МиБ файла, и never ломает длинные видео).
 	FetchPot string `toml:"fetch_pot"`
+	// hls_min_duration: с какой длительности (сек) предпочитать HLS-лестницу
+	// default-клиента (manifest.googlevideo.com) вместо DASH-склейки. DASH-URL даже
+	// с POT отдаёт ~60 с медиа и упирается в 403 «past window» — переминт двигает
+	// стену на минуту, и на 4:18 ролик всё равно падает; HLS стены не имеет
+	// (замер 2026-09-04: 1080p, 415 МиБ / 10 мин, отказов 0). 0 — по умолчанию 90;
+	// отрицательное — выключить (всегда склейка).
+	HLSMinDuration int `toml:"hls_min_duration"`
+	// node_fallback: ноды (имя или id из nodes.json), к которым primary обращается
+	// за YouTube, когда своя экстракция провалилась или дала только ≤360p (сгоревший
+	// выход: 429/бот-чек). Пусто — любая нода с edge_url. Нода отвечает ссылками
+	// на свой edge_url, зритель смотрит с неё напрямую.
+	NodeFallback []string `toml:"node_fallback"`
+	// SabrURL — адрес sabr-сервиса (см. /opt/sabr-svc). Он тянет видео по
+	// протоколу SABR: обычные googlevideo-ссылки отдают ~16 МиБ и рвутся на
+	// середине длинного ролика, а sabr переоткрывает сессии и качает участки
+	// параллельно (замер: 3.3 МБ/с против 0.34 у одиночной сессии).
+	// Пусто — источник выключен, работает прежний путь через yt-dlp.
+	SabrURL string `toml:"sabr_url"`
+	// ParallelChunks — сколько диапазонов файла качать одновременно. googlevideo
+	// душит КАЖДОЕ соединение отдельно, поэтому один поток упирается в ~2 МБ/с, а на
+	// длинном ролике и в 0.3 — этого не хватает даже на воспроизведение в реальном
+	// времени, отсюда обрывы на середине. Замер 2026-08-31: 1 поток 2.09 МБ/с,
+	// 6 потоков 8.42, 12 потоков 20.26. 0 = значение по умолчанию (8).
+	ParallelChunks int `toml:"parallel_chunks"`
+	// MaxAutoHeight — потолок качества, которое включается САМО (ручной выбор им не
+	// ограничен). 0 = 1080p. Потолок появился, когда докачка была последовательной и
+	// 4K не успевал за воспроизведением; с параллельной докачкой его можно поднять до
+	// 2160, но тогда каждый просмотр тянет 4K-файл целиком — это осознанное решение
+	// про нагрузку, а не про возможности.
+	MaxAutoHeight int `toml:"max_auto_height"`
+
+	// DisableTrailerSearch выключает поиск трейлеров по YouTube для тайтлов, у
+	// которых в TMDB нет видео (см. litesrc.TrailerFinder). Кнопка на случай,
+	// если поиск начнёт ловить бот-чек: без него трейлеры остаются только у
+	// тайтлов с видео в TMDB, как было до 2026-09-18.
+	DisableTrailerSearch bool `toml:"disable_trailer_search"`
+	// SponsorBlock — пропуск спонсорских вставок по разметке sponsor.ajay.app.
+	// nil/true = включено. Запрос к их API идёт по префиксу хеша videoID, поэтому
+	// наружу не уходит, какой именно ролик смотрит зритель.
+	SponsorBlock *bool `toml:"sponsorblock"`
+	// SponsorBlockCategories — что считать лишним. Пусто = sponsor, selfpromo,
+	// interaction, music_offtopic. Осознанно без intro/outro/preview/filler: это
+	// части самого ролика, и резать их — вкусовщина.
+	SponsorBlockCategories []string `toml:"sponsorblock_categories"`
 	// VOT (voice-over-translation) powers the player's «Перевод» button on YouTube videos. It runs an
 	// embedded Node sidecar (vot.js, bundled into the binary) that asks the public Yandex VOT service
 	// for a Russian voice-over track; the server then proxies the resulting mp3 to the client. The only
@@ -1818,6 +2067,11 @@ type YouTubeConfig struct {
 	VotWorker   string `toml:"vot_worker"`    // optional vot-worker host (e.g. "vot-worker.toil.cc"); empty = talk to Yandex directly
 	VotLang     string `toml:"vot_lang"`      // source language of the video (from), default "en"
 	VotToLang   string `toml:"vot_to_lang"`   // target language, default "ru"
+}
+
+// SponsorBlockEnabled reports whether sponsor-segment skipping is on (default true).
+func (c YouTubeConfig) SponsorBlockEnabled() bool {
+	return c.SponsorBlock == nil || *c.SponsorBlock
 }
 
 // VotEnabled reports whether the YouTube voice-over-translation feature is on (default true; an
@@ -1931,11 +2185,11 @@ type KinopoiskConfig struct {
 
 // CalendarConfig controls the content calendar (upcoming episodes + TG notifications).
 type CalendarConfig struct {
-	Enable           bool      `toml:"enable"`
-	CheckIntervalMin int       `toml:"check_interval_min"` // TMDB poll interval; default 120
-	NotifyTG         bool      `toml:"notify_tg"`          // send TG notifications; default true
-	UpcomingDays     int       `toml:"upcoming_days"`      // show episodes N days ahead; default 7
-	RecentDays       int       `toml:"recent_days"`        // show aired episodes N days back; default 3
+	Enable           bool `toml:"enable"`
+	CheckIntervalMin int  `toml:"check_interval_min"` // TMDB poll interval; default 120
+	NotifyTG         bool `toml:"notify_tg"`          // send TG notifications; default true
+	UpcomingDays     int  `toml:"upcoming_days"`      // show episodes N days ahead; default 7
+	RecentDays       int  `toml:"recent_days"`        // show aired episodes N days back; default 3
 }
 
 // IPTVConfig controls the server-side IPTV feature.
@@ -1951,6 +2205,14 @@ type IPTVConfig struct {
 	MergeGlobal    *bool `toml:"merge_global"`
 	HealthCheck    bool  `toml:"healthcheck"`     // periodically probe global streams, drop dead ones
 	HealthCheckMin int   `toml:"healthcheck_min"` // probe interval in minutes; default 30
+	// HealthCheckConc — сколько проб идёт ОДНОВРЕМЕННО (default 8). Подписочные
+	// панели лимитируют одновременные сессии на аккаунт: пробы отбирают слоты у
+	// живых зрителей и сами получают пустой манифест. Для такого донора ставьте
+	// 1–2.
+	HealthCheckConc int `toml:"healthcheck_concurrency"`
+	// HealthCheckMax — потолок числа проверяемых за цикл URL (default 2000).
+	// Бюджет делится между донорами поровну (round-robin).
+	HealthCheckMax int `toml:"healthcheck_max"`
 	// HealthCheckShallow reverts the HLS probe to reading two bytes off the manifest.
 	// The default walks the channel to its first segment instead: a dead channel almost
 	// always still serves its playlist, so the shallow check marks it alive forever.
@@ -1973,6 +2235,70 @@ type IPTVConfig struct {
 	// transcoding enabled. The client requests it explicitly (?econom=1) as an «Эконом» quality.
 	EconomEnable    bool `toml:"econom_enable"`
 	EconomMaxHeight int  `toml:"econom_max_height"` // downscale cap for econom; default 720
+	// RefreshHours — период перечитывания ВСЕХ плейлистов (глобальных и
+	// пользовательских) с апстрима. Xtream-панели ротируют токены в URL каналов;
+	// без перечитывания ссылки протухают за часы. 0 → 6ч, отрицательное — выкл.
+	RefreshHours int `toml:"refresh_hours"`
+	// Registry — СВОЙ реестр каналов («Мои каналы»): собственный список со
+	// стабильными id, у каждого канала несколько источников (закреплённые руками
+	// + собранные из global_playlists), автофейловер по health-check. Глобальные
+	// плейлисты при включённом реестре — лишь доноры источников. Пустой реестр
+	// при первом старте засевается из глобальных списков автоматически.
+	Registry bool `toml:"registry"`
+	// RegistryAutoAdd — добавлять ли в реестр каналы доноров, не совпавшие ни с
+	// одним своим (по tvg-id/имени). Выкл. (по умолчанию) — состав каналов
+	// стабилен и правится только руками/через админку.
+	RegistryAutoAdd bool   `toml:"registry_auto_add"`
+	RegistryName    string `toml:"registry_name"`  // имя плейлиста у клиента; default «Alpac IPTV»
+	RegistryProxy   string `toml:"registry_proxy"` // "none"|"all" для стримов реестра; пусто → default_proxy
+	// RegistryOnly прячет глобальные плейлисты от клиентов — наружу только
+	// реестр (и личные списки пользователей). Доноры продолжают качаться как
+	// источники.
+	RegistryOnly bool `toml:"registry_only"`
+	// RegistryExport открывает /api/iptv/export.m3u и приём токен-подписанных
+	// ссылок в /stream. Default FALSE: после кражи экспортного плейлиста реестр
+	// наружу не отдаётся вовсе — только авторизованные клиенты через /channels
+	// и /play. Включать осознанно: ссылки экспорта привязываются к токену
+	// пользователя (отзыв токена убивает файл), но при app_attest="enforce"
+	// внешние плееры их всё равно не сыграют (нет заголовка-аттестации).
+	RegistryExport bool `toml:"registry_export"`
+	// AppSecret — общий секрет ОФИЦИАЛЬНОГО приложения: им клиент подписывает
+	// заголовок X-App-Proof (HMAC), см. app_attest. Пустой секрет = аттестация
+	// не работает даже в режиме enforce (гейт честно закрыт для всех).
+	AppSecret string `toml:"app_secret"`
+	// AppAttest — проверка, что запрос пришёл из нашего приложения:
+	//   "off"     — не проверять (default; поведение до внедрения);
+	//   "log"     — пропускать, но логировать запросы без валидной подписи
+	//               (режим обкатки: видно, какие клиенты ещё не обновились);
+	//   "enforce" — 401 без валидного X-App-Proof.
+	// Секрет живёт в приложении и извлекаем декомпиляцией — это барьер против
+	// generic-плееров и массового шаринга, а не криптографическая гарантия.
+	AppAttest string `toml:"app_attest"`
+	// AppProofRejectV1 выключает приём СТАРОГО формата подписи (v1, общий секрет).
+	//
+	// Ради этого всё и делалось: секрет v1 одинаков во всех сборках и лежит открытым
+	// текстом в js-бандле и в APK — подделать подпись может кто угодно, кто его вынул.
+	// Пока v1 принимается, аттестация отсекает только тех, кто вообще не шлёт заголовок.
+	//
+	// Включать ТОЛЬКО когда персональные ключи (v2) разошлись по устройствам: ключ
+	// выдаётся в ответе /tg/auth/status, и до первого захода клиента его нет. Смотреть
+	// долю по полю proof_key в database/tgauth/tokens.json — на 2026-09-02 это 3.1%,
+	// то есть включение отрезало бы почти всех.
+	AppProofRejectV1 bool `toml:"app_proof_reject_v1"`
+	// PreferOfficial — играть с домена САМОГО вещателя, даже когда панель
+	// предлагает тот же канал выше качеством. Панель — посредник: она падает
+	// целиком (кончилась оплата, лимит сессий, сменились id), а поток вещателя
+	// от неё не зависит. Default true; выключите, если важнее битрейт панели.
+	PreferOfficial *bool `toml:"prefer_official"`
+	// OfficialHosts ДОПОЛНЯЕТ встроенный список доменов-первоисточников
+	// (подстроки хоста), а не заменяет его.
+	OfficialHosts []string `toml:"official_hosts"`
+}
+
+// PreferOfficialEnabled reports whether broadcaster-owned sources win over
+// donor/panel ones (default true when unset).
+func (c IPTVConfig) PreferOfficialEnabled() bool {
+	return c.PreferOfficial == nil || *c.PreferOfficial
 }
 
 // MergeGlobalEnabled reports whether global playlists should be merged (default true when unset).
@@ -2126,9 +2452,12 @@ func applyDefaults() Config {
 			// source is NOT in no_stream_proxy) makes the SERVER fetch with the same IP the hash
 			// was minted for → it plays. Add no_stream_proxy entries only for sources whose tokens
 			// are NOT IP-bound and that genuinely need direct-to-client delivery.
-			PidoRezka:    PidoRezkaSource{Host: "https://hdrzk.org"},
-			Rhsprem:      PidoRezkaSource{Host: "https://hdrzk.org"},
-			AhueRezka:    AhueRezkaSource{Host: "https://rezka.hdbase.workers.dev", KpHost: "https://kp.hdbase.workers.dev", Premium: false, HLS: false},
+			PidoRezka: PidoRezkaSource{Host: "https://hdrzk.org"},
+			Rhsprem:   PidoRezkaSource{Host: "https://hdrzk.org"},
+			// Воркер hdbase умер (404 на всё, замер 21.09.2026) — дефолт на живой.
+			// Дефолт важен не меньше конфига: у НОД своей секции [online.ahuerezka]
+			// нет, и они ходили на мёртвый воркер — источник у них молчал вовсе.
+			AhueRezka:    AhueRezkaSource{Host: "https://rezka.metrpiva.com", KpHost: "https://kp.metrpiva.com", Premium: false, HLS: false},
 			KinoPub:      KinoPubSource{Host: "https://api.srvkp.com"},
 			Wink:         WinkSource{DiscoveryHost: "https://itv.svc.iptv.rt.ru/api/v2", Platform: "ANDROID", DeviceType: "ANDROIDTV", DeviceModel: "Nexus 9", UserAgent: "Wink/1.38.1 (Android 9; ANDROIDTV)", TV: true, VOD: true},
 			Kinobase:     KinobaseSource{Host: "https://kinobase.org", PlayerJS: true, HDR: true},
@@ -2148,6 +2477,10 @@ func applyDefaults() Config {
 			Collaps:      CollapsSource{APIHost: "https://api.luxembd.ws", ListHost: "https://api.bhcesh.me", Token: "eedefb541aeba871dcfc756e6b31c02e"},
 			RutubeMovie:  HostSource{Host: "https://rutube.ru"},
 			Anwap:        HostSource{Host: "https://tv.anwap.today"},
+			Rudub:        RudubSource{Host: "https://play26.ru-dub.xyz", TrackerHost: "https://r4.rudub.world"},
+			Anidub:       HostSource{Host: "https://online.anidub.com"},
+			Zagonka:      HostSource{Host: "https://kinobadi.in"},
+			Smotrim:      SmotrimSource{Host: "https://smotrim.ru", PlayerAPI: "https://player-api.smotrim.ru"},
 			VKMovie:      VKMovieSource{Host: "https://api.vkvideo.ru", TokenURL: "https://login.vk.com/?act=get_anonym_token"},
 			HDVB:         APIHostTokenSource{APIHost: "https://apivb.com", Token: "5e2fe4c70bafd9a7414c4f170ee1b192", PlayerHost: "https://vid1733431681.entouaedon.com"},
 			Plvideo:      HostSource{Host: "https://api.g1.plvideo.ru"},
@@ -2170,7 +2503,7 @@ func applyDefaults() Config {
 			CDNmovies:    HostSource{Host: "https://coldcdn.xyz"},
 			CDNvideohub:  HostSource{Host: "https://plapi.cdnvideohub.com"},
 			Kubikvkube:   KubikvkubeSource{Host: "https://kubikvkube.com", PlayerHost: "https://tomion.org"},
-			Vibix:        HostTokenSource{Host: "https://vibix.org"},
+			Vibix:        VibixSource{Host: "https://vibix.org"},
 			Turbo:        HostSource{Host: "92d73433.obrut.show"},
 			IframeVideo:  IframeVideoSource{APIHost: "https://iframe.video", CDNHost: "https://videoframe.space"},
 			GetsTV:       HostTokenSource{Host: "https://getstv.com"},
@@ -2210,6 +2543,7 @@ func applyDefaults() Config {
 				"bamboo", "unimay", "starlight", "klonfun", "uaflix",
 				"animeon", "mikai", "leproduction", "gencit", "femd", "kinobadi", "cdnvideohub",
 				"kubikvkube", "lift", "sakhtv", "tevas", "zetflixdb", "uakino",
+				"rudub", "anidub", "smotrim",
 			},
 		},
 		Cub: CubConfig{

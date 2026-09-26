@@ -306,6 +306,17 @@ type accsdbConfig struct {
 // (alpac_/lampac_) cookies, optional header overrides, last-ditch query
 // param. Documented in the resolveUser comment block above.
 func extractAuthToken(r *http.Request) string {
+	// `_lampac_auth` — HttpOnly-якорь, его ставит сервер и не может переписать
+	// ни один плагин со страницы. Читаем ПЕРВЫМ: на телевизорах (Tizen, Android
+	// WebView) при перезапуске приложения вычищается именно JS-видимая банка
+	// кук, а HttpOnly переживает — и до 20.09.2026 в этом состоянии человек
+	// выглядел авторизованным для гейта (тот читал этот кук сам) и анонимом для
+	// всех, кто пользовался общим разбором.
+	if c, err := r.Cookie("_lampac_auth"); err == nil {
+		if v := strings.TrimSpace(c.Value); v != "" {
+			return v
+		}
+	}
 	if c, err := r.Cookie("alpac_token"); err == nil {
 		if v := strings.TrimSpace(c.Value); v != "" {
 			return v
@@ -324,6 +335,14 @@ func extractAuthToken(r *http.Request) string {
 	}
 	return strings.TrimSpace(r.URL.Query().Get("token"))
 }
+
+// ExtractToken — тот же разбор источников токена, что использует middleware.
+// Вынесен наружу, чтобы гейт не держал СВОЙ список: он знал только куки
+// `_lampac_auth`, `lampac_token` и `?token=`, и запрос, принёсший токен
+// заголовком `X-Alpac-Token`/`X-Lampac-Token` (а заголовок заведён ровно для
+// Android WebView, который не переигрывает куки в XHR), для middleware был
+// авторизован, а для гейта — нет: он уходил в ветку `uid` и получал QR-код.
+func ExtractToken(r *http.Request) string { return extractAuthToken(r) }
 
 func (m *Middleware) resolveUser(r *http.Request) *User {
 	cfg := loadAccsdbConfig()

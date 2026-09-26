@@ -97,15 +97,44 @@
     try { p.push(Intl.DateTimeFormat().resolvedOptions().timeZone||''); } catch(e){ p.push(''); }
     p.push((navigator.userAgent||'').replace(/[\d.]+/g,'').slice(0,120));
     var base = p.join('|'), done = false;
-    var finish = function(nid){ if(done) return; done = true; cb(fnv1a(base + '|' + (nid||''))); };
+    // Without a native id the stable fp is a MODEL signature (every unit of the
+    // same TV/PC hashes alike — one value was seen on 100 accounts), so it is
+    // not sent at all. With one it is prefixed "n:" — the server restores an
+    // account only from prefixed values.
+    var finish = function(nid){ if(done) return; done = true; cb(nid ? 'n:' + fnv1a(base + '|' + nid) : ''); };
     var t = setTimeout(function(){ finish(''); }, 1200);
     getNativeId(function(nid){ clearTimeout(t); finish(nid); });
   }
 
   // Generate a fresh device UID — used when server signals uid_conflict
   // (cub backup cloned the UID from another device) or on first install.
+  //
+  // ★Берём криптослучайные 48 бит вместо Lampa.Utils.uid(8): тот построен на
+  // Math.random и даёт 8 символов, а на прод-данных 20.09.2026 нашлось 88
+  // значений, поделённых 329 аккаунтами (одно — 70 аккаунтами, от iPhone до
+  // Hisense). Случайным совпадением это быть не может: на 26 тысяч устройств
+  // ожидаемое число пар — доли единицы. Значит, идентификатор приезжает
+  // скопированным (чужой бэкап CUB, мод с зашитым значением) или Math.random
+  // на части прошивок отдаёт одно и то же при холодном старте. Длина не
+  // проверяется нигде — ни на сервере, ни в плагинах, поэтому удлинение
+  // безопасно, а в админке такой uid просто показывается сокращённым.
   function regenUID() {
-    var n = Lampa.Utils.uid(8).toLowerCase();
+    var n = '';
+    try {
+      var c = window.crypto || window.msCrypto;
+      if (c && c.getRandomValues) {
+        var a = new Uint8Array(6);
+        c.getRandomValues(a);
+        for (var i = 0; i < a.length; i++) n += ('0' + a[i].toString(16)).slice(-2);
+      }
+    } catch(e) {}
+    if (n.length < 12) {
+      // Запасной путь для движков без crypto: время + два разных Math.random.
+      // Хуже криптослучайного, но уже не повторяется на одинаковых прошивках.
+      n = (Date.now().toString(36) + Math.random().toString(36).slice(2) +
+           Math.random().toString(36).slice(2)).slice(0, 12);
+    }
+    n = n.toLowerCase();
     Lampa.Storage.set('lampac_unic_id', n);
     try { localStorage.setItem('lampac_uid_backup', n); } catch(e){}
     return n;
@@ -195,6 +224,13 @@
         // cookie wipe) and bind the device (uid + both fingerprints) for recovery.
         if (result.token) { try { localStorage.setItem('lampac_auth_token', result.token); } catch(e){} }
         bindDevice(result.token, uid, sfp);
+        return;
+      }
+      if (result && result.revoked) {
+        // The owner unbound THIS device in the bot. Drop the stored token so we
+        // stop presenting it on every boot; the QR card on /lite/* is the way back.
+        try { localStorage.removeItem('lampac_auth_token'); } catch(e){}
+        try { Lampa.Storage.set('lampac_token',''); Lampa.Storage.set('alpac_token',''); Lampa.Storage.set('lampac_auth_token',''); } catch(e){}
         return;
       }
       // Not authorized — do nothing. The catalog stays open; the source list is

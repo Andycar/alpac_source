@@ -315,3 +315,59 @@ func TestTurningVoicesOffClearsWantList(t *testing.T) {
 		t.Fatalf("список ожиданий переживёт выключение и удивит при повторном включении: %v", got.WantVoices)
 	}
 }
+
+// Набор озвучек скачет от опроса к опросу: балансеры отвечают по-разному, и одна и
+// та же студия приходит то как «RHS», то как «Red Head Sound». С ПЕРЕЗАПИСЬЮ снимка
+// два набора объявляли друг друга по кругу — «Гангстерленд» за час прислал две
+// непересекающиеся рассылки (прод 2026-09-10; 519 рассылок об озвучках за неделю).
+// База накопительная: вернувшийся набор — не новость.
+func TestFlappingVoiceListDoesNotReAnnounce(t *testing.T) {
+	c, store, notifier := newTestCron(t)
+	store.Subscribe(1, Subscription{
+		TmdbID: 42, Title: "Гангстерленд", TrackVoices: true,
+		LastSeason: 1, LastEpisode: 10,
+	})
+	setA := []string{"DniproFilm", "RHS"}
+	setB := []string{"1WIN Studio", "Амедиа"}
+	serve := func(list []string) {
+		c.SetVoiceLister(func(_ context.Context, _ int, _ string, _, _ int) []string { return list })
+		c.checkVoices(context.Background(), store.ListByUser(1)[0])
+	}
+
+	serve(setA) // первый опрос — молча запоминаем базу
+	if len(notifier.sent) != 0 {
+		t.Fatalf("первый опрос должен молчать: %v", notifier.sent)
+	}
+	serve(setB) // ответил другой балансер — это действительно новые имена
+	if len(notifier.sent) != 1 {
+		t.Fatalf("ждали одну рассылку про новый набор, получили %d: %v", len(notifier.sent), notifier.sent)
+	}
+	serve(setA) // и вот тут раньше начинался круг
+	serve(setB)
+	serve(setA)
+	if len(notifier.sent) != 1 {
+		t.Fatalf("вернувшиеся наборы объявлены заново (%d рассылок): %v", len(notifier.sent), notifier.sent)
+	}
+	// Действительно новая студия по-прежнему доходит.
+	serve(append(append([]string{}, setA...), "Кубик в Кубе"))
+	if len(notifier.sent) != 2 {
+		t.Fatalf("новая озвучка потерялась: %v", notifier.sent)
+	}
+}
+
+// Снимок привязан к серии: дорожки новой серии — это новость, даже если студии те же.
+func TestVoiceBaselineResetsOnNewEpisode(t *testing.T) {
+	store := New(t.TempDir())
+	sub := Subscription{TmdbID: 7, Title: "Т", LastSeason: 1, LastEpisode: 10, TrackVoices: true}
+	store.Subscribe(1, sub)
+	store.UpdateVoices(sub.Key(), []string{"LostFilm"}, 1, 10)
+
+	got := store.ListByUser(1)[0]
+	if got.VoicesSeason != 1 || got.VoicesEpisode != 10 {
+		t.Fatalf("серия снимка не записана: S%dE%d", got.VoicesSeason, got.VoicesEpisode)
+	}
+	// Вышла новая серия — снимок к ней не относится, значит базы нет.
+	if got.VoicesSeason == 2 && got.VoicesEpisode == 1 {
+		t.Fatal("снимок ошибочно считается актуальным для новой серии")
+	}
+}

@@ -213,6 +213,12 @@ func iptvPreviewHandler(cache *iptvPreviewCache, iptvStore *iptv.Store, tgStore 
 			http.Error(w, "channel_id required", http.StatusBadRequest)
 			return
 		}
+		// Кадры каналов реестра — под тем же гейтом, что и их потоки: аноним не
+		// должен ни жечь ffmpeg-слоты, ни перебирать наши channel_id.
+		if iptv.IsRegistryChannelID(channelID) && !requireRegistryAuth(r, tgStore) {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
 		ch, _ := iptvStore.GetChannel(tgID, channelID)
 		if ch == nil {
 			http.Error(w, "channel not found", http.StatusNotFound)

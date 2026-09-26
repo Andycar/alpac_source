@@ -284,6 +284,10 @@ type FetchResult struct {
 	Body    []byte
 	Headers map[string]string
 	Status  int
+	// NoCache — ответ нельзя класть в кэш: он неполный по нашей вине и скоро
+	// станет лучше (например, трейлер для карточки ещё ищется в фоне).
+	// Кэшировать его на 2 часа значило бы закрепить пустоту.
+	NoCache bool
 }
 
 // FetchAPI tries each API upstream in order until one succeeds. Bounded by the

@@ -26,6 +26,7 @@ import (
 	"lampac-go/internal/config"
 
 	"github.com/rs/zerolog/log"
+	"golang.org/x/sync/singleflight"
 )
 
 // ---------------------------------------------------------------------------
@@ -101,6 +102,15 @@ type TranscodingJob struct {
 	logMu  sync.Mutex
 	logBuf []string
 	maxLog int
+
+	// Карта ключевых кадров (keyframes.go): строится в фоне после старта, kfDone закрывается по
+	// завершении (успех или нет). Плейлист и seek ждут её недолго и берут точные границы, пока
+	// карта есть, и прежнюю равномерную сетку, пока нет. Рестарты (seek/respawn) делят её.
+	kfMu   sync.Mutex
+	kf     *keyframeMap
+	kfSegs *hlsSegmentMap
+	kfDone chan struct{}
+	kfOnce *sync.Once
 }
 
 type transcodingContext struct {
@@ -178,6 +188,29 @@ type transcodingHLSCtx struct {
 	SegDur  int
 	WinSize int
 	FMP4    bool
+	// SeekExact — точное время -ss в секундах (ключевой кадр из карты); 0 = взять Seek.
+	// Seek остаётся номинальным целым: по нему живут dedup, start_number и старая логика.
+	SeekExact float64
+}
+
+// seekArg печатает значение для -ss. Входной seek (-ss до -i) с -noaccurate_seek приземляется
+// на ключевой кадр НЕ ПОЗЖЕ цели, поэтому к точному времени добавляем 50 мс — иначе округление
+// вниз уводит на предыдущий кадр. Выходной seek (pipe:0, -ss после -i) отбрасывает пакеты с
+// pts < цели, там нужна ровно метка ключевого кадра, чтобы он не выпал сам.
+func (c transcodingContext) seekArg(outputSeek bool) string {
+	if c.HLS.SeekExact > 0 {
+		if outputSeek {
+			return fmtSeek(c.HLS.SeekExact)
+		}
+		return fmtSeek(c.HLS.SeekExact + 0.05)
+	}
+	return strconv.Itoa(c.HLS.Seek)
+}
+
+// videoCopied — видео идёт stream-copy (remux / только звук): сегменты режутся по ключевым
+// кадрам источника, и только тут карта определяет плейлист.
+func videoCopied(mode transcode.TranscodingMode) bool {
+	return mode == transcode.ModeRemux || mode == transcode.ModeAudioOnly
 }
 
 type transcodingAudioCtx struct {
@@ -198,6 +231,8 @@ func newTranscodingJob(id, streamID, outputDir string, cmd *exec.Cmd, ctx transc
 		exitCode:   -1,
 		cancelCh:   make(chan struct{}),
 		maxLog:     200,
+		kfDone:     make(chan struct{}),
+		kfOnce:     &sync.Once{},
 	}
 	j.lastAccess.Store(j.StartedUtc)
 	atomic.StoreInt64(&j.lastSegIndex, -1)
@@ -371,12 +406,31 @@ type TranscodingService struct {
 	restartMu    sync.Mutex
 	restartTimes map[string][]time.Time
 
+	// Зомби-ffmpeg, замеченные прошлым проходом сторожа сирот (transcoding_orphans_unix.go).
+	// Трогает только горутина deadJobReaper — без замка.
+	orphanZombies map[int]struct{}
+
 	// P4: job-coalescing.  Keyed by (src+client-fingerprint+audio+subs+seek);
 	// value is the jobID of a still-warming-up job.  A retry from the same
 	// client for the same stream reuses that job instead of spawning another
 	// ffmpeg — kills the "12 ffmpeg for one stuck 4K stream" storm.
 	inflightMu sync.Mutex
 	inflight   map[string]string
+
+	// probeFlight coalesces concurrent ffprobes of the same src: a player
+	// retrying /transcoding/start while the first probe is still waiting on a
+	// cold torrent (up to ~45s for TorrServer inputs) must NOT spawn its own
+	// ffprobe + magnet add per retry — prod 2026-08-23: one TV issued 8 starts
+	// in a minute, each adding the torrent again and probing the swarm again.
+	probeFlight singleflight.Group
+	// startFlight coalesces identical concurrent GET /transcoding/start.m3u8
+	// requests (same dedup key) onto one Start — see transcodingStartM3U8Handler.
+	startFlight singleflight.Group
+	// noDataMu/noDataAt: torrent srcs that just failed the patient probe with
+	// no bytes (ErrTorrentNoData). A retry inside torrentNoDataTTL fails
+	// instantly instead of burning another ~45s probe per click.
+	noDataMu sync.Mutex
+	noDataAt map[string]time.Time
 
 	segCleanupRunning int32
 	stopCh            chan struct{}
@@ -757,6 +811,34 @@ func (svc *TranscodingService) schedulerFor(req *TranscodingStartRequest) *trans
 	return svc.scheduler
 }
 
+const torrentNoDataTTL = 90 * time.Second
+
+// markTorrentNoData remembers that src just failed the patient probe with no
+// bytes, so immediate retries fail fast (see torrentNoDataRecent).
+func (svc *TranscodingService) markTorrentNoData(src string) {
+	svc.noDataMu.Lock()
+	defer svc.noDataMu.Unlock()
+	if svc.noDataAt == nil {
+		svc.noDataAt = map[string]time.Time{}
+	}
+	now := time.Now()
+	for k, t := range svc.noDataAt { // bounded: expire on write
+		if now.Sub(t) > torrentNoDataTTL {
+			delete(svc.noDataAt, k)
+		}
+	}
+	svc.noDataAt[src] = now
+}
+
+// torrentNoDataRecent reports whether src failed with ErrTorrentNoData within
+// torrentNoDataTTL.
+func (svc *TranscodingService) torrentNoDataRecent(src string) bool {
+	svc.noDataMu.Lock()
+	defer svc.noDataMu.Unlock()
+	t, ok := svc.noDataAt[src]
+	return ok && time.Since(t) <= torrentNoDataTTL
+}
+
 func (svc *TranscodingService) Start(req *TranscodingStartRequest) (*TranscodingJob, string) {
 	tc := svc.cfg.Transcoding
 	if !tc.Enable {
@@ -810,10 +892,25 @@ func (svc *TranscodingService) Start(req *TranscodingStartRequest) (*Transcoding
 	// Run ffprobe — NEVER fatal.  If it fails, we go best-effort with
 	// synthetic probe data and a warning, which surfaces back to the
 	// plugin in the /transcoding/start response.
+	tsInput := strings.Contains(req.Src, "/lite/pidtor/s") || strings.Contains(req.Src, "/ts/")
+	if tsInput && svc.torrentNoDataRecent(req.Src) {
+		return nil, ErrTorrentNoData.Error()
+	}
 	ffprobeData, probeErr := svc.runFFProbe(req.Src, req.Headers)
 	bestEffort := false
 	probeWarning := ""
 	if probeErr != "" {
+		// TorrServer inputs (pidtor / /ts) get a patient probe (~45s); when even
+		// that saw no bytes the torrent has no metadata/seeds reachable from the
+		// backend (prod 2026-08-23: "Torrent getting info" for minutes on EVERY
+		// pool backend). A best-effort ffmpeg would only hang on the swarm —
+		// 8 zombie processes per click — while the player spins. Fail fast with
+		// a clear error so the client's recovery ladder moves on.
+		if tsInput && probeErr == "ffprobe failed" {
+			log.Warn().Str("src", req.Src).Msg("transcoding: torrent source gave no data within the probe budget — refusing best-effort (no metadata/seeds?)")
+			svc.markTorrentNoData(req.Src)
+			return nil, ErrTorrentNoData.Error()
+		}
 		log.Warn().Str("src", req.Src).Str("err", probeErr).Msg("transcoding: probe failed, continuing best-effort")
 		bestEffort = true
 		probeWarning = probeErr
@@ -954,13 +1051,18 @@ func (svc *TranscodingService) Start(req *TranscodingStartRequest) (*Transcoding
 	// Handles in-process torrs (→ localhost/ts/...) and external TorrServer.
 	source := srcURL.String()
 	tsAvail := torrsIsInProcess() || svc.cfg.TorrServer.Port > 0 || svc.cfg.TorrServer.URL != ""
+	isBox := transcodeIsBox(svc.cfg)
 	srcIsTS := false // TorrServer input → longer ffmpeg rw_timeout (cold-torrent start is legitimately slow)
-	if tsAvail && strings.Contains(source, "/ts/") {
+	if (tsAvail || isBox) && strings.Contains(source, "/ts/") {
 		if idx := strings.Index(source, "/ts/"); idx >= 0 {
 			localPath := source[idx+3:]
-			source = tsDirectStreamBase(svc.cfg, localPath) + localPath
-			srcIsTS = true
-			log.Debug().Str("original", srcURL.String()).Str("rewritten", source).Msg("transcoding: rewrite source to TorrServer")
+			// Pool backend (main's pool via the ts-pick oracle on a box) or
+			// the static TorrServer; "" = nothing local to rewrite onto.
+			if base := tsDirectStreamBaseFor(svc.cfg, srcOrigin(source), localPath, tsAvail); base != "" {
+				source = base + localPath
+				srcIsTS = true
+				log.Debug().Str("original", srcURL.String()).Str("rewritten", source).Msg("transcoding: rewrite source to TorrServer")
+			}
 		}
 	}
 
@@ -969,9 +1071,14 @@ func (svc *TranscodingService) Start(req *TranscodingStartRequest) (*Transcoding
 	var torrentHash string
 	var torrentFileIdx int
 
-	// Rewrite pidtor stream URLs to direct TorrServer stream for ffmpeg input.
-	if tsAvail && strings.Contains(source, "/lite/pidtor/s") {
-		if torrsIsInProcess() {
+	// Rewrite pidtor stream URLs to direct TorrServer stream for ffmpeg input:
+	// pool backend (oracle/local) or static TorrServer over HTTP; in-process
+	// torrs without a pool pick opens the torrent reader directly.
+	if strings.Contains(source, "/lite/pidtor/s") {
+		if rewritten, ok := ffprobeRewritePidtor(svc.cfg, source); ok {
+			source = rewritten
+			srcIsTS = true
+		} else if torrsIsInProcess() {
 			// In-process: open pipe directly — bypasses HTTP entirely.
 			// This avoids auth/routing/middleware issues with localhost requests.
 			if pipe, h, fi := transcodingPidtorOpenPipe(source); pipe != nil {
@@ -983,9 +1090,6 @@ func (svc *TranscodingService) Start(req *TranscodingStartRequest) (*Transcoding
 				// Fallback to HTTP URL if pipe failed.
 				source = rewritten
 			}
-		} else if rewritten, ok := ffprobeRewritePidtor(svc.cfg, source); ok {
-			source = rewritten
-			srcIsTS = true
 		}
 	}
 
@@ -1113,6 +1217,7 @@ func (svc *TranscodingService) Start(req *TranscodingStartRequest) (*Transcoding
 
 	job := newTranscodingJob(id, streamID, outputDir, cmd, ctx)
 	job.sched = sched // release this job's slot back to the pool it came from
+	svc.startKeyframeMap(job)
 	job.stderrPipe = stderrPipe
 	job.Mode = decision.Mode
 	job.Warning = decision.Warning
@@ -1275,6 +1380,12 @@ func (svc *TranscodingService) dropInflight(job *TranscodingJob) {
 // ---------------------------------------------------------------------------
 
 func (svc *TranscodingService) SeekAsync(streamID string, seconds int, startSegment *int) (bool, string) {
+	return svc.seekAsyncExact(streamID, seconds, 0, startSegment)
+}
+
+// seekAsyncExact — перезапуск ffmpeg с позиции; exact > 0 — точное время ключевого кадра из
+// карты (см. keyframes.go), seconds — его номинал для start_number и старой логики.
+func (svc *TranscodingService) seekAsyncExact(streamID string, seconds int, exact float64, startSegment *int) (bool, string) {
 	if seconds < 0 {
 		return false, "ss must be >= 0"
 	}
@@ -1285,6 +1396,7 @@ func (svc *TranscodingService) SeekAsync(streamID string, seconds int, startSegm
 
 	newCtx := job.Context
 	newCtx.HLS.Seek = seconds
+	newCtx.HLS.SeekExact = exact
 	if startSegment != nil {
 		sn := *startSegment
 		newCtx.StartNum = &sn
@@ -1329,6 +1441,7 @@ func (svc *TranscodingService) SeekAsync(streamID string, seconds int, startSegm
 	}
 
 	newJob := newTranscodingJob(job.ID, job.StreamID, job.OutputDir, cmd, newCtx)
+	newJob.copyKeyframesFrom(job) // карта та же — источник не менялся
 	newJob.stderrPipe = stderrPipe
 	newJob.sched = job.sched       // reuses the same slot → release to the same pool
 	newJob.dedupKey = job.dedupKey // carry coalescing entry across the restart
@@ -1414,13 +1527,21 @@ func (svc *TranscodingService) killProcess(job *TranscodingJob) {
 }
 
 func (svc *TranscodingService) cleanup(job *TranscodingJob) {
-	// Multi-audio readers die with the job (their shelves are about to go).
-	stopAudioReaders(job.OutputDir)
-
 	svc.mu.Lock()
-	_, existed := svc.jobs[job.ID]
+	cur, existed := svc.jobs[job.ID]
+	if existed && cur != job {
+		// Под этим id уже новая версия задания (перемотка или автоперезапуск кладут новую структуру
+		// под тот же id, с той же папкой и тем же слотом). Уборка старой не должна стирать новую из
+		// учёта, отдавать её слот, глушить её дорожки звука и удалять её папку: иначе новый ffmpeg
+		// остаётся работать вне учёта — сироты на боксе 26.09 все были в удалённых папках.
+		svc.mu.Unlock()
+		return
+	}
 	delete(svc.jobs, job.ID)
 	svc.mu.Unlock()
+
+	// Multi-audio readers die with the job (their shelves are about to go).
+	stopAudioReaders(job.OutputDir)
 
 	// P2.4: drop the restart budget entry for this stream so the map
 	// doesn't grow forever.
@@ -1461,11 +1582,19 @@ func (svc *TranscodingService) runFFProbe(src string, headers map[string]string)
 	if cached, ok := svc.probeCache.Get(src, headers); ok {
 		return cached, ""
 	}
-	result, errMsg := svc.runFFProbeUncached(src, headers)
-	if errMsg == "" && result != nil {
-		svc.probeCache.Put(src, headers, result)
+	type probeOut struct {
+		result map[string]any
+		errMsg string
 	}
-	return result, errMsg
+	v, _, _ := svc.probeFlight.Do(src, func() (any, error) {
+		result, errMsg := svc.runFFProbeUncached(src, headers)
+		if errMsg == "" && result != nil {
+			svc.probeCache.Put(src, headers, result)
+		}
+		return probeOut{result: result, errMsg: errMsg}, nil
+	})
+	out, _ := v.(probeOut)
+	return out.result, out.errMsg
 }
 
 // prewarmProbe runs ffprobe in the background for each URL the plugin
@@ -1548,23 +1677,26 @@ func (svc *TranscodingService) runFFProbeUncached(src string, headers map[string
 	// Handles in-process torrs (→ localhost/ts/...) and external TorrServer.
 	probeSrc := src
 	tsAvail := torrsIsInProcess() || svc.cfg.TorrServer.Port > 0 || svc.cfg.TorrServer.URL != ""
-	if tsAvail && strings.Contains(src, "/ts/") {
+	if (tsAvail || transcodeIsBox(svc.cfg)) && strings.Contains(src, "/ts/") {
 		if idx := strings.Index(src, "/ts/"); idx >= 0 {
 			localPath := src[idx+3:] // strip "/ts" prefix, keep "/stream/..."
-			probeSrc = tsDirectStreamBase(svc.cfg, localPath) + localPath
-			log.Debug().Str("original", src).Str("rewritten", probeSrc).Msg("transcoding: ffprobe rewrite URL to TorrServer")
+			if base := tsDirectStreamBaseFor(svc.cfg, srcOrigin(src), localPath, tsAvail); base != "" {
+				probeSrc = base + localPath
+				log.Debug().Str("original", src).Str("rewritten", probeSrc).Msg("transcoding: ffprobe rewrite URL to TorrServer")
+			}
 		}
 	}
 
-	// Rewrite pidtor stream URLs to direct TorrServer stream.
-	if torrsIsInProcess() && strings.Contains(src, "/lite/pidtor/s") {
-		// In-process: add magnet directly, probe via temp file.
-		if result, errMsg := ffprobeDirectPidtor(ffprobePath, src); result != nil || errMsg != "" {
-			return result, errMsg
-		}
-	} else if tsAvail && strings.Contains(src, "/lite/pidtor/s") {
+	// Rewrite pidtor stream URLs to direct TorrServer stream (pool backend via
+	// the ts-pick oracle on a box / local pool / static); in-process torrs
+	// without a pool pick: add magnet directly, probe via temp file.
+	if strings.Contains(src, "/lite/pidtor/s") {
 		if rewritten, ok := ffprobeRewritePidtor(svc.cfg, src); ok {
 			probeSrc = rewritten
+		} else if torrsIsInProcess() {
+			if result, errMsg := ffprobeDirectPidtor(ffprobePath, src); result != nil || errMsg != "" {
+				return result, errMsg
+			}
 		}
 	}
 
@@ -1654,8 +1786,24 @@ func (svc *TranscodingService) runFFProbeUncached(src string, headers map[string
 	liteErr := errMsg
 
 	// Stage 2 — full (10 MB / 10 seconds / 15s wall timeout).
-	fullArgs := buildArgs("10000000", "20000000", 15000000)
-	result, errMsg = runStage("full", fullArgs, 15*time.Second)
+	//
+	// TorrServer inputs (pidtor / /ts rewrites onto a backend's /stream) get
+	// a patient 40s budget: a COLD torrent legitimately needs ~20-30s before
+	// the first bytes arrive (metadata + preload from the swarm — prod
+	// 2026-08-23: every pidtor probe died at 4s+15s while ffmpeg got data at
+	// ~25s), and a failed probe forces "best-effort sw-transcode" — the most
+	// expensive mode and a dead end for 4K HEVC on a GPU-less box — where a
+	// real probe would have picked native/remux/audio-only. The bytes are
+	// awaited either way (ffmpeg waits for the same swarm), so the extra
+	// patience costs nothing overall and the probe returns the moment data
+	// flows.
+	fullBudget := 15 * time.Second
+	if tsInput := (strings.Contains(probeSrc, "/stream") && strings.Contains(probeSrc, "link=")) ||
+		strings.Contains(src, "/lite/pidtor/s") || strings.Contains(src, "/ts/"); tsInput {
+		fullBudget = 40 * time.Second
+	}
+	fullArgs := buildArgs("10000000", "20000000", int(fullBudget/time.Microsecond))
+	result, errMsg = runStage("full", fullArgs, fullBudget)
 	if errMsg == "" && result != nil {
 		if _, ok := result["format"]; ok {
 			return result, ""
@@ -1769,7 +1917,7 @@ func (svc *TranscodingService) createProcess(ctx transcodingContext) *exec.Cmd {
 	// after -i so ffmpeg reads and discards frames up to the seek point (output seek).
 	// This is slower but the only option for unseekable inputs.
 	if ctx.HLS.Seek > 0 && ctx.StdinPipe == nil {
-		args = append(args, "-ss", strconv.Itoa(ctx.HLS.Seek), "-noaccurate_seek")
+		args = append(args, "-ss", ctx.seekArg(false), "-noaccurate_seek")
 	}
 
 	args = append(args, "-nostats", "-progress", "pipe:2")
@@ -1847,7 +1995,7 @@ func (svc *TranscodingService) createProcess(ctx transcodingContext) *exec.Cmd {
 	// For pipe:0 inputs: output-seek (after -i). ffmpeg reads and discards frames
 	// up to the seek point. Slower than input-seek but works with non-seekable streams.
 	if ctx.HLS.Seek > 0 && ctx.StdinPipe != nil {
-		args = append(args, "-ss", strconv.Itoa(ctx.HLS.Seek), "-noaccurate_seek")
+		args = append(args, "-ss", ctx.seekArg(true), "-noaccurate_seek")
 	}
 
 	// CRITICAL: when seeking, we MUST preserve original PTS so that the
@@ -2017,7 +2165,11 @@ func (svc *TranscodingService) createProcess(ctx transcodingContext) *exec.Cmd {
 	// live.m3u8 404). Aligned keyframes every SegDur also keep segments small — exactly what a
 	// thin pipe needs (the whole point of IPTV «Эконом»). Only when we're actually re-encoding
 	// video (a -c:v copy stream keeps the source's own GOP; we can't move its keyframes).
-	if ctx.Live && !sliceContainsPair(args, "-c:v", "copy") {
+	// ★VOD тоже: без принудительных ключевых кадров x264 режет по своему GOP (250 кадров =
+	// 10 с), а синтетический плейлист объявляет SegDur — плеер считает буфер по плейлисту и
+	// промахивается перемоткой. Проверено на ffmpeg 9: с expr сегменты ровно SegDur, а после
+	// рестарта с -ss отсчёт t в выражении идёт от точки seek, так что сетка не съезжает.
+	if !sliceContainsPair(args, "-c:v", "copy") {
 		seg := max(ctx.HLS.SegDur, 1)
 		args = append(args, "-force_key_frames", fmt.Sprintf("expr:gte(t,n_forced*%d)", seg))
 	}
@@ -2722,9 +2874,14 @@ func (svc *TranscodingService) tryAutoRestart(job *TranscodingJob) bool {
 	segDur := max(job.Context.HLS.SegDur, 1)
 	resumeSec := 0
 	resumeSeg := 0
+	resumeExact := 0.0
 	if lastIdx >= 0 {
 		resumeSec = (lastIdx + 1) * segDur
 		resumeSeg = lastIdx + 1
+		if segs := job.segMapNow(); segs != nil && videoCopied(job.Context.Mode) {
+			resumeExact = segs.start(resumeSeg)
+			resumeSec = int(resumeExact)
+		}
 	}
 
 	// P3.E: classify last 200 stderr lines and decide whether to escalate.
@@ -2759,7 +2916,7 @@ func (svc *TranscodingService) tryAutoRestart(job *TranscodingJob) bool {
 	}
 
 	// No escalation — fall through to the existing same-mode resume.
-	ok, errMsg := svc.SeekAsync(job.StreamID, resumeSec, &resumeSeg)
+	ok, errMsg := svc.seekAsyncExact(job.StreamID, resumeSec, resumeExact, &resumeSeg)
 	if !ok {
 		log.Warn().Str("streamId", job.StreamID).Str("err", errMsg).Msg("transcoding: auto-restart failed")
 		return false
@@ -2777,6 +2934,13 @@ func (svc *TranscodingService) tryAutoRestart(job *TranscodingJob) bool {
 func (svc *TranscodingService) respawnWithMode(job *TranscodingJob, resumeSec, resumeSeg int, newMode transcode.TranscodingMode, disableHW bool) (bool, string) {
 	newCtx := job.Context
 	newCtx.HLS.Seek = resumeSec
+	newCtx.HLS.SeekExact = 0
+	// Плейлист уже объявлен по карте — продолжать надо ровно с границы сегмента resumeSeg,
+	// иначе стык после рестарта наложится на уже отданное.
+	if segs := job.segMapNow(); segs != nil && resumeSeg > 0 && videoCopied(job.Context.Mode) {
+		newCtx.HLS.SeekExact = segs.start(resumeSeg)
+		newCtx.HLS.Seek = int(newCtx.HLS.SeekExact)
+	}
 	if resumeSeg > 0 {
 		sn := resumeSeg
 		newCtx.StartNum = &sn
@@ -2822,6 +2986,7 @@ func (svc *TranscodingService) respawnWithMode(job *TranscodingJob, resumeSec, r
 	}
 
 	newJob := newTranscodingJob(job.ID, job.StreamID, job.OutputDir, cmd, newCtx)
+	newJob.copyKeyframesFrom(job) // карта та же — источник не менялся
 	newJob.stderrPipe = stderrPipe
 	newJob.sched = job.sched // reuses the same slot → release to the same pool
 	newJob.Mode = newMode
@@ -3105,12 +3270,17 @@ func (svc *TranscodingService) deadJobReaper() {
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
 
+	tick := 0
 	for {
 		select {
 		case <-svc.stopCh:
 			return
 		case <-ticker.C:
 			svc.reapDeadJobs(gracePeriod)
+			// Раз в минуту — ffmpeg, чьих заданий больше нет в учёте (transcoding_orphans_unix.go).
+			if tick++; tick%4 == 0 {
+				svc.reapOrphanProcs()
+			}
 		}
 	}
 }
@@ -3503,4 +3673,117 @@ func parseFFmpegMajorFromLibavutil(body string) int {
 		return 1
 	}
 	return libutil - 52
+}
+
+// ── карта ключевых кадров (keyframes.go) ──
+
+// ffprobePath — ffprobe рядом с настроенным ffmpeg, иначе из PATH (то же правило, что у runFFProbeUncached).
+func (svc *TranscodingService) ffprobePath() string {
+	tc := svc.cfg.Transcoding
+	if tc.FFmpeg != "" && tc.FFmpeg != "ffmpeg" {
+		candidate := filepath.Join(filepath.Dir(tc.FFmpeg), "ffprobe")
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate
+		}
+	}
+	return "ffprobe"
+}
+
+// fastStartInitTime — включён ли -hls_init_time 1 для этого контекста (та же формула, что в
+// createProcess): от него зависит целевая длина сегментов hlsenc, см. hlsGrid.
+func (svc *TranscodingService) fastStartInitTime(ctx transcodingContext) float64 {
+	tc := svc.cfg.Transcoding
+	if !ctx.Live && !tc.DisableFastStart && svc.ffmpegMajorVersion >= 5 && ctx.HLS.SegDur > 1 {
+		return 1
+	}
+	return 0
+}
+
+// startKeyframeMap строит карту в фоне: VOD, одиночный rung, с пробой. Для stream-copy по ней
+// строятся плейлист и seek, для re-encode она нужна только превью перемотки (trickplay).
+func (svc *TranscodingService) startKeyframeMap(job *TranscodingJob) {
+	ctx := job.Context
+	if ctx.Live || ctx.MultiRung || ctx.BestEffort || ctx.FFProbe == nil {
+		job.setKeyframes(nil, nil)
+		return
+	}
+	go func() {
+		var torrent io.ReadSeeker
+		if ctx.torrentHash != "" && torrsIsInProcess() {
+			if srv := getTorrsServer(); srv != nil {
+				if rs, _, _, err := srv.Stream(ctx.torrentHash, ctx.torrentFileIdx); err == nil {
+					torrent = rs
+					if c, ok := rs.(io.Closer); ok {
+						defer c.Close()
+					}
+				}
+			}
+		}
+		cctx, cancel := context.WithTimeout(context.Background(), keyframeExtractTimeout)
+		defer cancel()
+		km, err := extractKeyframes(cctx, ctx.Source, ctx.UserAgent, ctx.Referer, ctx.FFProbe, torrent, svc.ffprobePath())
+		if err != nil {
+			log.Debug().Err(err).Str("streamId", job.StreamID).Msg("transcoding: keyframe map unavailable — uniform playlist")
+			job.setKeyframes(nil, nil)
+			return
+		}
+		segs := hlsGrid(km, float64(max(ctx.HLS.SegDur, 1)), svc.fastStartInitTime(ctx), float64(ffprobeDuration(ctx.FFProbe)))
+		job.setKeyframes(km, segs)
+		n := 0
+		if segs != nil {
+			n = segs.count()
+		}
+		log.Info().Str("streamId", job.StreamID).Str("source", km.Source).Int("keyframes", len(km.Times)).
+			Int("segments", n).Bool("copy", videoCopied(ctx.Mode)).Msg("transcoding: keyframe map ready")
+	}()
+}
+
+func (j *TranscodingJob) setKeyframes(km *keyframeMap, segs *hlsSegmentMap) {
+	j.kfMu.Lock()
+	j.kf, j.kfSegs = km, segs
+	done, once := j.kfDone, j.kfOnce
+	j.kfMu.Unlock()
+	if once != nil && done != nil {
+		once.Do(func() { close(done) })
+	}
+}
+
+// keyframes — карта без ожидания (nil, пока строится).
+func (j *TranscodingJob) keyframes() *keyframeMap {
+	j.kfMu.Lock()
+	defer j.kfMu.Unlock()
+	return j.kf
+}
+
+// segMapNow — границы сегментов без ожидания.
+func (j *TranscodingJob) segMapNow() *hlsSegmentMap {
+	j.kfMu.Lock()
+	defer j.kfMu.Unlock()
+	return j.kfSegs
+}
+
+// segMap ждёт карту не дольше wait: плейлист отдаётся после первого сегмента (секунды), к этому
+// моменту Cues обычно давно прочитаны; не успела — работаем по равномерной сетке.
+func (j *TranscodingJob) segMap(wait time.Duration) *hlsSegmentMap {
+	j.kfMu.Lock()
+	done := j.kfDone
+	j.kfMu.Unlock()
+	if done != nil {
+		select {
+		case <-done:
+		case <-time.After(wait):
+			return nil
+		}
+	}
+	return j.segMapNow()
+}
+
+// copyKeyframesFrom делит карту (и её канал готовности) с предыдущим воплощением джобы.
+func (j *TranscodingJob) copyKeyframesFrom(o *TranscodingJob) {
+	o.kfMu.Lock()
+	km, segs, done, once := o.kf, o.kfSegs, o.kfDone, o.kfOnce
+	o.kfMu.Unlock()
+	j.kfMu.Lock()
+	j.kf, j.kfSegs, j.kfDone, j.kfOnce = km, segs, done, once
+	j.kfMu.Unlock()
 }

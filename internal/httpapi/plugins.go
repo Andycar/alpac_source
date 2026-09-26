@@ -731,7 +731,7 @@ func onJSHandler(cfg config.Config, manifest []modules.RootModule, customPlugins
 			// so localStorage has it for account() fallback. Cookie name
 			// pair (lampac_token + alpac_token) and SameSite tuning matches
 			// setAuthCookies() so a cross-origin Lampa install (e.g.
-			// lampa.mx loading beta.l-vid.online/on.js) replays the cookie
+			// lampa.mx loading beta.example.com/on.js) replays the cookie
 			// on subsequent XHRs.
 			out = fmt.Sprintf(`(function(){
   try{
@@ -943,7 +943,7 @@ func hostFromRequest(r *http.Request) string {
 // the request comes in via a host listed in `[host.stream_aliases]`, the
 // aliased host is returned — so video and WebSocket traffic can bypass a
 // fronting CDN (e.g. CloudFlare on `lampa.li` → direct `s.lampa.li`).
-// For requests on unmapped hosts (e.g. `beta.l-vid.online` direct), the
+// For requests on unmapped hosts (e.g. `beta.example.com` direct), the
 // original host is returned unchanged.
 //
 // Use for stream URL generation only. For API/HTML URLs that should stay on
@@ -1079,13 +1079,46 @@ func withMyVariant(path string) []string {
 // Embedded directly to avoid an external template file.
 const adsFreeJS = `(function () {
     function initLampaHook() {
-        if (window.Lampa && Lampa.Player && Lampa.Player.play) {
-            var originalPlay = Lampa.Player.play;
-            Lampa.Player.play = function (object) {
-                object.iptv = true;
-                if (object.vast_url) delete object.vast_url;
-                if (object.vast_msg) delete object.vast_msg;
-                return originalPlay.apply(this, arguments);
+        if (window.Lampa && Lampa.Player && Lampa.Player.listener) {
+            $.ajaxTransport('+json', function (options) {
+                if (/\/api\/ad\/get\/banner(?:[?#]|$)/.test(options.url)) {
+                    return {
+                        send: function (headers, complete) {
+                            complete(200, 'OK', { json: { ad: [] } });
+                        },
+                        abort: function () {}
+                    };
+                }
+            });
+
+            var listener = Lampa.Player.listener;
+            var originalSend = listener.send;
+            var restore;
+
+            listener.send = function (type, event) {
+                if (restore && (type === 'create' || type === 'start' || type === 'external' || type === 'destroy')) {
+                    restore();
+                    restore = null;
+                }
+
+                var result = originalSend.apply(this, arguments);
+
+                if (type === 'create' && event && event.data) {
+                    var data = event.data;
+                    var hadIptv = Object.prototype.hasOwnProperty.call(data, 'iptv');
+                    var iptv = data.iptv;
+
+                    restore = function () {
+                        if (hadIptv) data.iptv = iptv;
+                        else delete data.iptv;
+                    };
+
+                    data.iptv = true;
+                    delete data.vast_url;
+                    delete data.vast_msg;
+                }
+
+                return result;
             };
         } else {
             setTimeout(initLampaHook, 500);
@@ -1142,7 +1175,7 @@ func buildAuthGateJS(host string) string {
   function saveToken(tok){
     if(!tok)return;
     // SameSite=None;Secure on HTTPS so the cookie is sent on cross-origin
-    // XHRs (lampa.mx → beta.l-vid.online scenario). HTTP installs fall
+    // XHRs (lampa.mx → beta.example.com scenario). HTTP installs fall
     // back to Lax — None requires Secure which plain-HTTP can't provide.
     var sas=(location.protocol==='https:'?';SameSite=None;Secure':';SameSite=Lax');
     try{
@@ -1166,22 +1199,64 @@ func buildAuthGateJS(host string) string {
     }catch(e){}
     try{localStorage.removeItem(LS_TOK);}catch(e){}
   }
-  function getUID(){
-    try{var raw=localStorage.getItem('lampac_unic_id');if(raw){try{var p=JSON.parse(raw);if(typeof p==='string'&&p)return p;}catch(e){if(typeof raw==='string'&&raw)return raw;}}}catch(e){}
+  // ★getUID читает ВСЕ места, куда uid когда-либо писали. Раньше смотрел
+  // только в lampac_unic_id: резервный ключ писался и никогда не читался, а
+  // куки не использовались вовсе. Стоило телевизору вычистить localStorage при
+  // перезапуске приложения — и клиент заводил НОВЫЙ uid, терял привязку и шёл
+  // за кодом заново. В боте это видно как россыпь одинаковых «Android» с
+  // одного адреса: у одного пострадавшего три записи за сутки, у другого
+  // две за две минуты. Кука переживает чистку localStorage, localStorage
+  // переживает чистку кук — читаем обе.
+  function _unjson(raw){
+    if(!raw)return '';
+    try{var p=JSON.parse(raw);if(typeof p==='string'&&p)return p;}catch(e){if(typeof raw==='string'&&raw)return raw;}
     return '';
+  }
+  function getUID(){
+    try{var v=_unjson(localStorage.getItem('lampac_unic_id'));if(v)return v;}catch(e){}
+    try{var b=_unjson(localStorage.getItem('lampac_uid_backup'));if(b){saveUID(b);return b;}}catch(e){}
+    try{
+      var m=document.cookie.match(/(?:^|;\s*)alpac_uid=([^;]*)/);
+      if(m&&m[1]){var c=decodeURIComponent(m[1]);if(c){saveUID(c);return c;}}
+    }catch(e){}
+    return '';
+  }
+  function saveUID(u){
+    if(!u)return u;
+    try{localStorage.setItem('lampac_unic_id',u);}catch(e){}
+    try{localStorage.setItem('lampac_uid_backup',u);}catch(e){}
+    try{
+      var sas=(location.protocol==='https:'?';SameSite=None;Secure':';SameSite=Lax');
+      document.cookie='alpac_uid='+encodeURIComponent(u)+';path=/;max-age=31536000'+sas;
+    }catch(e){}
+    return u;
   }
   // ensureUID generates and persists a device UID when none exists yet —
   // on an external Lampa (plugin added by URL) nothing else creates
   // lampac_unic_id, and a recovery without uid authorizes the session but
   // never binds the device (invisible in the bot, no uid-based recovery).
+  //
+  // ★Генератор: было восемь символов из Math.random по одному. На проде это
+  // дало 88 значений uid, поделённых 329 аккаунтами (у рекордсмена 72
+  // владельца на платформах от iPhone до Hisense) — случайным совпадением
+  // такое быть не может: Math.random на части телевизоров при холодном старте
+  // засеян одинаково. Берём 48 бит из crypto, с запасным путём для старых
+  // движков. Длину uid сервер не проверяет нигде.
   function ensureUID(){
     var u=getUID();
     if(u)return u;
-    u='';var abc='abcdefghijklmnopqrstuvwxyz0123456789';
-    for(var i=0;i<8;i++)u+=abc.charAt(Math.floor(Math.random()*abc.length));
-    try{localStorage.setItem('lampac_unic_id',u);}catch(e){}
-    try{localStorage.setItem('lampac_uid_backup',u);}catch(e){}
-    return u;
+    u='';
+    try{
+      var c=window.crypto||window.msCrypto;
+      if(c&&c.getRandomValues){
+        var a=new Uint8Array(6);c.getRandomValues(a);
+        for(var i=0;i<a.length;i++)u+=('0'+a[i].toString(16)).slice(-2);
+      }
+    }catch(e){}
+    if(u.length<12){
+      u=(Date.now().toString(36)+Math.random().toString(36).slice(2)+Math.random().toString(36).slice(2)).slice(0,12);
+    }
+    return saveUID(u.toLowerCase());
   }
   // CUB session token from Lampa's account storage — the longest-lived
   // recovery anchor: the server links it to the account passively, and after
@@ -1300,6 +1375,10 @@ func buildAuthGateJS(host string) string {
     statusReq('token='+encodeURIComponent(tok)+(uid?'&uid='+encodeURIComponent(uid):'')+(cub?'&cub='+encodeURIComponent(cub):''),function(r){
       if(r&&r.authorized){saveToken(r.token||tok);upgradeBundle(r.token||tok);return;}
       clearToken();
+      // The owner unbound THIS device in the bot: the token is gone for good
+      // on this device and every recovery rung below is refused server-side.
+      // Stop here — the QR card in the source list is the way back in.
+      if(r&&r.revoked){return;}
       // After clearing invalid cookie, check if localStorage had a DIFFERENT valid token
       try{var ls=localStorage.getItem(LS_TOK);if(ls&&ls!==tok){saveToken(ls);checkToken(ls);return;}}catch(e){}
       tryRecovery();
@@ -1329,9 +1408,41 @@ func buildAuthGateJS(host string) string {
     }
   }
 
-  // Coarse, drift-resistant fingerprint (stable hardware subset) — a secondary
-  // anchor for the case where the precise fp shifted after a firmware update.
-  function stableFP(){
+  // Native device id — the only thing that tells two units of the same TV
+  // model apart after a full wipe. Tizen DUID and the Android bridge are
+  // synchronous; webOS LGUDID is an async luna call. Absent → ''.
+  function nativeIdSync(){
+    try{if(window.webapis&&webapis.productinfo&&typeof webapis.productinfo.getDuid==='function')return 'tz:'+webapis.productinfo.getDuid();}catch(e){}
+    try{if(window.AndroidJS&&typeof AndroidJS.getDeviceId==='function')return 'ad:'+AndroidJS.getDeviceId();}catch(e){}
+    try{if(window.Android&&typeof Android.getDeviceId==='function')return 'ad:'+Android.getDeviceId();}catch(e){}
+    return '';
+  }
+  function nativeId(cb){
+    var s=nativeIdSync();
+    if(s){cb(s);return;}
+    var done=false;
+    var finish=function(v){if(done)return;done=true;cb(v||'');};
+    var t=setTimeout(function(){finish('');},1200);
+    try{
+      if(window.webOSDev&&typeof webOSDev.LGUDID==='function'){
+        webOSDev.LGUDID({onSuccess:function(r){clearTimeout(t);finish(r&&r.id?'lg:'+r.id:'');},onFailure:function(){clearTimeout(t);finish('');}});
+        return;
+      }
+      if(window.PalmServiceBridge){
+        var b=new PalmServiceBridge();
+        b.onservicecallback=function(msg){var r=null;try{r=JSON.parse(msg);}catch(e){}var ids=r&&r.idList;var id='';if(ids&&ids.length)id=ids[0].idValue||'';clearTimeout(t);finish(id?'lg:'+id:'');};
+        b.call('luna://com.webos.service.sm/deviceid/getIDs',JSON.stringify({idType:['LGUDID']}));
+        return;
+      }
+    }catch(e){}
+    clearTimeout(t);finish('');
+  }
+  // Coarse, drift-resistant fingerprint (stable hardware subset) folded with
+  // the native device id. WITHOUT a native id it is a MODEL signature — every
+  // unit of the same TV/PC hashes alike (one value was seen on 100 accounts in
+  // production) — so it is not sent at all. With one it is prefixed "n:"; the
+  // server restores an account only from prefixed values.
+  function stableFP(cb){
     var p=[];
     try{p.push((screen.width||0)+'x'+(screen.height||0));}catch(e){}
     try{p.push(screen.colorDepth||0);}catch(e){}
@@ -1342,23 +1453,24 @@ func buildAuthGateJS(host string) string {
     try{p.push(navigator.maxTouchPoints||0);}catch(e){}
     try{p.push(Intl.DateTimeFormat().resolvedOptions().timeZone||'');}catch(e){}
     try{p.push((navigator.userAgent||'').replace(/[\d.]+/g,'').slice(0,120));}catch(e){}
-    return fnv1a(p.join('|'));
+    nativeId(function(nid){cb(nid?'n:'+fnv1a(p.join('|')+'|'+nid):'');});
   }
   function tryFingerprint(){
     getFingerprint(function(fp){
-      var sfp=stableFP();
-      var cub=getCub();
-      if(!fp&&!sfp&&!cub){showGate();return;}
-      var qs=[];
-      if(fp)qs.push('fp='+encodeURIComponent(fp));
-      if(sfp)qs.push('sfp='+encodeURIComponent(sfp));
-      if(cub)qs.push('cub='+encodeURIComponent(cub));
-      var uid=ensureUID();
-      if(uid)qs.push('uid='+encodeURIComponent(uid));
-      statusReq(qs.join('&'),function(r){
-        if(r&&r.authorized){saveToken(r.token||'');upgradeBundle(r.token);return;}
-        showGate();
-      },showGate);
+      stableFP(function(sfp){
+        var cub=getCub();
+        if(!fp&&!sfp&&!cub){showGate();return;}
+        var qs=[];
+        if(fp)qs.push('fp='+encodeURIComponent(fp));
+        if(sfp)qs.push('sfp='+encodeURIComponent(sfp));
+        if(cub)qs.push('cub='+encodeURIComponent(cub));
+        var uid=ensureUID();
+        if(uid)qs.push('uid='+encodeURIComponent(uid));
+        statusReq(qs.join('&'),function(r){
+          if(r&&r.authorized){saveToken(r.token||'');upgradeBundle(r.token);return;}
+          showGate();
+        },showGate);
+      });
     });
   }
 

@@ -6,7 +6,43 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"lampac-go/internal/browsertmp"
 )
+
+// Tests never sweep the machine's real snap Chromium /tmp.
+func TestMain(m *testing.M) {
+	browsertmp.SnapChromiumTmp = filepath.Join(os.TempDir(), "browser-test-no-snap")
+	os.Exit(m.Run())
+}
+
+// A snap Chromium keeps its scratch and profile dirs in its private /tmp —
+// the janitor has to sweep there too, or it frees nothing on such hosts.
+func TestCleanupStaleChromeTmp_SweepsSnapChromiumTmp(t *testing.T) {
+	host, snap := t.TempDir(), t.TempDir()
+	t.Setenv("TMPDIR", host)
+	prev := browsertmp.SnapChromiumTmp
+	browsertmp.SnapChromiumTmp = snap
+	t.Cleanup(func() { browsertmp.SnapChromiumTmp = prev })
+
+	pastMtime := time.Now().Add(-2 * time.Hour)
+	staleSnap := mkDir(t, snap, "lampac-chromedp-1", pastMtime)
+	staleCrashpad := mkDir(t, snap, ".org.chromium.Chromium.Ab12", pastMtime)
+	staleHost := mkDir(t, host, "lampac-chromedp-2", pastMtime)
+	keepRezka := mkDir(t, snap, "rezka-chrome", pastMtime)
+
+	if n := CleanupStaleChromeTmp("", 10*time.Minute); n != 3 {
+		t.Fatalf("removed=%d, want 3 (two in the snap tmp, one in TMPDIR)", n)
+	}
+	for _, p := range []string{staleSnap, staleCrashpad, staleHost} {
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Errorf("expected %s removed, stat err=%v", p, err)
+		}
+	}
+	if _, err := os.Stat(keepRezka); err != nil {
+		t.Errorf("persistent profile must stay: %v", err)
+	}
+}
 
 // TestCleanupStaleChromeTmp_RemovesStaleAndKeepsFresh covers the core
 // two-way behaviour: stale (older than maxAge) directories matching a

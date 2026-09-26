@@ -22,9 +22,14 @@ type Forwarder struct {
 // NewForwarder creates a forwarder backed by the given pool.
 func NewForwarder(pool *Pool) *Forwarder {
 	return &Forwarder{
-		pool:        pool,
-		liteClient:  httpclient.New(30 * time.Second),
-		proxyClient: httpclient.New(5 * time.Minute),
+		pool: pool,
+		// Редиректы нод отдаём клиенту как есть. Клиент по умолчанию шёл по 302
+		// сам: нода отвечала 302 на /proxy/<токен> — пересыл шагал туда через
+		// публичный хост и тянул ВСЁ видео через main (manifest.mp4 у zetflix:
+		// 206 на main с p50 5.5 с и до 62 с, разбор 22.09.2026); с torrent_direct
+		// так же утёк бы поток бэкенда. Плеер по 302 ходит сам.
+		liteClient:  httpclient.NewNoRedirect(30 * time.Second),
+		proxyClient: httpclient.NewNoRedirect(5 * time.Minute),
 	}
 }
 

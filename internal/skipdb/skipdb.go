@@ -18,6 +18,10 @@ type Segment struct {
 	Type  string  `json:"type"`  // "intro", "outro", "recap"
 	Start float64 `json:"start"` // seconds
 	End   float64 `json:"end"`   // seconds
+	// Provider — откуда метка: "" (ручная/админ), "auto-chromaprint" (introdetect по звуку);
+	// Confidence — доля совпавших отпечатков у авто-меток, 0..1. Ручная метка всегда важнее.
+	Provider   string  `json:"provider,omitempty"`
+	Confidence float64 `json:"confidence,omitempty"`
 }
 
 // UserMark is a user-submitted skip marker awaiting moderation.

@@ -39,6 +39,10 @@ func TestSamsungWGTServesPrebuiltWidget(t *testing.T) {
 	if ct := rec.Header().Get("Content-Type"); ct != "application/octet-stream" {
 		t.Fatalf("unexpected content-type: %q", ct)
 	}
+	// Имя при скачивании — наше, а не унаследованное lampac.wgt (переименовано 2026-09-10).
+	if cd := rec.Header().Get("Content-Disposition"); cd != `attachment; filename="alpac.wgt"` {
+		t.Fatalf("unexpected content-disposition: %q", cd)
+	}
 	if body := rec.Body.Bytes(); string(body) != string(expected) {
 		t.Fatalf("unexpected body: %q", string(body))
 	}
@@ -56,5 +60,22 @@ func TestSamsungWGTReturns503WithoutLegacyFallback(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "samsung widget templates not installed") {
 		t.Fatalf("unexpected response body: %q", rec.Body.String())
+	}
+}
+
+// Оболочки для телевизоров — за входом, обе. /webos.ipk и так был закрыт гейтом tgauth,
+// а /samsung.wgt проскакивал по расширению .wgt в списке публичных ассетов и раздавался
+// анонимам. Проверяем сам аллоулист: он общий для основного гейта и зеркал (mirror.go).
+func TestWidgetDownloadsRequireAuth(t *testing.T) {
+	for _, p := range []string{"/samsung.wgt", "/webos.ipk"} {
+		if gatePreAuthAllowed(httptest.NewRequest(http.MethodGet, "http://lampac.local"+p, nil)) {
+			t.Fatalf("%s пропущен до входа", p)
+		}
+	}
+	// Контроль: страница входа и её статика по-прежнему доступны без токена.
+	for _, p := range []string{"/tg/auth", "/assets/app.js", "/plugin.lampa"} {
+		if !gatePreAuthAllowed(httptest.NewRequest(http.MethodGet, "http://lampac.local"+p, nil)) {
+			t.Fatalf("%s неожиданно закрыт", p)
+		}
 	}
 }

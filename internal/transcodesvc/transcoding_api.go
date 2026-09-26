@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"lampac-go/internal/transcode"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -335,6 +336,10 @@ func transcodingStartHandler(cfg config.Config, svc *TranscodingService) http.Ha
 				writeJSON(w, http.StatusServiceUnavailable, body)
 				return
 			}
+			if errMsg == ErrTorrentNoData.Error() {
+				writeJSON(w, http.StatusBadGateway, body)
+				return
+			}
 			writeJSON(w, http.StatusBadRequest, body)
 			return
 		}
@@ -455,49 +460,7 @@ func jobUsesMasterPlaylist(job *TranscodingJob) bool {
 // audio-only copy instead of a software HEVC→H.264 re-encode that times out. Returns nil when no caps
 // param is present, so the UA-DB fallback stays in charge for clients that don't send it.
 func parseClientCapsFromQuery(q url.Values) *transcode.ClientCaps {
-	raw := strings.TrimSpace(q.Get("caps"))
-	if raw == "" {
-		return nil
-	}
-	has := map[string]bool{}
-	maxHeight := 0
-	for _, t := range strings.Split(raw, ",") {
-		if t = strings.TrimSpace(strings.ToLower(t)); t == "" {
-			continue
-		}
-		// maxh<N> — потолок высоты видео (физический режим вывода дисплея клиента):
-		// выше него видео не отдаётся stream-copy, см. ClientCaps.MaxHeight.
-		if n, ok := strings.CutPrefix(t, "maxh"); ok {
-			if v, err := strconv.Atoi(n); err == nil && v >= 240 && v <= 4320 {
-				maxHeight = v
-			}
-			continue
-		}
-		has[t] = true
-	}
-	lang := strings.TrimSpace(q.Get("lang"))
-	if lang == "" {
-		lang = "ru"
-	}
-	return &transcode.ClientCaps{
-		MaxHeight:     maxHeight,
-		Lang:          lang,
-		Platform:      "browser",
-		CanPlayMKV:    has["mkv"],
-		CanPlayH264:   has["h264"],
-		CanPlayHEVC:   has["hevc"],
-		CanPlayHEVC10: has["hevc10"],
-		CanPlayAV1:    has["av1"],
-		CanPlayVP9:    has["vp9"],
-		CanPlayAAC:    has["aac"],
-		CanPlayAC3:    has["ac3"],
-		CanPlayEAC3:   has["eac3"],
-		CanPlayDTS:    has["dts"],
-		CanPlayTrueHD: has["truehd"],
-		CanPlayFLAC:   has["flac"],
-		CanPlayOpus:   has["opus"],
-		CanPlayMP3:    has["mp3"],
-	}
+	return transcode.ParseCapsToken(q.Get("caps"), q.Get("lang"))
 }
 
 func transcodingStartM3U8Handler(cfg config.Config, svc *TranscodingService) http.HandlerFunc {
@@ -567,11 +530,50 @@ func transcodingStartM3U8Handler(cfg config.Config, svc *TranscodingService) htt
 		// Route to the separate capi/TV pool when tagged (no-op if unconfigured).
 		req.useCapiPool = TranscodingWantsCapiPool(r)
 
-		job, errMsg := svc.Start(req)
+		// P4 coalescing for the GET path too (the POST handler had it, this one
+		// didn't): a player that fires two starts at once (Shaka load + the
+		// extras prefetch) or re-requests while the box is still adding and
+		// probing a cold torrent (10–45s) must share ONE job — prod 2026-08-23:
+		// 8 ffmpeg for one pidtor click. Identical requests in flight ride the
+		// same Start via singleflight; a job still warming up is reused.
+		dedupKey := transcodingDedupKey(r, req)
+		var job *TranscodingJob
+		var errMsg string
+		if existing := svc.LookupInflightJob(dedupKey); existing != nil {
+			svc.Touch(existing)
+			job = existing
+		} else if dedupKey == "" {
+			job, errMsg = svc.Start(req)
+		} else {
+			type startOut struct {
+				job    *TranscodingJob
+				errMsg string
+			}
+			v, _, _ := svc.startFlight.Do(dedupKey, func() (any, error) {
+				if j := svc.LookupInflightJob(dedupKey); j != nil {
+					svc.Touch(j)
+					return startOut{job: j}, nil
+				}
+				j, em := svc.Start(req)
+				if j != nil && j.Mode != transcode.ModeNative && j.Mode != transcode.ModeDirect {
+					svc.RegisterInflightJob(dedupKey, j)
+				}
+				return startOut{job: j, errMsg: em}, nil
+			})
+			out, _ := v.(startOut)
+			job, errMsg = out.job, out.errMsg
+		}
 		if job == nil {
 			if errMsg == ErrSchedulerBusy.Error() {
 				w.Header().Set("Retry-After", "5")
 				writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": errMsg})
+				return
+			}
+			if errMsg == ErrTorrentNoData.Error() {
+				// Upstream (the torrent swarm) never delivered — 502 so the player
+				// treats it as a dead source and moves on, not as a bad request.
+				writeJSON(w, http.StatusBadGateway, map[string]any{"error": errMsg, "errorCode": "torrent_no_data",
+					"userMessage": "Торрент не отдаёт данные (нет метаданных/сидов) — попробуйте другую раздачу"})
 				return
 			}
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": errMsg})
@@ -905,15 +907,42 @@ func transcodingMainHandler(cfg config.Config, svc *TranscodingService) http.Han
 			b.WriteString("#EXT-X-MAP:URI=\"init.mp4\"\n")
 		}
 
+		// Stream-copy + карта ключевых кадров: объявляем те границы, которые hlsenc и нарежет
+		// (см. keyframes.go). Иначе — прежняя равномерная сетка.
 		numSegments := duration / segDur
-		for i := range numSegments {
-			b.WriteString(fmt.Sprintf("#EXTINF:%d.0,\n", segDur))
-			b.WriteString(fmt.Sprintf("seg_%05d.%s\n", i, segExt))
+		if segs := job.segMap(2 * time.Second); segs != nil && videoCopied(job.Context.Mode) && segs.count() > 0 {
+			maxDur := 0.0
+			for _, d := range segs.Durs {
+				maxDur = math.Max(maxDur, d)
+			}
+			b.Reset()
+			b.WriteString("#EXTM3U\n")
+			b.WriteString("#EXT-X-PLAYLIST-TYPE:VOD\n")
+			if job.Context.HLS.FMP4 {
+				b.WriteString("#EXT-X-VERSION:7\n")
+			} else {
+				b.WriteString("#EXT-X-VERSION:3\n")
+			}
+			b.WriteString(fmt.Sprintf("#EXT-X-TARGETDURATION:%d\n", int(math.Ceil(maxDur))))
+			b.WriteString("#EXT-X-MEDIA-SEQUENCE:0\n")
+			if job.Context.HLS.FMP4 {
+				b.WriteString("#EXT-X-MAP:URI=\"init.mp4\"\n")
+			}
+			for i, d := range segs.Durs {
+				b.WriteString(fmt.Sprintf("#EXTINF:%.3f,\n", d))
+				b.WriteString(fmt.Sprintf("seg_%05d.%s\n", i, segExt))
+			}
+			numSegments = segs.count()
+		} else {
+			for i := range numSegments {
+				b.WriteString(fmt.Sprintf("#EXTINF:%d.0,\n", segDur))
+				b.WriteString(fmt.Sprintf("seg_%05d.%s\n", i, segExt))
+			}
 		}
 
 		b.WriteString("#EXT-X-ENDLIST\n")
 
-		log.Debug().Int("numSegments", numSegments).Int("segDur", segDur).Bool("fmp4", job.Context.HLS.FMP4).Msg("transcoding: serving main.m3u8")
+		log.Debug().Int("numSegments", numSegments).Int("segDur", segDur).Bool("fmp4", job.Context.HLS.FMP4).Bool("keyframeMap", job.segMapNow() != nil).Msg("transcoding: serving main.m3u8")
 
 		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
 		w.WriteHeader(http.StatusOK)
@@ -972,11 +1001,21 @@ func transcodingSegmentHandler(cfg config.Config, svc *TranscodingService) http.
 		if !job.Context.Live && resolved == "" && !strings.Contains(file, ".vtt") && segmentIndex != nil {
 			segDur := job.Context.HLS.SegDur
 			ss := *segmentIndex * segDur
+			// С картой ключевых кадров сегмент начинается ровно в ключевом кадре — туда и -ss.
+			exact := 0.0
+			if segs := job.segMapNow(); segs != nil && videoCopied(job.Context.Mode) {
+				exact = segs.start(*segmentIndex)
+				ss = int(exact)
+			}
+			alreadyAt := job.Context.HLS.Seek == ss
+			if exact > 0 || job.Context.HLS.SeekExact > 0 {
+				alreadyAt = job.Context.HLS.SeekExact == exact
+			}
 
 			goSeek := false
 			if job.Context.HLS.Seek == 0 && 30 > ss {
 				// First 30 seconds — don't seek.
-			} else if job.Context.HLS.Seek == ss {
+			} else if alreadyAt {
 				// Already at the right position.
 			} else {
 				goSeek = job.Context.HLS.Seek > ss
@@ -994,7 +1033,7 @@ func transcodingSegmentHandler(cfg config.Config, svc *TranscodingService) http.
 					}
 				}
 				if goSeek {
-					svc.SeekAsync(streamID, ss, segmentIndex)
+					svc.seekAsyncExact(streamID, ss, exact, segmentIndex)
 				}
 			}
 
@@ -1183,10 +1222,19 @@ func buildDiagnosticsSnapshot(job *TranscodingJob) map[string]any {
 
 	// HLS context.
 	out["hls"] = map[string]any{
-		"segDur":  job.Context.HLS.SegDur,
-		"winSize": job.Context.HLS.WinSize,
-		"fmp4":    job.Context.HLS.FMP4,
-		"seek":    job.Context.HLS.Seek,
+		"segDur":    job.Context.HLS.SegDur,
+		"winSize":   job.Context.HLS.WinSize,
+		"fmp4":      job.Context.HLS.FMP4,
+		"seek":      job.Context.HLS.Seek,
+		"seekExact": job.Context.HLS.SeekExact,
+	}
+	// Карта ключевых кадров: откуда, сколько, применена ли к плейлисту.
+	if km := job.keyframes(); km != nil {
+		kf := map[string]any{"source": km.Source, "keyframes": len(km.Times), "headerEnd": km.HeaderEnd, "applied": videoCopied(job.Context.Mode)}
+		if segs := job.segMapNow(); segs != nil {
+			kf["segments"] = segs.count()
+		}
+		out["keyframeMap"] = kf
 	}
 
 	// Recent stderr (cap at 20 lines for the snapshot — full history
@@ -1710,7 +1758,7 @@ func ffprobeHandler(cfg config.Config) http.HandlerFunc {
 }
 
 // RunFFProbeStandalone runs ffprobe on the given URL without requiring TranscodingService.
-// requestHost is the Host header from the incoming request (e.g. "beta.l-vid.online").
+// requestHost is the Host header from the incoming request (e.g. "beta.example.com").
 func RunFFProbeStandalone(cfg config.Config, src string, requestHost string) (map[string]any, string) {
 	ffprobePath := "ffprobe"
 	tc := cfg.Transcoding
@@ -1731,26 +1779,30 @@ func RunFFProbeStandalone(cfg config.Config, src string, requestHost string) (ma
 	// and external TorrServer (→ localhost:{ts_port}/...).
 	probeSrc := src
 	tsAvailable := torrsIsInProcess() || cfg.TorrServer.Port > 0 || cfg.TorrServer.URL != ""
-	if tsAvailable && strings.Contains(src, "/ts/") {
-		if parsed, err := url.Parse(src); err == nil && ffprobeIsLocalTS(parsed.Host, requestHost) {
+	isBox := transcodeIsBox(cfg)
+	if (tsAvailable || isBox) && strings.Contains(src, "/ts/") {
+		if parsed, err := url.Parse(src); err == nil && (isBox || ffprobeIsLocalTS(parsed.Host, requestHost)) {
 			if idx := strings.Index(src, "/ts/"); idx >= 0 {
 				localPath := src[idx+3:] // strip "/ts" prefix, keep "/stream/..."
-				probeSrc = tsDirectStreamBase(cfg, localPath) + localPath
-				log.Debug().Str("original", src).Str("rewritten", probeSrc).Msg("ffprobe: rewrite URL to TorrServer")
+				if base := tsDirectStreamBaseFor(cfg, srcOrigin(src), localPath, tsAvailable); base != "" {
+					probeSrc = base + localPath
+					log.Debug().Str("original", src).Str("rewritten", probeSrc).Msg("ffprobe: rewrite URL to TorrServer")
+				}
 			}
 		}
 	}
 
-	// Fast path: pidtor + in-process torrs — bypass HTTP entirely.
-	// Adds magnet via Go API, reads torrent data directly into temp file.
-	if torrsIsInProcess() && strings.Contains(src, "/lite/pidtor/s") {
-		if result, errMsg := ffprobeDirectPidtor(ffprobePath, src); result != nil || errMsg != "" {
-			return result, errMsg
-		}
-	} else if tsAvailable && strings.Contains(src, "/lite/pidtor/s") {
-		// External TorrServer: rewrite via HTTP.
+	// pidtor: pool backend (main's pool via the ts-pick oracle on a box, the
+	// local pool otherwise) or the static TorrServer → rewrite via HTTP.
+	// In-process torrs without a pool pick: fast path — add the magnet via the
+	// Go API and read torrent data directly into a temp file (no HTTP).
+	if strings.Contains(src, "/lite/pidtor/s") {
 		if rewritten, ok := ffprobeRewritePidtor(cfg, src); ok {
 			probeSrc = rewritten
+		} else if torrsIsInProcess() {
+			if result, errMsg := ffprobeDirectPidtor(ffprobePath, src); result != nil || errMsg != "" {
+				return result, errMsg
+			}
 		}
 	}
 
@@ -2053,8 +2105,12 @@ func ffprobeRewritePidtor(cfg config.Config, src string) (string, bool) {
 
 	// TS-balancer pool: the magnet ADD and the subsequent STREAM must hit the
 	// SAME backend (TorrServer is stateful per torrent) — pick it by infohash,
-	// exactly like the /ts proxy would, and override all three targets.
-	if b := TSPoolBackendFor(hash); b != nil {
+	// exactly like the /ts proxy would, and override all three targets. On a
+	// remote transcode box the pick comes from the MAIN's pool via the ts-pick
+	// oracle (origin of the src), so pidtor spreads over the whole balancer
+	// pool instead of the box's static TorrServer.
+	tsAvail := torrsIsInProcess() || cfg.TorrServer.Port > 0 || strings.TrimSpace(cfg.TorrServer.URL) != ""
+	if b := tsPickBackend(srcOrigin(src), hash); b != nil {
 		host, authHdr := b.Target()
 		tsBase = tsBackendBaseURL(b)
 		tsHostClean = strings.TrimRight(host, "/")
@@ -2062,21 +2118,28 @@ func ffprobeRewritePidtor(cfg config.Config, src string) (string, bool) {
 		if authHdr != "" {
 			tsHeaders["Authorization"] = authHdr
 		}
+	} else if !tsAvail || torrsIsInProcess() {
+		// No pool pick: with no local TorrServer at all leave the URL alone so
+		// ffmpeg fetches the main's resolve URL over HTTP (→ /proxy); with
+		// in-process torrs the caller takes its direct (no-HTTP) path.
+		return "", false
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// 20s like the main's pidtor path: MatriX "add" blocks until the torrent
+	// metadata arrives, which for a cold magnet is routinely >10s.
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
-	client := &http.Client{Timeout: 10 * time.Second}
+	client := &http.Client{Timeout: 20 * time.Second}
 	tsHash, err := pidtorTSAddMagnet(ctx, client, tsHostClean, tsHeaders, magnet)
 	if err != nil {
-		log.Warn().Err(err).Str("hash", hash).Msg("ffprobe: pidtor add magnet failed")
+		log.Warn().Err(err).Str("hash", hash).Str("ts", tsHostClean).Msg("ffprobe: pidtor add magnet failed")
 		return "", false
 	}
 
 	// Stream URL: tsBase already includes /ts prefix for in-process mode.
 	streamURL := fmt.Sprintf("%s/stream?link=%s&index=%d&play", tsBase, tsHash, tsid)
-	log.Debug().Str("original", src).Str("rewritten", streamURL).Msg("ffprobe: rewrite pidtor to TorrServer")
+	log.Info().Str("hash", hash).Str("ts", tsHostClean).Int("tsid", tsid).Msg("pidtor: magnet added on TorrServer, ffmpeg reads it directly")
 	return streamURL, true
 }
 
@@ -2186,11 +2249,11 @@ func tsDirectBaseURL(cfg config.Config) string {
 // ffprobeIsLocalTS checks whether urlHost refers to the same lampac instance
 // as requestHost.  Only then is it safe to rewrite /ts/ URLs to 127.0.0.1.
 //
-// Matches:  "" (relative), "beta.l-vid.online" == "beta.l-vid.online",
+// Matches:  "" (relative), "beta.example.com" == "beta.example.com",
 //
-//	"beta.l-vid.online:443" == "beta.l-vid.online".
+//	"beta.example.com:443" == "beta.example.com".
 //
-// Rejects:  "fox.root.sx:500" != "beta.l-vid.online".
+// Rejects:  "fox.root.sx:500" != "beta.example.com".
 func ffprobeIsLocalTS(urlHost, requestHost string) bool {
 	if urlHost == "" {
 		return true // relative URL — belongs to this server

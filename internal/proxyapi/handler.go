@@ -31,16 +31,20 @@ package proxyapi
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"lampac-go/internal/httpclient"
 	"net"
 	"net/http"
 	"net/textproto"
 	"net/url"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -94,6 +98,78 @@ const m3uCacheMax = 2000            // increased from 500 for scale
 // archives also carry per-seek from/to timestamps → unique keys that never hit again).
 const m3uCacheMaxBytes = 96 << 20       // 96 MB total budget
 const m3uCacheMaxEntryBytes = 512 << 10 // single entries above 512 KB are served uncached
+
+// m3uLastGood — последний УДАЧНЫЙ манифест канала, отдельно от основного кэша и с более
+// длинным сроком. Нужен для подмены при отказе апстрима (см. m3uServeStaleOnError).
+//
+// Зачем отдельное хранилище: у живого IPTV основной кэш живёт 2 секунды нарочно (иначе
+// плеер получает тот же манифест дважды и встаёт на живом краю), а пережить отказ надо
+// дольше этих двух секунд.
+var m3uLastGood = struct {
+	sync.RWMutex
+	items map[string]m3uCacheEntry
+}{items: make(map[string]m3uCacheEntry, 256)}
+
+const (
+	m3uStaleRetain   = 30 * time.Second // сколько храним последний удачный манифест
+	m3uStaleServeMax = 12 * time.Second // насколько старый готовы отдать вместо отказа
+	m3uLastGoodMax   = 512              // потолок записей
+)
+
+func m3uLastGoodSet(key string, e m3uCacheEntry) {
+	if len(e.body) == 0 || len(e.body) > m3uCacheMaxEntryBytes {
+		return
+	}
+	e.expiresAt = time.Now().Add(m3uStaleRetain)
+	m3uLastGood.Lock()
+	if len(m3uLastGood.items) >= m3uLastGoodMax {
+		now := time.Now()
+		for k, v := range m3uLastGood.items {
+			if now.After(v.expiresAt) {
+				delete(m3uLastGood.items, k)
+			}
+		}
+		if len(m3uLastGood.items) >= m3uLastGoodMax {
+			for k := range m3uLastGood.items { // всё ещё полно — освобождаем произвольную
+				delete(m3uLastGood.items, k)
+				break
+			}
+		}
+	}
+	m3uLastGood.items[key] = e
+	m3uLastGood.Unlock()
+}
+
+func m3uLastGoodGet(key string) (m3uCacheEntry, bool) {
+	m3uLastGood.RLock()
+	e, ok := m3uLastGood.items[key]
+	m3uLastGood.RUnlock()
+	if !ok {
+		return m3uCacheEntry{}, false
+	}
+	// expiresAt = момент конца хранения; отдавать готовы только заметно более свежее
+	age := m3uStaleRetain - time.Until(e.expiresAt)
+	if age > m3uStaleServeMax {
+		return m3uCacheEntry{}, false
+	}
+	return e, true
+}
+
+// m3uStaleLogged гасит повтор одинаковых строк: подмена случается на каждый запрос
+// зрителя, а знать надо лишь то, что канал сейчас едет на подмене.
+var m3uStaleLogged sync.Map // cacheKey -> time.Time
+
+func noteM3UStale(plugin, key string, status int) {
+	now := time.Now()
+	if v, ok := m3uStaleLogged.Load(key); ok {
+		if t, ok2 := v.(time.Time); ok2 && now.Sub(t) < 30*time.Second {
+			return
+		}
+	}
+	m3uStaleLogged.Store(key, now)
+	log.Warn().Str("plugin", plugin).Int("status", status).Str("key", truncStr(key, 90)).
+		Msg("proxy: апстрим отказал — отдаём последний удачный манифест")
+}
 
 // m3uCacheJanitor evicts expired entries every minute. The write-path covers
 // hot traffic, but on quiet servers between bursts entries can sit until the
@@ -218,6 +294,16 @@ func (s *cbcsKeyStore) Store(uri string, key []byte) {
 // Example: Rezka can inject fresh auth cookies obtained by auto-login.
 var pluginHeaderProviders sync.Map // map[string]func() map[string]string
 
+// DirectRedirect — хук httpapi: поток этого источника зритель может забрать у
+// бэкенда напрямую, подписанной ссылкой, минуя и main, и ноды. Возвращает
+// адрес для 302. Замер 21.09.2026: торренты через /proxy (pidtor) — 56 %
+// входящего main в вечерний пик, при том что у /ts/stream прямая отдача уже
+// есть; ноды такой поток отдать не могут (403 от secure_link бэкенда).
+var DirectRedirect func(plugin, target string, r *http.Request) (string, bool)
+
+// DirectRecorder — учёт потоков, ушедших напрямую (для сводки мощностей).
+var DirectRecorder func(plugin string)
+
 // TrafficRecorder is a callback set by httpapi to record proxy traffic stats.
 // Parameters: plugin name, bytes transferred, whether the response was an error.
 var TrafficRecorder func(plugin string, bytes int64, isError bool)
@@ -229,6 +315,11 @@ var ActiveStreamCounter func() func()
 // LatencyRecorder is a callback set by httpapi to record per-plugin proxy latency.
 // Parameters: plugin name, request elapsed duration, final HTTP status code.
 var LatencyRecorder func(plugin string, elapsed time.Duration, statusCode int)
+
+// OffloadRecorder is a callback set by httpapi, called when a stream is handed
+// to a node instead of being served here. Lets the dashboard show how much the
+// stream_edges allowlist actually takes off this instance.
+var OffloadRecorder func(plugin string)
 
 // CMCDRecorder is a callback set by httpapi to record Common Media Client Data
 // (CTA-5004) that a player attached to a segment request. This is the only place
@@ -288,8 +379,14 @@ type balancerClientEntry struct {
 }
 
 type Handler struct {
-	links          *proxylink.Manager
-	client         *http.Client
+	links  *proxylink.Manager
+	client *http.Client
+	// streamClient — клиент БЕЗ общего таймаута для живых IPTV-потоков: у
+	// http.Client{Timeout} дедлайн продолжает тикать после получения заголовков
+	// и обрывает чтение тела — raw-TS канал (один бесконечный HTTP-ответ)
+	// умирал ровно на 35-й секунде. Фазу коннекта+заголовков страхует
+	// контекстный таймер, тело — stallWatchdogBody (см. fetchWithMeta).
+	streamClient   *http.Client
 	proxiedClient  *http.Client    // proxied client (SOCKS5/VLESS) — legacy, first proxy
 	proxiedPlugins map[string]bool // all plugins that have a proxy configured
 	// manifestOnlyPlugins are plugins whose MANIFEST we rewrite but whose SEGMENTS
@@ -310,6 +407,11 @@ type Handler struct {
 	// Called for mirage/alloha/aladdin plugins on every segment request.
 	// Set by httpapi after handler creation. Key is typically tokenMovie.
 	EdgeHashLookup func(tokenMovie string) string
+
+	// nodeLabel — как этот сервер подписывает СВОИ ответы в X-Alpac-Node: плеер по нему
+	// понимает, с какой ноды пришёл сегмент, когда разбирает просадку (StreamDiag).
+	// edge_label из конфига, иначе хост edge_url, иначе hostname.
+	nodeLabel string
 }
 
 func New(cfg config.Config, links *proxylink.Manager) *Handler {
@@ -343,17 +445,30 @@ func New(cfg config.Config, links *proxylink.Manager) *Handler {
 	// Единственная настоящая поломка — hashless EXT-X-MAP (см. ниже): CDN дописывает ?hash= во все
 	// сегменты, но НЕ в init-сегмент, и тот один запрос 403-ит всё воспроизведение. Манифест мы
 	// переписываем и hash туда возвращаем, поэтому сегменты можно спокойно отдавать напрямую.
+	// Ноды, которым разрешено отдавать поток вместо primary (см. edge.go).
+	// Пустой список = поведение прежнее, всё отдаёт этот сервер.
+	configureEdges(cfg.ProxyLink.StreamEdges, cfg.ProxyLink.StreamEdgePlugins, cfg.ProxyLink.StreamEdgeExclude)
+	// Кому какую ноду не отдавать: имя ноды бывает закрыто провайдерами целой страны.
+	configureEdgeGeo(cfg.ProxyLink.StreamEdgeGeoDeny)
+	// Куда нода возвращает поток, который не смогла отдать. У primary это поле
+	// пустое, поэтому возврат там не включается и петли не возникает.
+	if cfg.Cluster.Mode == "node" {
+		configureEdgeFallback(cfg.Cluster.PrimaryHost)
+	}
+
 	h := &Handler{
 		links:                 links,
 		maxLengthM3U:          maxLen,
 		responseContentLength: cfg.ServerProxy.ResponseContentLength,
 		client:                httpclient.NewNoRedirect(35 * time.Second),
+		streamClient:          httpclient.NewNoRedirect(0),
 		proxiedClient:         proxiedClient,
 		proxiedPlugins:        proxiedPlugins,
 		manifestOnlyPlugins:   manifestOnly,
 		pidorezkaHost:         strings.TrimSpace(cfg.Online.PidoRezka.Host),
 		cdnHTTPProxy:          strings.TrimSpace(cfg.Online.CDNHTTPProxy),
 		hostCfg:               cfg.Host,
+		nodeLabel:             nodeLabelFor(cfg),
 	}
 	// Evict stale per-balancer clients every 5 minutes (idle > 10 min).
 	go h.evictStaleClients()
@@ -420,6 +535,17 @@ func (h *Handler) HandleProxy(w http.ResponseWriter, r *http.Request) {
 	target, meta, ok := h.resolveTarget(raw, r.URL.RawQuery, reqIP)
 	pluginName = meta.plugin
 	if !ok {
+		if meta.gone {
+			// 410 Gone, not 404: the link is a pre-TTL one that will never
+			// resolve again. 404 reads as "try again" to most players, and one
+			// client hammered a single dead IPTV token 622 times in an hour
+			// behind an endless spinner. The body names the fix so a human
+			// looking at the response sees it too.
+			statusCode = http.StatusGone
+			w.Header().Set("Cache-Control", "no-store")
+			http.Error(w, "link expired — refresh the playlist to get a fresh one", http.StatusGone)
+			return
+		}
 		log.Warn().Str("ip", reqIP).Str("raw", truncStr(raw, 80)).Msg("proxy: resolve failed")
 		statusCode = http.StatusNotFound
 		h.fallback(w, r)
@@ -434,6 +560,40 @@ func (h *Handler) HandleProxy(w http.ResponseWriter, r *http.Request) {
 		Str("range", r.Header.Get("Range")).
 		Str("ua", truncStr(r.Header.Get("User-Agent"), 80)).
 		Msg("proxy: request")
+
+	// Разгрузка primary: отдать поток нодой, а не собой (см. edge.go). Стоит
+	// ЗДЕСЬ, потому что плагин известен только после расшифровки токена, а
+	// выносить можно не всякий источник. Сессионные и привязанные к сети ссылки
+	// (IPTV) сюда не попадают по белому списку: их состояние живёт в памяти
+	// ВЫДАВШЕГО сервера, и на ноде такая ссылка получила бы «сессия неизвестна».
+	if DirectRedirect != nil && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
+		if loc, ok := DirectRedirect(meta.plugin, target, r); ok && loc != "" {
+			statusCode = http.StatusFound
+			if DirectRecorder != nil {
+				DirectRecorder(meta.plugin)
+			}
+			// Подпись протухает, бэкенд может смениться — кэшировать редирект нельзя.
+			w.Header().Set("Cache-Control", "no-store")
+			http.Redirect(w, r, loc, http.StatusFound)
+			return
+		}
+	}
+
+	if edge := pickEdge(meta.plugin, raw, r, meta.edge); edge != "" && edgeAlive(h.client, edge) {
+		dst := edge + r.URL.Path
+		if r.URL.RawQuery != "" {
+			dst += "?" + r.URL.RawQuery
+		}
+		statusCode = http.StatusFound
+		if OffloadRecorder != nil {
+			OffloadRecorder(meta.plugin)
+		}
+		log.Debug().Str("edge", edge).Str("plugin", meta.plugin).Msg("proxy: поток отдаёт нода")
+		// 302, а не 301: выбор ноды зависит от её живости и может смениться,
+		// а постоянный редирект клиенты и прокси кэшируют навсегда.
+		http.Redirect(w, r, dst, http.StatusFound)
+		return
+	}
 
 	// Player telemetry rides along on the request; record it before anything
 	// upstream can fail, so a stalling source still reports its stalls.
@@ -462,11 +622,63 @@ func (h *Handler) HandleProxy(w http.ResponseWriter, r *http.Request) {
 
 	resp, baseURI, err := h.fetchWithMeta(target, r, meta)
 	upstreamDone = time.Now()
+	if err == nil && baseURI != nil && baseURI.String() != target {
+		// Источник увёл нас на другой адрес (veoveo: список источников → плейлист
+		// на ротируемом edge). Относительные сегменты внутри плейлиста считаются
+		// от ТОГО адреса, откуда он реально пришёл, иначе они уйдут в никуда.
+		meta.baseURI = baseURI.String()
+	}
 	if err != nil {
 		log.Warn().Err(err).Str("target", truncStr(target, 120)).Msg("proxy request failed")
-		statusCode = http.StatusNotFound
-		h.fallback(w, r)
+		// Транспортная ошибка апстрима (таймаут, обрыв TCP, DNS) — это 502/504,
+		// а НЕ 404: для HLS-плеера 404 на сегменте означает «выпал из окна
+		// навсегда» (фатал без ретрая), 5xx — «временно, повтори». Моргнувший
+		// апстрим переставал быть поводом выбрасывать юзера из плеера.
+		statusCode = upstreamErrStatus(err)
+		http.Error(w, "upstream error", statusCode)
 		return
+	}
+
+	// Протухший билет апстрима: 401/403 у источника, который умеет
+	// переминтить. «Мир кино» отдаёт mediaSourceId со сроком ~60 секунд, а
+	// наш /proxy-токен живёт 36 часов — зритель доигрывает до первой
+	// перемотки и ловит 401. Здесь мы один раз просим у источника свежий
+	// адрес и повторяем запрос: зритель видит продолжение фильма, а не
+	// чёрный экран.
+	//
+	// Ровно один повтор и только пока клиенту ещё ничего не отправлено.
+	// HEAD тоже лечим: плееры проверяют им длину перед перемоткой.
+	//
+	// 429 — тоже сюда: CDN Filmix закрепляет подпись поста за первым IP учётки и
+	// остальным отвечает 429 на часы; тот же файл, подписанный ДРУГОЙ учёткой, с
+	// этого адреса играет (litesrc/filmix_remint.go). Без этого нода возвращала
+	// зрителя на primary, где подпись для main так же чужая.
+	if (r.Method == http.MethodGet || r.Method == http.MethodHead) &&
+		(resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden ||
+			resp.StatusCode == http.StatusTooManyRequests) &&
+		proxylink.HasTargetRefresher(meta.plugin) {
+		if fresh, ok := proxylink.RefreshTarget(r.Context(), meta.plugin, target); ok {
+			resp.Body.Close()
+			log.Info().
+				Str("plugin", meta.plugin).
+				Int("was_status", resp.StatusCode).
+				Str("stale", truncStr(target, 100)).
+				Str("fresh", truncStr(fresh, 100)).
+				Msg("proxy: билет апстрима протух — переминтили и повторяем")
+			target = fresh
+			meta.baseURI = fresh
+			resp, baseURI, err = h.fetchWithMeta(target, r, meta)
+			if err != nil {
+				log.Warn().Err(err).Str("target", truncStr(target, 120)).
+					Msg("proxy: повтор после переминта не удался")
+				statusCode = upstreamErrStatus(err)
+				http.Error(w, "upstream error", statusCode)
+				return
+			}
+			if baseURI != nil && baseURI.String() != target {
+				meta.baseURI = baseURI.String()
+			}
+		}
 	}
 
 	// Retry on upstream 5xx (GET only, before body is streamed to client).
@@ -484,8 +696,8 @@ func (h *Handler) HandleProxy(w http.ResponseWriter, r *http.Request) {
 			resp, baseURI, err = h.fetchWithMeta(target, r, meta)
 			if err != nil {
 				log.Warn().Err(err).Int("retry", retry+1).Str("target", truncStr(target, 120)).Msg("proxy: retry failed")
-				statusCode = http.StatusNotFound
-				h.fallback(w, r)
+				statusCode = upstreamErrStatus(err)
+				http.Error(w, "upstream error", statusCode)
 				return
 			}
 			if !isRetryableStatus(resp.StatusCode) {
@@ -627,6 +839,29 @@ func (h *Handler) HandleProxy(w http.ResponseWriter, r *http.Request) {
 		logEvt.Msg("proxy: upstream blocked playback")
 	}
 
+	// Не смогли отдать — вернуть запрос primary, пусть отдаст сам.
+	// Ровно этим отличается «источник не пускает ноду» от сломанного просмотра:
+	// зритель платит один переход, а не чёрный экран (см. edgeGiveBack).
+	if back := edgeGiveBack(r, resp.StatusCode, resp.Header.Get("Content-Type")); back != "" {
+		upHost := ""
+		if baseURI != nil {
+			upHost = baseURI.Host
+		}
+		// upstream_host — КТО именно не пустил ноду. Без него по журналу видно
+		// лишь «hdvb вернулся», а решать, через какой выход вести источник с
+		// этой ноды, можно только зная хост CDN.
+		log.Warn().Int("status", resp.StatusCode).Str("plugin", meta.plugin).
+			Str("content_type", resp.Header.Get("Content-Type")).
+			Str("upstream_host", upHost).
+			Bool("via_proxy", meta.plugin != "" && httpclient.TransportForBalancer(meta.plugin) != nil).
+			Msg("proxy: нода не смогла отдать, возвращаю запрос primary")
+		_ = resp.Body.Close()
+		statusCode = http.StatusFound
+		recordTraffic(meta.plugin, 0, resp.StatusCode)
+		http.Redirect(w, r, back, http.StatusFound)
+		return
+	}
+
 	targetLower := strings.ToLower(meta.baseURI)
 	if !isTS && (strings.Contains(pathLower, ".m3u") || strings.Contains(targetLower, ".m3u") || ct == "application/x-mpegurl" || ct == "application/vnd.apple.mpegurl" || ct == "text/plain") {
 		statusCode = resp.StatusCode
@@ -665,6 +900,10 @@ func truncStr(s string, max int) string {
 	return s[:max] + "…"
 }
 
+// dashSIDSep отделяет sid потока от зашифрованного base в пути /proxy-dash.
+// Не точка: Decrypt срезает всё после последней точки как расширение файла.
+const dashSIDSep = "~s~"
+
 func (h *Handler) HandleDash(w http.ResponseWriter, r *http.Request) {
 	reqIP := requestIP(r)
 	rest := strings.TrimPrefix(r.URL.Path, "/proxy-dash/")
@@ -676,17 +915,39 @@ func (h *Handler) HandleDash(w http.ResponseWriter, r *http.Request) {
 
 	baseRaw := parts[0]
 	tail := parts[1]
+	sid := ""
+	if i := strings.LastIndex(baseRaw, dashSIDSep); i > 0 {
+		if v, err := url.PathUnescape(baseRaw[i+len(dashSIDSep):]); err == nil {
+			sid = v
+		}
+		baseRaw = baseRaw[:i]
+	}
 	var baseURI string
-	meta := linkMeta{reqIP: reqIP, verifyIP: true}
+	meta := linkMeta{reqIP: reqIP, verifyIP: true, sid: sid}
 
 	if target, ok := decodeDirectTarget(baseRaw, ""); ok {
 		baseURI = target
 	} else if h.links != nil {
 		if model := h.links.Decrypt(baseRaw, reqIP); model != nil && strings.TrimSpace(model.URI) != "" {
+			// Тот же гейт сессии, что и на /proxy: без него сегменты DASH
+			// оставались бы голыми предъявительскими ссылками в обход всей
+			// сверки. Ручка в проде пока не используется (0 запросов), но
+			// незакрытой дырке незачем ждать первого DASH-канала.
+			if h.links.RequiresSession(model.Plugin) {
+				if reason := h.links.CheckSession(sid, reqIP); reason != "" {
+					log.Info().Str("reqip", reqIP).Str("plugin", model.Plugin).
+						Str("reason", reason).Bool("session", true).
+						Msg("proxy-dash: поток погашен сверкой сессии")
+					w.Header().Set("Cache-Control", "no-store")
+					http.Error(w, "link expired — refresh the playlist to get a fresh one", http.StatusGone)
+					return
+				}
+			}
 			baseURI = strings.TrimSpace(model.URI)
 			meta.plugin = model.Plugin
 			meta.verifyIP = model.VerifyIP
 			meta.headers = model.Headers
+			meta.edge = model.Edge
 		}
 	}
 	if baseURI == "" {
@@ -743,14 +1004,40 @@ type linkMeta struct {
 	headers  map[string]string // custom upstream headers from proxylink payload
 	cbcsKey  []byte            // CBCS decryption key (16 bytes)
 	cbcsIV   []byte            // CBCS constant IV (16 bytes)
+	// gone marks a failure that can never succeed on retry (a pre-TTL link
+	// for a plugin that now requires an expiry) so the caller answers 410.
+	gone bool
+	// sid — потоковая сессия запроса. Все ссылки, отчеканенные при разборе
+	// этого манифеста, обязаны его унести: гейт fail-closed, и сегмент без
+	// sid был бы отвергнут вместе с живым потоком.
+	sid  string
+	edge string // нода, добывшая ссылку (Model.Edge); "" = primary
+
+}
+
+// withSID вешает sid потока на готовую /proxy-ссылку. Отдельный помощник, а не
+// три копии по месту: пропущенная копия молча выключила бы сверку на сегментах,
+// оставив гейт только на манифесте.
+func withSID(u, sid string) string {
+	if sid == "" || u == "" {
+		return u
+	}
+	sep := "?"
+	if strings.Contains(u, "?") {
+		sep = "&"
+	}
+	return u + sep + "sid=" + url.QueryEscape(sid)
 }
 
 func (h *Handler) resolveTarget(raw, rawQuery, reqIP string) (string, linkMeta, bool) {
 	meta := linkMeta{reqIP: reqIP, verifyIP: true}
 	pluginFromQuery := ""
+	sid := ""
 	if q, err := url.ParseQuery(rawQuery); err == nil {
 		pluginFromQuery = strings.ToLower(strings.TrimSpace(q.Get("pl")))
+		sid = strings.TrimSpace(q.Get("sid"))
 	}
+	meta.sid = sid
 	cleanQuery := sanitizeProxyRawQuery(rawQuery)
 	if target, ok := decodeDirectTarget(raw, cleanQuery); ok {
 		// Direct /proxy/<urlencoded-url> mode is used by several browser-facing
@@ -777,11 +1064,32 @@ func (h *Handler) resolveTarget(raw, rawQuery, reqIP string) (string, linkMeta, 
 			if model := h.links.Decrypt(candidate, reqIP); model != nil && strings.TrimSpace(model.URI) != "" {
 				target := strings.TrimSpace(model.URI)
 				meta.plugin = model.Plugin
+				// Гейт потоковой сессии: ссылка живёт, только пока живёт её
+				// поток. Несостыковка (чужая/чередующаяся сеть, погашенная или
+				// неизвестная сессия) гасит поток целиком — до перезапроса
+				// /api/iptv/play. Проверяем ПОСЛЕ расшифровки: раньше не знаем
+				// плагина, а гейт нужен не всем источникам.
+				if h.links.RequiresSession(model.Plugin) {
+					if reason := h.links.CheckSession(sid, reqIP); reason != "" {
+						meta.gone = true
+						log.Info().
+							Str("reqip", reqIP).
+							Str("plugin", model.Plugin).
+							Str("reason", reason).
+							Bool("session", true).
+							Msg("proxy: поток погашен сверкой сессии")
+						return "", meta, false
+					}
+				}
 				meta.verifyIP = model.VerifyIP
 				meta.baseURI = target
 				meta.headers = model.Headers
+				meta.edge = model.Edge
 				meta.cbcsKey = model.CBCSKey
 				meta.cbcsIV = model.CBCSIV
+				if cleanQuery != "" {
+					cleanQuery = sanitizeProxyTokenQuery(cleanQuery)
+				}
 				if cleanQuery != "" {
 					if strings.Contains(target, "?") {
 						target += "&" + cleanQuery
@@ -795,6 +1103,27 @@ func (h *Handler) resolveTarget(raw, rawQuery, reqIP string) (string, linkMeta, 
 		// Debug: log why each candidate failed decryption.
 		for _, candidate := range candidates {
 			reason := h.links.DebugDecrypt(candidate, reqIP)
+			if proxylink.IsEternalRejection(reason) || proxylink.IsForeignNetworkRejection(reason) ||
+				proxylink.IsExpiredRejection(reason) {
+				// Permanent: истёкший срок, чужая сеть или вечная ссылка у
+				// плагина с обязательным TTL. Marked so the caller answers 410
+				// instead of 404 — retrying can never help, and players that
+				// treat 404 as "try again" spin forever on it. По 410 наш
+				// клиент перезапрашивает /api/iptv/play и играет дальше
+				// (замерено 2026-09-02: восстановление за 4 секунды).
+				meta.gone = true
+				// Info, не Debug: на проде debug выключен, и единственный
+				// след того, ЧТО именно отбито — вечная ссылка или чужая
+				// сеть — пропадал. Событие редкое (единицы в минуту) и это
+				// ровно та метрика, ради которой привязка вводилась.
+				log.Info().
+					Str("candidate", truncStr(candidate, 120)).
+					Str("reqip", reqIP).
+					Str("reason", reason).
+					Bool("foreign_net", proxylink.IsForeignNetworkRejection(reason)).
+					Msg("proxy: link permanently rejected")
+				continue
+			}
 			log.Warn().
 				Str("candidate", truncStr(candidate, 120)).
 				Str("reqip", reqIP).
@@ -819,12 +1148,43 @@ func sanitizeProxyRawQuery(rawQuery string) string {
 
 	for key := range q {
 		switch strings.ToLower(strings.TrimSpace(key)) {
-		case "uid", "user_uid", "box_mac", "spid", "lampac_token", "pl":
+		case "uid", "user_uid", "box_mac", "spid", "lampac_token", "pl", "sid":
 			q.Del(key)
 		case "cmcd":
 			// Client telemetry is for us, not for the CDN. Forwarding it would
 			// append an unexpected argument to signed upstream URLs — exactly
 			// the class of change that turns a working stream into a 403.
+			q.Del(key)
+		case edgeNoRetry, edgeHint:
+			// Служебные параметры выноса на ноды (см. edge.go). Тот же класс
+			// ошибки: videodb подписывает URL (hash+expires), и «&_noedge=1»,
+			// доехав до CDN, превращал рабочий поток в 403 — причём именно на
+			// возврате с ноды, то есть у самого страховочного механизма.
+			q.Del(key)
+		}
+	}
+	return q.Encode()
+}
+
+// sanitizeProxyTokenQuery — query клиента для AES-ссылки: всё, что вырезает
+// sanitizeProxyRawQuery, плюс наш токен пользователя. Внешние плееры (MX/ViMu/IPTV-плееры)
+// получали ссылки с «?token=» — клиенты дописывали его к любому адресу своего хоста, включая
+// /proxy, — и здесь он приклеивался к адресу апстрима: токен уезжал на чужой CDN, а подписанные
+// ссылки (hash+expires) от лишнего параметра отвечали 403. Настоящий адрес апстрима целиком
+// лежит в зашифрованном payload, так что «token» в query AES-ссылки — всегда наш.
+// Прямой режим (/proxy/<url>) не трогаем: там query может быть частью самого адреса CDN.
+func sanitizeProxyTokenQuery(rawQuery string) string {
+	clean := sanitizeProxyRawQuery(rawQuery)
+	if clean == "" || !strings.Contains(clean, "token") {
+		return clean
+	}
+	q, err := url.ParseQuery(clean)
+	if err != nil {
+		return clean
+	}
+	for key := range q {
+		switch strings.ToLower(strings.TrimSpace(key)) {
+		case "token", "alpac_token":
 			q.Del(key)
 		}
 	}
@@ -833,6 +1193,40 @@ func sanitizeProxyRawQuery(rawQuery string) string {
 
 func (h *Handler) fetch(target string, in *http.Request) (*http.Response, *url.URL, error) {
 	return h.fetchWithMeta(target, in, linkMeta{})
+}
+
+// nodeLabelFor — подпись этого сервера для X-Alpac-Node (см. Handler.nodeLabel).
+func nodeLabelFor(cfg config.Config) string {
+	if l := strings.TrimSpace(cfg.Cluster.EdgeLabel); l != "" {
+		return l
+	}
+	if u, err := url.Parse(strings.TrimSpace(cfg.Cluster.EdgeURL)); err == nil && u.Host != "" {
+		return u.Host
+	}
+	hn, _ := os.Hostname()
+	return hn
+}
+
+// stampDiag дописывает в ответ апстрима заголовки диагностики для плеера:
+//   - X-Alpac-Up-Ms — сколько ЭТОТ сервер ждал апстрим до заголовков (TTFB);
+//   - X-Alpac-Node  — кто отдал (подпись ноды);
+//   - X-Alpac-Src   — балансер (плеер и так знает, чей поток играет — это для сверки).
+//
+// Клиент меряет свой TTFB на том же сегменте; разница «у нас 3 с, апстрим 100 мс» —
+// это путь до ноды (провайдер режет), а «апстрим 3 с» — балансер. Без этих цифр обе
+// просадки выглядят одинаково: спиннер. Заголовки уходят через copyHeadersFiltered
+// вместе с остальными, отдельных точек записи не нужно.
+func stampDiag(resp *http.Response, since time.Time, node, plugin string) {
+	if resp == nil {
+		return
+	}
+	resp.Header.Set("X-Alpac-Up-Ms", strconv.FormatInt(time.Since(since).Milliseconds(), 10))
+	if node != "" {
+		resp.Header.Set("X-Alpac-Node", node)
+	}
+	if plugin != "" {
+		resp.Header.Set("X-Alpac-Src", plugin)
+	}
 }
 
 // ProbeUpstream fetches the first bytes of a resolved stream url EXACTLY as HandleProxy would
@@ -1134,8 +1528,9 @@ func (h *Handler) fetchWithMeta(target string, in *http.Request, meta linkMeta) 
 	// front-end nginx stamped on the inbound request (X-Real-IP / X-Forwarded-For = the
 	// end-user's real IP) straight to the CDN. Strip every client-IP-bearing header so the
 	// provider only ever sees THIS server's single egress IP — i.e. one device.
-	if strings.EqualFold(meta.plugin, "iptv") {
+	if isIPTVPlugin(meta.plugin) {
 		stripClientIdentityHeaders(req.Header)
+		applyIPTVHeaderPolicy(req.Header, meta.headers)
 	}
 	if isObrutCDNPlugin(meta.plugin) && isZetflixObrutCDNURL(u) {
 		// Obrut CDN stream endpoint is a redirect resolver; byte ranges here often
@@ -1281,7 +1676,47 @@ func (h *Handler) fetchWithMeta(target string, in *http.Request, meta linkMeta) 
 			Msg("vibix: proxy upstream request")
 	}
 
+	// IPTV: живой эфир бывает ОДНИМ бесконечным HTTP-ответом (raw MPEG-TS,
+	// Xtream-панели) — общий client.Timeout=35s рубил такой канал ровно на
+	// 35-й секунде. Меняем клиент на безлимитный: заголовки страхует таймер на
+	// контексте, тело — stall-watchdog (ни байта streamStallTimeout → Close).
+	var armStreamGuard func(*http.Response)
+	if isIPTVPlugin(meta.plugin) {
+		switch {
+		case client == h.client:
+			client = h.streamClient
+		case client.Timeout != 0:
+			// IPTV через прокси (proxycore/SOCKS5): клиент тут НЕ h.client, и
+			// раньше подмена не срабатывала — проксированный живой эфир рвался
+			// на 35-й секунде. Берём тот же транспорт (пул соединений общий),
+			// снимая только общий таймаут; заголовки и стоп-кадр по-прежнему
+			// страхуют hdrTimer и stall-watchdog ниже.
+			noTimeout := *client
+			noTimeout.Timeout = 0
+			client = &noTimeout
+		}
+		guardCtx, guardCancel := context.WithCancel(in.Context())
+		hdrTimer := time.AfterFunc(streamHeaderTimeout, guardCancel)
+		req = req.Clone(guardCtx)
+		armStreamGuard = func(resp *http.Response) {
+			hdrTimer.Stop()
+			if resp == nil {
+				guardCancel()
+				return
+			}
+			resp.Body = newStallWatchdogBody(resp.Body, streamStallTimeout, guardCancel)
+		}
+	}
+
+	upSince := time.Now() // TTFB апстрима для X-Alpac-Up-Ms (stampDiag на каждом успешном выходе)
 	resp, err := client.Do(req)
+	if armStreamGuard != nil {
+		if err != nil {
+			armStreamGuard(nil)
+		} else {
+			armStreamGuard(resp)
+		}
+	}
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1318,6 +1753,65 @@ func (h *Handler) fetchWithMeta(target string, in *http.Request, meta linkMeta) 
 				return nil, nil, err2
 			}
 			resp, u, req = resp2, next, req2
+		}
+	}
+
+	// veoveo: часть вариантов вместо плейлиста отдаёт 200 и JSON вида
+	// {"sources":[{"link":<content-router>,"isDefault":..}]}, а сам плейлист
+	// лежит за 307 внутри link. Плееру такой ответ не годится — он говорит
+	// «источник отказал» и роняет просмотр (инцидент 0903-232615). Идём по
+	// ссылке сами и отдаём уже плейлист; базой для относительных сегментов
+	// станет конечный адрес (возвращаемый u), см. вызов fetchWithMeta.
+	if strings.EqualFold(meta.plugin, "veoveo") && resp.StatusCode >= 200 && resp.StatusCode < 300 &&
+		strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "json") {
+		peek, rerr := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+		resp.Body.Close()
+		if rerr != nil {
+			return nil, nil, rerr
+		}
+		link := pickSourceLink(peek)
+		if link == "" {
+			// Не наш формат — отдаём как было, пусть возврат на primary/плеер решают.
+			resp.Body = io.NopCloser(bytes.NewReader(peek))
+		} else {
+			cur, perr := u.Parse(link)
+			if perr != nil {
+				return nil, nil, perr
+			}
+			var resp2 *http.Response
+			for hops := 0; hops < 6; hops++ {
+				req2, err2 := http.NewRequestWithContext(in.Context(), http.MethodGet, cur.String(), nil)
+				if err2 != nil {
+					return nil, nil, err2
+				}
+				for k, vals := range req.Header {
+					for _, v := range vals {
+						req2.Header.Add(k, v)
+					}
+				}
+				req2.Host = cur.Host
+				r2, e2 := client.Do(req2)
+				if e2 != nil {
+					return nil, nil, e2
+				}
+				if isHTTPRedirect(r2.StatusCode) {
+					loc := strings.TrimSpace(r2.Header.Get("Location"))
+					r2.Body.Close()
+					next, lerr := cur.Parse(loc)
+					if loc == "" || lerr != nil {
+						return nil, nil, fmt.Errorf("veoveo: bad redirect from source-list link")
+					}
+					cur = next
+					continue
+				}
+				resp2, req = r2, req2
+				break
+			}
+			if resp2 == nil {
+				return nil, nil, fmt.Errorf("veoveo: too many redirects behind source-list link")
+			}
+			log.Info().Str("final", truncStr(cur.String(), 120)).Msg("veoveo: source-list followed to playlist")
+			resp, u = resp2, cur
 		}
 	}
 
@@ -1375,6 +1869,7 @@ func (h *Handler) fetchWithMeta(target string, in *http.Request, meta linkMeta) 
 			}
 			if resp2.StatusCode != http.StatusNotFound {
 				resp.Body.Close()
+				stampDiag(resp2, upSince, h.nodeLabel, meta.plugin)
 				return resp2, altBase, nil
 			}
 			resp2.Body.Close()
@@ -1413,17 +1908,117 @@ func (h *Handler) fetchWithMeta(target string, in *http.Request, meta linkMeta) 
 			if resp2.StatusCode != http.StatusNotFound {
 				log.Info().Str("alt", truncStr(alt, 120)).Int("status", resp2.StatusCode).Msg("proxy: voidboost fallback succeeded")
 				resp.Body.Close()
+				stampDiag(resp2, upSince, h.nodeLabel, meta.plugin)
 				return resp2, altBase, nil
 			}
 			resp2.Body.Close()
 		}
 	}
+	stampDiag(resp, upSince, h.nodeLabel, meta.plugin)
 	return resp, u, nil
+}
+
+// relayVerbatim отдаёт ответ апстрима без изменений. head — уже вычитанные байты
+// (может быть nil), они уходят перед остатком тела.
+func relayVerbatim(w http.ResponseWriter, resp *http.Response, head []byte) {
+	copyHeadersFiltered(w.Header(), resp.Header)
+	if ct := resp.Header.Get("Content-Type"); ct != "" {
+		w.Header().Set("Content-Type", ct)
+	}
+	if cl := resp.Header.Get("Content-Length"); cl != "" {
+		w.Header().Set("Content-Length", cl)
+	}
+	w.WriteHeader(resp.StatusCode)
+	if len(head) > 0 {
+		if _, err := w.Write(head); err != nil {
+			return
+		}
+	}
+	_, _ = io.Copy(w, resp.Body)
+}
+
+// firstLineWith возвращает первую строку, содержащую подстроку — для образца в логе.
+func firstLineWith(src, needle string) string {
+	for _, line := range strings.Split(src, "\n") {
+		if strings.Contains(line, needle) {
+			return strings.TrimSpace(line)
+		}
+	}
+	return ""
+}
+
+// looksLikePlaylist reports whether a body is an HLS playlist. RFC 8216 требует
+// первой строкой #EXTM3U, поэтому проверка дешёвая и надёжная; допускаются лишь
+// BOM и ведущие пробелы, которые встречаются у части CDN.
+// gunzipUnsolicited распаковывает плейлист, который источник сжал БЕЗ запроса
+// (мы шлём Accept-Encoding: identity, и Go такой ответ сам не распаковывает).
+// Так делает заглушка cinerama (`/blocked/index.m3u8`, 175 байт `1f 8b`): без
+// распаковки бинарник уезжал зрителю как плейлист, и mpv/ExoPlayer падали с
+// «unrecognized file format». Сегменты не трогаем — только текст плейлистов.
+func gunzipUnsolicited(body []byte, resp *http.Response) []byte {
+	if len(body) < 2 || body[0] != 0x1f || body[1] != 0x8b {
+		return body
+	}
+	if resp != nil && resp.Uncompressed {
+		return body
+	}
+	zr, err := gzip.NewReader(bytes.NewReader(body))
+	if err != nil {
+		return body
+	}
+	defer zr.Close()
+	out, err := io.ReadAll(io.LimitReader(zr, 4<<20))
+	if err != nil || len(out) == 0 {
+		return body
+	}
+	return out
+}
+
+func looksLikePlaylist(body []byte) bool {
+	b := bytes.TrimPrefix(body, []byte{0xEF, 0xBB, 0xBF})
+	return bytes.HasPrefix(bytes.TrimLeft(b, " \t\r\n"), []byte("#EXTM3U"))
 }
 
 func (h *Handler) handleM3U(w http.ResponseWriter, r *http.Request, resp *http.Response, meta linkMeta, preTarget string) {
 	// Cache key: upstream URL + plugin (different plugins rewrite differently).
 	cacheKey := resp.Request.URL.String() + "|" + meta.plugin
+
+	// Апстрим отказал по лимиту или своей аварии, а у нас есть свежий удачный манифест
+	// ЭТОГО же канала — отдаём его вместо ошибки.
+	//
+	// Зачем: у живых IPTV-источников лимит считается на IP, и весь наш зал зрителей уходит
+	// к ним с ОДНОГО адреса main. Замерено 2026-09-08 на stream.mcquack.net: с main проходит
+	// 4 запроса за 8 секунд, пятый — 429, при этом с любой ноды (другой IP) сразу 200. Отказ
+	// доезжал до плеера как ERROR_CODE_IO_BAD_HTTP_STATUS, зритель жал «повторить», и это
+	// давало новый запрос — лимит не отпускал никогда: за сутки 433 обращения к этому хосту
+	// и 433 отказа, а каналы Okko дали треть всех жалоб на просадки в netdiag.
+	//
+	// Подменённый манифест кладём и в основной кэш на пару секунд: тогда следующие зрители
+	// обслуживаются из него ДО похода наверх (предвыборка в HandleProxy смотрит туда же), и
+	// наша частота запросов сама опускается под лимит источника.
+	if isIPTVPlugin(meta.plugin) && (resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500) {
+		if stale, ok := m3uLastGoodGet(cacheKey); ok {
+			_ = resp.Body.Close()
+			noteM3UStale(meta.plugin, cacheKey, resp.StatusCode)
+			serve := stale
+			serve.statusCode = http.StatusOK
+			m3uCacheSetTTL(cacheKey, serve, 2*time.Second)
+			if preTarget != "" {
+				if preKey := preTarget + "|" + meta.plugin; preKey != cacheKey {
+					m3uCacheSetTTL(preKey, serve, 2*time.Second)
+				}
+			}
+			for k, vs := range serve.headers {
+				for _, v := range vs {
+					w.Header().Set(k, v)
+				}
+			}
+			w.Header().Set("Content-Length", strconv.Itoa(len(serve.body)))
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(serve.body)
+			return
+		}
+	}
 
 	// Check cache first — saves both upstream fetch AND regex rewrite.
 	if cached, ok := m3uCacheGet(cacheKey); ok {
@@ -1439,21 +2034,72 @@ func (h *Handler) handleM3U(w http.ResponseWriter, r *http.Request, resp *http.R
 		return
 	}
 
+	// Крупное тело — это НЕ плейлист. Сюда попадают и медиа-сегменты: выбор ветки
+	// делается по подстроке ".m3u" в пути, а у HLS-сегментов YouTube путь выглядит
+	// как «…/file/index.m3u8/sq/7/…». Раньше такой сегмент отбивался 503 «bigfile»
+	// и воспроизведение вставало. Плейлисты столько не весят, поэтому отдаём как
+	// есть, ничего не переписывая.
 	if resp.ContentLength > h.maxLengthM3U && resp.ContentLength > 0 {
-		http.Error(w, "bigfile", http.StatusServiceUnavailable)
+		relayVerbatim(w, resp, nil)
 		return
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, h.maxLengthM3U+1))
+	body = gunzipUnsolicited(body, resp)
 	if err != nil {
 		http.Error(w, "error array m3u8", http.StatusServiceUnavailable)
 		return
 	}
 	if int64(len(body)) > h.maxLengthM3U {
-		http.Error(w, "bigfile", http.StatusServiceUnavailable)
+		// Размер узнали только по факту чтения (апстрим не прислал Content-Length):
+		// уже прочитанное отдаём вместе с остатком, иначе получился бы обрезанный файл.
+		relayVerbatim(w, resp, body)
+		return
+	}
+
+	// Сюда попадают и НЕ-плейлисты: выбор делается по подстроке ".m3u" в пути или
+	// в апстрим-URL, а у HLS-сегментов YouTube путь выглядит как
+	// «…/file/index.m3u8/sq/7/…» — то есть содержит .m3u8, оставаясь двоичным
+	// видео. Переписывание такого тела вставляло прокси-ссылки прямо внутрь
+	// MP4/TS: ffmpeg потом ругался «Invalid data found when processing input»,
+	// а плеер не находил кодек («Video: none, none»).
+	//
+	// Плейлист по RFC 8216 обязан начинаться с #EXTM3U, поэтому решаем по
+	// СОДЕРЖИМОМУ, а не по имени: не плейлист — отдаём байт в байт как есть.
+	if !looksLikePlaylist(body) {
+		// Единственный оставшийся путь, где наружу может уйти НЕпереписанный
+		// плейлист: тело не опознано как плейлист и отдаётся как есть. Для
+		// медиа-сегмента это правильно, но если внутри лежат ссылки на CDN —
+		// значит опознание промахнулось, и клиент сейчас получит CORS.
+		if bytes.Contains(body, []byte("googlevideo.com")) {
+			head := body
+			if len(head) > 80 {
+				head = head[:80]
+			}
+			log.Warn().Int("байт", len(body)).Str("plugin", meta.plugin).
+				Str("начало", truncStr(string(head), 80)).
+				Str("образец", truncStr(firstLineWith(string(body), "googlevideo.com"), 160)).
+				Msg("proxy: тело не опознано как плейлист, но содержит ссылки на CDN — отдаю как есть")
+		}
+		copyHeadersFiltered(w.Header(), resp.Header)
+		if ct := resp.Header.Get("Content-Type"); ct != "" {
+			w.Header().Set("Content-Type", ct)
+		}
+		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+		w.WriteHeader(resp.StatusCode)
+		_, _ = w.Write(body)
 		return
 	}
 
 	rewritten := h.rewriteM3U(string(body), r, meta)
+	// После переписывания прямых googlevideo-ссылок остаться не должно: у CDN нет
+	// Access-Control-Allow-Origin, и браузер упрётся в CORS. Если что-то уцелело —
+	// значит строка не подошла под reHTTPLinks; печатаем образец, иначе причину
+	// не восстановить (в логах виден только запрос клиента, уже ушедший мимо нас).
+	if n := strings.Count(rewritten, "googlevideo.com"); n > 0 {
+		log.Warn().Int("осталось", n).Str("plugin", meta.plugin).
+			Str("образец", truncStr(firstLineWith(rewritten, "googlevideo.com"), 200)).
+			Msg("proxy: в переписанном плейлисте остались прямые ссылки на CDN")
+	}
 	out := []byte(rewritten)
 	copyHeadersFiltered(w.Header(), resp.Header)
 	// Always force correct Content-Type for m3u8. Some CDNs return text/html
@@ -1472,11 +2118,15 @@ func (h *Handler) handleM3U(w http.ResponseWriter, r *http.Request, resp *http.R
 		hdr := make(http.Header)
 		hdr.Set("Content-Type", "application/vnd.apple.mpegurl")
 		ttl := m3uCacheTTL
-		if strings.EqualFold(meta.plugin, "iptv") && !strings.Contains(rewritten, "#EXT-X-ENDLIST") {
+		if isIPTVPlugin(meta.plugin) && !strings.Contains(rewritten, "#EXT-X-ENDLIST") {
 			ttl = 2 * time.Second
 		}
 		entry := m3uCacheEntry{body: out, statusCode: resp.StatusCode, headers: hdr}
 		m3uCacheSetTTL(cacheKey, entry, ttl)
+		// Копия на случай отказа апстрима: живёт дольше основного кэша (см. m3uLastGood).
+		if isIPTVPlugin(meta.plugin) {
+			m3uLastGoodSet(cacheKey, entry)
+		}
 		// Also cache under the PRE-redirect target: HandleProxy's pre-fetch lookup uses it, letting
 		// concurrent viewers skip the upstream round-trip entirely (the entry body is shared, not copied).
 		if preTarget != "" {
@@ -1496,6 +2146,7 @@ func (h *Handler) handleMPD(w http.ResponseWriter, r *http.Request, resp *http.R
 		return
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, h.maxLengthM3U+1))
+	body = gunzipUnsolicited(body, resp)
 	if err != nil {
 		http.Error(w, "error array mpd", http.StatusServiceUnavailable)
 		return
@@ -1513,8 +2164,20 @@ func (h *Handler) handleMPD(w http.ResponseWriter, r *http.Request, resp *http.R
 		}
 		base := m[1]
 		enc := h.encrypt(base, meta, true, false)
+		// sid едет в ПУТИ, а не в query: плеер клеит имя сегмента прямо к
+		// BaseURL, и "?sid=X" слилось бы с именем файла в мусор.
+		if meta.sid != "" {
+			enc += dashSIDSep + url.PathEscape(meta.sid)
+		}
 		return strings.Replace(match, base, h.streamHostFromRequest(r)+"/proxy-dash/"+enc+"/", 1)
 	})
+	// Живой DASH сплошь и рядом идёт БЕЗ <BaseURL>, а пути сегментов лежат
+	// относительными прямо в SegmentTemplate (Первый канал: media="../../../
+	// dash-live2/…$Number%09d$.mp4"). Без правки плеер резолвит их относительно
+	// НАШЕГО /proxy/<hash> и уходит в никуда. Делаем их абсолютными на
+	// вещателя: манифест остаётся проксированным (у него нет CORS), а сегменты
+	// плеер берёт напрямую — там CORS отдают, и наш трафик на них не тратится.
+	mpd = absolutizeMPDPaths(mpd, meta.baseURI)
 
 	out := []byte(mpd)
 	copyHeadersFiltered(w.Header(), resp.Header)
@@ -1529,6 +2192,8 @@ func (h *Handler) handleMPD(w http.ResponseWriter, r *http.Request, resp *http.R
 
 func (h *Handler) rewriteM3U(src string, r *http.Request, meta linkMeta) string {
 	proxyHost := h.streamHostFromRequest(r) + "/proxy"
+	edgeHintOf := EdgeHintFrom(r)      // выбор ноды зрителем едет и в сегменты (см. WithEdge)
+	edgeSkipOf := EdgeSkipEffective(r) // отключённые зрителем ноды — туда же
 	hlsHost := extractHLSHost(meta.baseURI)
 	hlsPatch := extractHLSPatch(meta.baseURI)
 
@@ -1552,6 +2217,18 @@ func (h *Handler) rewriteM3U(src string, r *http.Request, meta linkMeta) string 
 	// the client unrepaired.
 	directSegments := h.manifestOnlyPlugins[strings.ToLower(strings.TrimSpace(meta.plugin))]
 
+	// ★Диагностика: CDN-раздел, не дописывающий hash в сегменты, нельзя отдавать зрителю прямой
+	// ссылкой — его плеер пойдёт без hash и получит 403 (2026-08-22, раздел UHD_1313). Ручной
+	// список таких разделов живёт в httpapi/stream_proxy.go (filmixNoHashDirRe) и пополняется по
+	// этому логу: правила, отличающего дефектный раздел от исправного, у CDN нет.
+	if strings.EqualFold(meta.plugin, "filmix") && inheritHash != "" &&
+		strings.Contains(src, "http") && !strings.Contains(src, "hash=") {
+		if m := filmixCDNDirRe.FindStringSubmatch(meta.baseURI); len(m) == 2 {
+			log.Warn().Str("dir", m[1]).
+				Msg("filmix: CDN-раздел отдаёт сегменты БЕЗ hash — прямая отдача зрителю сломается")
+		}
+	}
+
 	// fMP4 (EXT-X-MAP) раньше здесь безусловно возвращался в полное проксирование — считалось, что
 	// его сегменты IP-привязаны. Для filmix измерено обратное (см. New): с постороннего IP и init
 	// с дописанным hash, и сегменты отдают 206. Ломает воспроизведение не маршрут, а hashless init.
@@ -1564,7 +2241,7 @@ func (h *Handler) rewriteM3U(src string, r *http.Request, meta linkMeta) string 
 
 	// Live IPTV: bound a huge sliding DVR window BEFORE the rewrite multiplies its size —
 	// old TV-native HLS parsers take up to a minute on a megabyte playlist (see iptv_live.go).
-	if strings.EqualFold(meta.plugin, "iptv") {
+	if isIPTVPlugin(meta.plugin) {
 		src = trimLiveDVR(src, iptvLiveKeepSegments)
 	}
 
@@ -1623,7 +2300,7 @@ func (h *Handler) rewriteM3U(src string, r *http.Request, meta linkMeta) string 
 				if directSegments && !isManifestURI(link) {
 					return link
 				}
-				return proxyHost + "/" + h.encrypt(link, meta, false, false)
+				return WithEdge(withSID(proxyHost+"/"+h.encrypt(link, meta, false, false), meta.sid), edgeHintOf, edgeSkipOf)
 			})
 		} else if line[0] != '#' {
 			// 2. Non-comment, non-HTTP line → relative URI segment/playlist ref.
@@ -1633,7 +2310,7 @@ func (h *Handler) rewriteM3U(src string, r *http.Request, meta linkMeta) string 
 				if directSegments && !isManifestURI(abs) {
 					line = abs
 				} else {
-					line = proxyHost + "/" + h.encrypt(abs, meta, false, false)
+					line = withSID(proxyHost+"/"+h.encrypt(abs, meta, false, false), meta.sid)
 				}
 			}
 		}
@@ -1649,6 +2326,9 @@ func (h *Handler) rewriteM3U(src string, r *http.Request, meta linkMeta) string 
 	}
 	return b.String()
 }
+
+// filmixCDNDirRe вытаскивает имя CDN-раздела из ссылки (`/hls/<dir>/…`) для диагностики.
+var filmixCDNDirRe = regexp.MustCompile(`/hls/([^/]+)/`)
 
 // appendMissingHash adds ?hash=<h> to a URL that carries none. filmix-only
 // (inheritHash is empty for every other plugin): the EXT-X-MAP init URI in
@@ -1705,7 +2385,7 @@ func rewriteRelativeQuotedURIs(line, proxyHost, hlsHost, hlsPatch, inheritHash s
 			if directSegments && !isManifestURI(abs) {
 				b.WriteString(abs)
 			} else {
-				b.WriteString(proxyHost + "/" + h.encrypt(abs, meta, false, false))
+				b.WriteString(withSID(proxyHost+"/"+h.encrypt(abs, meta, false, false), meta.sid))
 			}
 		}
 	}
@@ -1757,7 +2437,9 @@ func (h *Handler) encrypt(uri string, meta linkMeta, forceMD5, isProxyImg bool) 
 }
 
 func (h *Handler) proxyURI(r *http.Request, uri string, meta linkMeta, forceMD5 bool) string {
-	return h.streamHostFromRequest(r) + "/proxy/" + h.encrypt(uri, meta, forceMD5, false)
+	// Сегменты наследуют sid манифеста: поток сверяется целиком, а не по
+	// отдельным запросам.
+	return withSID(h.streamHostFromRequest(r)+"/proxy/"+h.encrypt(uri, meta, forceMD5, false), meta.sid)
 }
 
 func choosePrimaryURL(client *http.Client, target string, in *http.Request, maxLen int64) string {
@@ -2548,4 +3230,89 @@ func isRedirect(code int) bool {
 
 func (h *Handler) fallback(w http.ResponseWriter, r *http.Request) {
 	http.NotFound(w, r)
+}
+
+// upstreamErrStatus маппит транспортную ошибку апстрима в клиентский статус:
+// дедлайн/таймаут → 504, всё остальное (обрыв, DNS, TLS) → 502. Оба —
+// ретраябельны для HLS-плееров, в отличие от прежнего 404.
+func upstreamErrStatus(err error) int {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return http.StatusGatewayTimeout
+	}
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return http.StatusGatewayTimeout
+	}
+	return http.StatusBadGateway
+}
+
+// Стриминговые таймауты streamClient'а: заголовки апстрима обязаны прийти за
+// streamHeaderTimeout (та же страховка, что давал старый client.Timeout), а
+// тело живёт сколько угодно — пока апстрим шлёт хоть что-то раз в
+// streamStallTimeout.
+const (
+	streamHeaderTimeout = 35 * time.Second
+	streamStallTimeout  = 60 * time.Second
+)
+
+// stallWatchdogBody принудительно закрывает тело ответа, когда апстрим замолчал
+// (ни одного байта за stall): io.Copy разблокируется с ошибкой вместо вечно
+// висящей горутины и залипшего клиента. Замена client.Timeout для бесконечных
+// live-ответов. cancel отпускает контекст запроса при любом закрытии.
+type stallWatchdogBody struct {
+	rc     io.ReadCloser
+	timer  *time.Timer
+	stall  time.Duration
+	cancel context.CancelFunc
+}
+
+func newStallWatchdogBody(rc io.ReadCloser, stall time.Duration, cancel context.CancelFunc) io.ReadCloser {
+	b := &stallWatchdogBody{rc: rc, stall: stall, cancel: cancel}
+	b.timer = time.AfterFunc(stall, func() { _ = b.Close() })
+	return b
+}
+
+func (b *stallWatchdogBody) Read(p []byte) (int, error) {
+	n, err := b.rc.Read(p)
+	if err == nil {
+		b.timer.Reset(b.stall)
+	}
+	return n, err
+}
+
+func (b *stallWatchdogBody) Close() error {
+	b.timer.Stop()
+	if b.cancel != nil {
+		defer b.cancel()
+	}
+	return b.rc.Close()
+}
+
+// pickSourceLink достаёт ссылку на поток из JSON-списка источников вида
+// {"sources":[{"link":"...","isDefault":true}]}. Предпочитает isDefault,
+// иначе берёт первую непустую. "" — если это не список источников.
+func pickSourceLink(body []byte) string {
+	var doc struct {
+		Sources []struct {
+			Link      string `json:"link"`
+			IsDefault bool   `json:"isDefault"`
+		} `json:"sources"`
+	}
+	if err := json.Unmarshal(body, &doc); err != nil || len(doc.Sources) == 0 {
+		return ""
+	}
+	first := ""
+	for _, s := range doc.Sources {
+		l := strings.TrimSpace(s.Link)
+		if l == "" || !strings.HasPrefix(l, "http") {
+			continue
+		}
+		if s.IsDefault {
+			return l
+		}
+		if first == "" {
+			first = l
+		}
+	}
+	return first
 }

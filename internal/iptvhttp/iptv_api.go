@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 
+	"lampac-go/internal/auth"
 	"lampac-go/internal/iptv"
 	"lampac-go/internal/proxylink"
 	"lampac-go/internal/tgauth"
@@ -43,6 +44,9 @@ type iptvPublicPlaylist struct {
 	UpdatedAt    int64  `json:"updated_at"`
 }
 
+// defaultCatchupDays — глубина архива, когда плейлист её не объявил.
+const defaultCatchupDays = 7
+
 type iptvPublicCatchup struct {
 	Type string `json:"type,omitempty"`
 	Days int    `json:"days,omitempty"`
@@ -50,17 +54,22 @@ type iptvPublicCatchup struct {
 }
 
 type iptvPublicChannel struct {
-	ID         string             `json:"id"`
-	Name       string             `json:"name"`
-	CleanName  string             `json:"clean_name"`
-	Logo       string             `json:"logo,omitempty"`
-	Group      string             `json:"group,omitempty"`
-	TvgID      string             `json:"tvg_id,omitempty"`
-	TvgName    string             `json:"tvg_name,omitempty"`
-	Number     int                `json:"number,omitempty"`
-	Quality    string             `json:"quality,omitempty"`
-	Catchup    *iptvPublicCatchup `json:"catchup,omitempty"`
-	PlaylistID string             `json:"playlist_id"`
+	ID          string             `json:"id"`
+	Name        string             `json:"name"`
+	CleanName   string             `json:"clean_name"`
+	Logo        string             `json:"logo,omitempty"`
+	Group       string             `json:"group,omitempty"` // legacy: страна, иначе жанр
+	Country     string             `json:"country,omitempty"`
+	CountryCode string             `json:"country_code,omitempty"`
+	Genre       string             `json:"genre,omitempty"`
+	TvgID       string             `json:"tvg_id,omitempty"`
+	TvgName     string             `json:"tvg_name,omitempty"`
+	Number      int                `json:"number,omitempty"`
+	Quality     string             `json:"quality,omitempty"`
+	Catchup     *iptvPublicCatchup `json:"catchup,omitempty"`
+	// StreamStatus — что показала проба живости: "ok" | "dead" | "frozen". Пусто = не проверяли.
+	StreamStatus string `json:"stream_status,omitempty"`
+	PlaylistID  string             `json:"playlist_id"`
 	// PlayURL (only with ?play=1) is the CLIENT-playable live URL — either the
 	// raw https CDN URL (when direct play is safe) or a /proxy/{hash} wrapper.
 	// Having it in the listing lets the player build a real channel-zapping
@@ -79,11 +88,19 @@ func toPublicPlaylist(p iptv.Playlist) iptvPublicPlaylist {
 func toPublicChannel(c iptv.Channel) iptvPublicChannel {
 	pc := iptvPublicChannel{
 		ID: c.ID, Name: c.Name, CleanName: c.CleanName, Logo: c.Logo,
-		Group: c.Group, TvgID: c.TvgID, TvgName: c.TvgName, Number: c.Number,
+		Group: c.Group, Country: c.Country, CountryCode: c.CountryCode, Genre: c.Genre,
+		TvgID: c.TvgID, TvgName: c.TvgName, Number: c.Number,
 		Quality: c.Quality, PlaylistID: c.PlaylistID,
 	}
 	if c.Catchup != nil {
-		pc.Catchup = &iptvPublicCatchup{Type: c.Catchup.Type, Days: c.Catchup.Days}
+		// Глубину знают не все плейлисты: у 3583 каналов базы тип архива указан, а `catchup-days`
+		// нет. Клиент по нулю считал, что архива нет вовсе, и прятал запись — хотя она работает.
+		// Отдаём осторожный дефолт: неделя (типичная глубина flussonic-панелей).
+		days := c.Catchup.Days
+		if days <= 0 {
+			days = defaultCatchupDays
+		}
+		pc.Catchup = &iptvPublicCatchup{Type: c.Catchup.Type, Days: days}
 	}
 	return pc
 }
@@ -113,9 +130,12 @@ func iptvTgID(r *http.Request, store *tgauth.Store) int64 {
 	if id := calendarTgID(r, store); id != 0 {
 		return id
 	}
-	// Fallback: derive a stable positive int64 from the lampac_token cookie.
-	if c, err := r.Cookie("lampac_token"); err == nil && c.Value != "" {
-		h := md5.Sum([]byte("iptv:" + c.Value))
+	// Fallback: стабильный положительный int64 из самого токена. Источник
+	// токена здесь ВАЖЕН: считать хеш от одной куки нельзя — уцелей на
+	// перезапуске другая, и у человека молча появился бы второй набор
+	// плейлистов. Берём общий разбор, он отдаёт одну и ту же строку.
+	if tok := auth.ExtractToken(r); tok != "" {
+		h := md5.Sum([]byte("iptv:" + tok))
 		v := int64(binary.BigEndian.Uint64(h[:8]))
 		if v < 0 {
 			v = -v
@@ -132,10 +152,31 @@ func iptvTgID(r *http.Request, store *tgauth.Store) int64 {
 //  GET /api/iptv/playlists — list user's playlists (personal + global)
 // ---------------------------------------------------------------------------
 
-func iptvPlaylistsHandler(iptvStore *iptv.Store, whoami tgResolver) http.HandlerFunc {
+func iptvPlaylistsHandler(iptvStore *iptv.Store, whoami tgResolver, prefs *iptvPrefStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		tgID := whoami(r)
 		playlists := iptvStore.ListPlaylists(tgID)
+		// «Игнорировать встроенные плейлисты»: человеку со своим списком наши доноры
+		// и реестр только мешают — он их не выбирал. Прячем ТОЛЬКО когда у него
+		// действительно есть свой список: иначе настройка оставила бы пустой экран,
+		// и выглядело бы это как поломка, а не как выбор.
+		if prefs.get(tgID).HideBuiltin {
+			own := 0
+			for _, p := range playlists {
+				if !p.IsGlobal {
+					own++
+				}
+			}
+			if own > 0 {
+				kept := playlists[:0]
+				for _, p := range playlists {
+					if !p.IsGlobal {
+						kept = append(kept, p)
+					}
+				}
+				playlists = kept
+			}
+		}
 		pub := make([]iptvPublicPlaylist, 0, len(playlists))
 		for _, p := range playlists {
 			pub = append(pub, toPublicPlaylist(p))
@@ -154,6 +195,7 @@ func iptvAddPlaylistHandler(iptvStore *iptv.Store, whoami tgResolver) http.Handl
 	return func(w http.ResponseWriter, r *http.Request) {
 		tgID := whoami(r)
 		if tgID == 0 {
+			logIPTVDeny(r, "не опознали пользователя")
 			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
 			return
 		}
@@ -208,6 +250,7 @@ func iptvDeletePlaylistHandler(iptvStore *iptv.Store, whoami tgResolver) http.Ha
 	return func(w http.ResponseWriter, r *http.Request) {
 		tgID := whoami(r)
 		if tgID == 0 {
+			logIPTVDeny(r, "не опознали пользователя")
 			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
 			return
 		}
@@ -235,6 +278,7 @@ func iptvRefreshPlaylistHandler(iptvStore *iptv.Store, whoami tgResolver) http.H
 	return func(w http.ResponseWriter, r *http.Request) {
 		tgID := whoami(r)
 		if tgID == 0 {
+			logIPTVDeny(r, "не опознали пользователя")
 			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
 			return
 		}
@@ -271,6 +315,14 @@ func iptvChannelsHandler(iptvStore *iptv.Store, tgStore *tgauth.Store, epg *iptv
 
 		if playlistID == "" {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "playlist_id required"})
+			return
+		}
+
+		// Список НАШЕГО реестра (тем более с ?play=1 — готовыми /proxy-ссылками)
+		// анониму не отдаём: это и был путь массовой кражи каталога.
+		if playlistID == iptv.RegistryPlaylistID && !requireRegistryAuth(r, tgStore) {
+			logIPTVDeny(r, "канал реестра, а человек не авторизован")
+			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
 			return
 		}
 
@@ -316,11 +368,21 @@ func iptvChannelsHandler(iptvStore *iptv.Store, tgStore *tgauth.Store, epg *iptv
 		// direct=1 — клиент-натив с usesCleartextTraffic: plain http:// играет с устройства
 		// (гео проходит на IP зрителя), прокси остаётся для заголовков и proxy=all.
 		direct := q.Get("direct") == "1"
+		// ОДНА сессия на весь список: зритель один, поток один. Сессия на
+		// канал дала бы две тысячи штук за одно открытие списка — и заодно
+		// сломала бы саму идею сверки, ведь делят именно список целиком.
+		listSID := ""
+		if withPlay {
+			listSID, _ = proxyLinks.OpenSession(reqIP, tgID, deviceKey(r), deviceLimit(r))
+		}
 		pub := make([]iptvPublicChannel, 0, len(channels))
 		for i := range channels {
 			out := toPublicChannel(channels[i])
+			// Статус живости — из health-check'а сервера: он и так ходит по адресам, а зритель
+			// иначе узнаёт о сломанном канале только чёрным экраном после OK.
+			out.StreamStatus = iptvStore.StreamHealth(channels[i].URL)
 			if withPlay {
-				if u, errSlug := iptvResolveStreamURL(channels[i].URL, &channels[i], pl, proxyLinks, reqIP, host, direct); errSlug == "" {
+				if u, errSlug := iptvResolveStreamURL(channels[i].URL, &channels[i], pl, proxyLinks, reqIP, host, direct, listSID); errSlug == "" {
 					out.PlayURL = u
 				}
 			}
@@ -349,13 +411,76 @@ func iptvGroupsHandler(iptvStore *iptv.Store, tgStore *tgauth.Store) http.Handle
 			return
 		}
 
-		groups := iptvStore.GetGroups(tgID, playlistID)
+		// Группы реестра — под тем же гейтом, что и его каналы.
+		if playlistID == iptv.RegistryPlaylistID && !requireRegistryAuth(r, tgStore) {
+			logIPTVDeny(r, "канал реестра, а человек не авторизован")
+			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
+			return
+		}
+
+		// ?by=country|genre — одна ось таксономии. Без параметра поведение
+		// прежнее (единый смешанный список), чтобы не сломать текущих клиентов.
+		by := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("by")))
+		switch by {
+		case iptv.GroupByCountry, iptv.GroupByGenre, iptv.GroupByLegacy:
+		default:
+			writeJSON(w, http.StatusBadRequest, map[string]any{
+				"error": "by must be country or genre",
+			})
+			return
+		}
+
+		groups := iptvStore.GetGroupsBy(tgID, playlistID, by)
 		if groups == nil {
 			groups = []iptv.GroupInfo{}
 		}
 
-		writeJSON(w, http.StatusOK, map[string]any{
-			"groups": groups,
-		})
+		resp := map[string]any{"groups": groups}
+		if by != iptv.GroupByLegacy {
+			resp["by"] = by
+		}
+		writeJSON(w, http.StatusOK, resp)
+	}
+}
+
+// ---------------------------------------------------------------------------
+//  PATCH /api/iptv/playlists/{id} — настройки уже добавленного плейлиста
+// ---------------------------------------------------------------------------
+
+// iptvPatchPlaylistHandler меняет режим прокси личного плейлиста.
+//
+// Зачем отдельная ручка: режим задавался ТОЛЬКО при добавлении, а клиенты его
+// не передавали вовсе — поле оставалось пустым, и сервер подставлял свой
+// default_proxy ("all"). Личный плейлист пользователя всегда шёл через нас, и
+// выключить это было нечем.
+//
+// Оговорка, которую надо понимать: "none" отдаёт прямой адрес только тем
+// клиентам, что играют нативным плеером и просят ?direct=1 (Android, tvOS).
+// Браузеру прямой адрес не поможет — IPTV-CDN не отдают CORS-заголовки, и
+// манифест не загрузится вовсе; там прокси остаётся всегда. То же для каналов,
+// которым нужен свой User-Agent или Referer: без нашего прокси их некому
+// проставить.
+func iptvPatchPlaylistHandler(iptvStore *iptv.Store, whoami tgResolver) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		tgID := whoami(r)
+		if tgID == 0 {
+			logIPTVDeny(r, "не опознали пользователя")
+			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
+			return
+		}
+		id := chi.URLParam(r, "id")
+		body, _ := io.ReadAll(io.LimitReader(r.Body, 4<<10))
+		var req struct {
+			ProxyMode string `json:"proxy_mode"`
+		}
+		if err := json.Unmarshal(body, &req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "bad json"})
+			return
+		}
+		if err := iptvStore.SetPlaylistProxyMode(tgID, id, req.ProxyMode); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "proxy_mode": strings.ToLower(strings.TrimSpace(req.ProxyMode))})
 	}
 }

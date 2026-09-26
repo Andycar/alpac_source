@@ -27,7 +27,7 @@ func TestSimpleSourcesChecksearch(t *testing.T) {
 			Zetflix:     config.ZetflixSource{Host: upstream.URL},
 			CDNmovies:   config.HostSource{Host: upstream.URL},
 			CDNvideohub: config.HostSource{Host: upstream.URL},
-			Vibix:       config.HostTokenSource{Host: upstream.URL},
+			Vibix: config.VibixSource{Host: upstream.URL},
 			IframeVideo: config.IframeVideoSource{APIHost: upstream.URL},
 			GetsTV:      config.HostTokenSource{Host: upstream.URL},
 			Mirage:      config.MirageSource{APIHost: upstream.URL},

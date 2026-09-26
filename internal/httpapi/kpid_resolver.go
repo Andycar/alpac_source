@@ -266,16 +266,34 @@ func wikidataKP(ctx context.Context, mediaType string, tmdbID int, imdb string) 
 
 // kpByTmdbEndpoints are base URLs (each WITH its ?token=...) from [kinopoisk] kp_by_tmdb; the code
 // appends &tmdb=<id>. They resolve kp DIRECTLY by tmdb id — cleaner than a title search.
-var kpByTmdbEndpoints []string
+// Под мьютексом: список перечитывается по SIGHUP, пока его читают обработчики.
+var (
+	kpByTmdbMu        sync.RWMutex
+	kpByTmdbEndpoints []string
+)
 
-func setKpByTmdbEndpoints(eps []string) {
+// setKpByTmdbEndpoints применяет список и сообщает, изменился ли он. При смене сбрасывается кэш
+// бейджей качества: пустые ответы, закэшированные без справочника (или с мёртвым), иначе держались
+// бы ещё сутки. 22.09.2026: список не был настроен на проде вообще — бейдж на постерах молчал
+// как минимум с августа, а /capi/quality/batch честно отвечал «бейджа нет» за 0 мс.
+func setKpByTmdbEndpoints(eps []string) bool {
 	var clean []string
 	for _, e := range eps {
 		if e = strings.TrimSpace(e); e != "" {
 			clean = append(clean, e)
 		}
 	}
+	kpByTmdbMu.Lock()
+	changed := strings.Join(clean, "\n") != strings.Join(kpByTmdbEndpoints, "\n")
 	kpByTmdbEndpoints = clean
+	kpByTmdbMu.Unlock()
+	return changed
+}
+
+func kpByTmdbList() []string {
+	kpByTmdbMu.RLock()
+	defer kpByTmdbMu.RUnlock()
+	return kpByTmdbEndpoints
 }
 
 type kpByTmdbResp struct {
@@ -286,6 +304,12 @@ type kpByTmdbResp struct {
 		Category int    `json:"category"` // 1=movie, 2=tv — rejects a wrong-namespace collision
 		Quality  string `json:"quality"`  // source format: WEB-DL / BDRip / TS / CAMRip / …
 		UHD      bool   `json:"uhd"`      // 4K available
+		// Для карточки каталога. Типы у справочника плавают (число / строка / null), поэтому сырьём.
+		RatingKP    stdjson.RawMessage `json:"rating_kp"`
+		RatingIMDb  stdjson.RawMessage `json:"rating_imdb"`
+		Age         stdjson.RawMessage `json:"age_restrictions"`
+		Time        stdjson.RawMessage `json:"time"`        // «02:11»
+		Translation stdjson.RawMessage `json:"translation"` // «Дублированный, Кубик в Кубе, …»
 	} `json:"data"`
 }
 
@@ -295,16 +319,80 @@ type kpByTmdbData struct {
 	Quality  string
 	UHD      bool
 	Category int
+	// Карточка каталога: рейтинги, возраст, длительность (минуты), озвучки как у справочника.
+	RatingKP   float64
+	RatingIMDb float64
+	Age        int
+	Runtime    int
+	Voices     []string
+}
+
+// kpRawNum — число справочника: 8.054, "8.054", "8,0", null.
+func kpRawNum(raw stdjson.RawMessage) float64 {
+	s := strings.Trim(strings.TrimSpace(string(raw)), `"`)
+	if s == "" || s == "null" {
+		return 0
+	}
+	f, err := strconv.ParseFloat(strings.Replace(s, ",", ".", 1), 64)
+	if err != nil || f < 0 {
+		return 0
+	}
+	return f
+}
+
+// kpRawMinutes — длительность «02:11» (или «131») в минутах.
+func kpRawMinutes(raw stdjson.RawMessage) int {
+	s := strings.Trim(strings.TrimSpace(string(raw)), `"`)
+	if h, m, ok := strings.Cut(s, ":"); ok {
+		hh, e1 := strconv.Atoi(h)
+		mm, e2 := strconv.Atoi(m)
+		if e1 == nil && e2 == nil && hh >= 0 && mm >= 0 && mm < 60 {
+			return hh*60 + mm
+		}
+		return 0
+	}
+	if n, err := strconv.Atoi(s); err == nil && n > 0 && n < 1000 {
+		return n
+	}
+	return 0
+}
+
+// kpRawVoices — озвучки: строка через запятую или массив строк.
+func kpRawVoices(raw stdjson.RawMessage) []string {
+	var list []string
+	var str string
+	switch {
+	case stdjson.Unmarshal(raw, &list) == nil:
+	case stdjson.Unmarshal(raw, &str) == nil:
+		list = strings.Split(str, ",")
+	}
+	var out []string
+	for _, v := range list {
+		if v = strings.TrimSpace(v); v != "" {
+			out = append(out, v)
+		}
+	}
+	return out
 }
 
 // kpByTmdbMeta queries the configured kp_by_tmdb endpoints for a tmdb id (first success wins) and
 // returns kp id + quality/uhd. Rejects a clear movie/tv category mismatch: TMDB movie/tv ids are
 // separate namespaces but these endpoints key only by the number, so a bare id could return the wrong work.
 func kpByTmdbMeta(ctx context.Context, mediaType string, tmdbID int) (kpByTmdbData, bool) {
+	d, ok, _ := kpByTmdbMetaDef(ctx, mediaType, tmdbID)
+	return d, ok
+}
+
+// kpByTmdbMetaDef — то же, плюс definite: получен ли ОСМЫСЛЕННЫЙ ответ (хоть один справочник
+// ответил 200 с JSON — неважно, нашёл ли). false = все упали по сети/таймауту/5xx: это не «тайтла
+// нет», и кэшировать такое как «нет» нельзя. Без справочников ответ окончательный (спрашивать некого).
+func kpByTmdbMetaDef(ctx context.Context, mediaType string, tmdbID int) (kpByTmdbData, bool, bool) {
 	if tmdbID <= 0 {
-		return kpByTmdbData{}, false
+		return kpByTmdbData{}, false, true
 	}
-	for _, ep := range kpByTmdbEndpoints {
+	eps := kpByTmdbList()
+	definite := len(eps) == 0
+	for _, ep := range eps {
 		sep := "&"
 		if !strings.Contains(ep, "?") {
 			sep = "?"
@@ -316,24 +404,46 @@ func kpByTmdbMeta(ctx context.Context, mediaType string, tmdbID int) (kpByTmdbDa
 		req.Header.Set("User-Agent", kpStoreUA)
 		req.Header.Set("Accept", "application/json")
 		resp, err := wikidataHTTP.Do(req) // plain client → transparently gunzips
+		// 503/429 у справочника — короткая перегрузка (ловится на пачке бейджей): один повтор через
+		// 400 мс почти всегда отвечает, а без него тайтл уходил во «временный промах» на 10 минут.
+		if err == nil && (resp.StatusCode == http.StatusServiceUnavailable || resp.StatusCode == http.StatusTooManyRequests) {
+			resp.Body.Close()
+			select {
+			case <-ctx.Done():
+				continue
+			case <-time.After(400 * time.Millisecond):
+			}
+			if retry, rerr := http.NewRequestWithContext(ctx, http.MethodGet, req.URL.String(), nil); rerr == nil {
+				retry.Header = req.Header.Clone()
+				resp, err = wikidataHTTP.Do(retry)
+			}
+		}
 		if err != nil {
 			continue
 		}
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		// 4 МБ: у длинных сериалов ответ с сезонами весит до мегабайта (One Piece — 977 КБ), и
+		// обрезанный на 1 МБ JSON не разбирался — бейдж такого тайтла не приходил никогда.
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 		resp.Body.Close()
 		if resp.StatusCode != http.StatusOK {
 			continue
 		}
 		var r kpByTmdbResp
-		if stdjson.Unmarshal(body, &r) != nil || r.Data.IDKp <= 0 {
+		if stdjson.Unmarshal(body, &r) != nil {
+			continue
+		}
+		definite = true // справочник ответил по существу — дальше «нет» значит нет
+		if r.Data.IDKp <= 0 {
 			continue
 		}
 		if (r.Data.Category == 1 && mediaType == "tv") || (r.Data.Category == 2 && mediaType == "movie") {
 			continue // wrong type for this tmdb number
 		}
-		return kpByTmdbData{IDKp: r.Data.IDKp, Quality: r.Data.Quality, UHD: r.Data.UHD, Category: r.Data.Category}, true
+		return kpByTmdbData{IDKp: r.Data.IDKp, Quality: r.Data.Quality, UHD: r.Data.UHD, Category: r.Data.Category,
+			RatingKP: kpRawNum(r.Data.RatingKP), RatingIMDb: kpRawNum(r.Data.RatingIMDb), Age: int(kpRawNum(r.Data.Age)),
+			Runtime: kpRawMinutes(r.Data.Time), Voices: kpRawVoices(r.Data.Translation)}, true, true
 	}
-	return kpByTmdbData{}, false
+	return kpByTmdbData{}, false, definite
 }
 
 // kpByTmdbLookup is the kp-id-only wrapper of kpByTmdbMeta (used by the resolver chain).

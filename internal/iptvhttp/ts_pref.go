@@ -80,7 +80,7 @@ func normalizeTsPref(raw string) (string, bool) {
 	return strings.TrimRight(t, "/"), true
 }
 
-// GET → {"url": "..."} ('' = не задан). Кука/kit — по переданному резолверу.
+// GET → {"url": "..."} (” = не задан). Кука/kit — по переданному резолверу.
 func tsPrefGetHandler(store *tsPrefStore, whoami tgResolver) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		tgID := whoami(r)

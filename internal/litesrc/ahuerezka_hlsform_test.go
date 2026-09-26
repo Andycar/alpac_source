@@ -96,7 +96,7 @@ func TestAhueRezkaPremiumTiersAreRecognised(t *testing.T) {
 // better to return nothing and let the client try another source.
 func TestAhueRezkaPremiumOnlyTitleYieldsNothing(t *testing.T) {
 	a := &ahueRezkaChecker{premium: false, hls: false}
-	streams, qual := a.extractStreams(nil, ahueWorkerPremiumOnly, "ahuerezka")
+	streams, qual, _ := a.extractStreams(nil, ahueWorkerPremiumOnly, "ahuerezka")
 	if len(streams) != 0 || len(qual) != 0 {
 		t.Fatalf("premium-only title leaked the stub: streams=%v qual=%v", streams, qual)
 	}
@@ -113,7 +113,7 @@ const ahueWorkerFreeLadder = `[360p]https://stream.voidboost.one/h:2026072810:b=
 // the picker offered 1080p and played 720p. Labels must report what plays.
 func TestAhueRezkaLabelsMatchRealResolution(t *testing.T) {
 	a := &ahueRezkaChecker{premium: false, hls: false}
-	streams, qual := a.extractStreams(nil, ahueWorkerFreeLadder, "ahuerezka")
+	streams, qual, _ := a.extractStreams(nil, ahueWorkerFreeLadder, "ahuerezka")
 	if len(streams) != 4 {
 		t.Fatalf("want 4 free tiers, got %d: %v", len(streams), streams)
 	}

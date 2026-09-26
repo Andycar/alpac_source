@@ -111,7 +111,12 @@ func startTrickplayGeneration(cfg config.Config, job *TranscodingJob) *trickplay
 
 	durationSec := ffprobeDuration(job.Context.FFProbe)
 	count, interval := trickplayPlan(durationSec)
-	if count < 3 || job.Context.Live || job.Context.Source == "pipe:0" {
+	// pipe:0 (торрент в процессе) для старого способа неперематываем; с картой ключевых
+	// кадров (trickplay_cues.go) кластеры читаются напрямую из торрент-ридера — тогда можно.
+	job.segMap(3 * time.Second) // дождаться карты, она обычно уже готова
+	km := job.keyframes()
+	hasCues := km != nil && km.Source == "mkv-cues"
+	if count < 3 || job.Context.Live || (job.Context.Source == "pipe:0" && !hasCues) {
 		// Too short / live / unseekable stdin source — nothing sensible to build.
 		st.started, st.failed = true, true
 		return st
@@ -137,6 +142,12 @@ func generateTrickplay(cfg config.Config, job *TranscodingJob, st *trickplayStat
 	ctx, cancel := context.WithTimeout(context.Background(), trickplayTotalBudget)
 	defer cancel()
 
+	// По карте ключевых кадров — «голова + кластер» в stdin, без проб и перемоток; без карты —
+	// прежние точечные -ss-захваты (trickplay_cues.go).
+	cues := newCueGrabber(job)
+	if cues != nil {
+		defer cues.Close()
+	}
 	// Phase 1: sparse frame grabs (bounded parallelism).
 	var wg sync.WaitGroup
 	for i := 0; i < count; i++ {
@@ -154,6 +165,12 @@ func generateTrickplay(cfg config.Config, job *TranscodingJob, st *trickplayStat
 			out := filepath.Join(dir, fmt.Sprintf("thumb_%03d.jpg", idx))
 			gctx, gcancel := context.WithTimeout(ctx, trickplayGrabTimeout)
 			defer gcancel()
+			if cues != nil {
+				if err := cues.grab(gctx, ffmpegBin, float64(ts), out); err != nil {
+					log.Debug().Err(err).Int("idx", idx).Msg("trickplay: cue grab failed")
+				}
+				return
+			}
 			// Input-side -ss: demuxer seeks (HTTP Range / HLS segment jump),
 			// decodes one GOP, emits one frame. -noaccurate_seek keeps it to
 			// the nearest keyframe — cheapest possible grab, and thumbnail
@@ -240,7 +257,13 @@ func generateTrickplay(cfg config.Config, job *TranscodingJob, st *trickplayStat
 	st.mu.Lock()
 	st.ready, st.thumbW, st.thumbH, st.rows = true, thumbW, thumbH, rows
 	st.mu.Unlock()
-	log.Info().Int("thumbs", count).Int("interval_s", interval).Msg("trickplay: sprite ready")
+	ev := log.Info().Int("thumbs", count).Int("interval_s", interval)
+	if cues != nil {
+		ev = ev.Str("method", "cues").Int64("bytes", cues.bytes)
+	} else {
+		ev = ev.Str("method", "seek")
+	}
+	ev.Msg("trickplay: sprite ready")
 }
 
 func trickplayFail(st *trickplayState, stage string, err error) {

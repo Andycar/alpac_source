@@ -44,10 +44,10 @@ func TestFindTokenByStableFP(t *testing.T) {
 	_ = s.Add(ApprovedToken{Token: "tok-live", TelegramID: 1, ExpiresAt: now.Add(24 * time.Hour)})
 	_ = s.Add(ApprovedToken{Token: "tok-dead", TelegramID: 2, ExpiresAt: now.Add(-time.Hour)})
 
-	if _, err := s.AddDevice("tok-live", DeviceInfo{UID: "l1", StableFP: "sfp-tv", BoundAt: now, LastSeen: now}); err != nil {
+	if _, err := s.AddDevice("tok-live", DeviceInfo{UID: "l1", StableFP: "n:sfp-tv", BoundAt: now, LastSeen: now}); err != nil {
 		t.Fatalf("AddDevice l1: %v", err)
 	}
-	if tok, _, ok := s.FindTokenByStableFP("sfp-tv"); !ok || tok != "tok-live" {
+	if tok, _, ok := s.FindTokenByStableFP("n:sfp-tv"); !ok || tok != "tok-live" {
 		t.Fatalf("stable fp: got tok=%q ok=%v, want tok-live", tok, ok)
 	}
 	if _, _, ok := s.FindTokenByStableFP("sfp-missing"); ok {
@@ -70,11 +70,11 @@ func TestAddDevice_StableFPMigration(t *testing.T) {
 	now := time.Now().UTC()
 	_ = s.Add(ApprovedToken{Token: "tok", TelegramID: 1, ExpiresAt: now.Add(24 * time.Hour)})
 
-	if added, err := s.AddDevice("tok", DeviceInfo{UID: "uid-old", Fingerprint: "fp-v1", StableFP: "sfp-tv", BoundAt: now, LastSeen: now}); err != nil || !added {
+	if added, err := s.AddDevice("tok", DeviceInfo{UID: "uid-old", Fingerprint: "fp-v1", StableFP: "n:sfp-tv", BoundAt: now, LastSeen: now}); err != nil || !added {
 		t.Fatalf("first bind: added=%v err=%v", added, err)
 	}
 	// Relaunch after firmware update: new UID, new precise fp, SAME stable fp.
-	if added, err := s.AddDevice("tok", DeviceInfo{UID: "uid-new", Fingerprint: "fp-v2", StableFP: "sfp-tv", BoundAt: now, LastSeen: now}); err != nil {
+	if added, err := s.AddDevice("tok", DeviceInfo{UID: "uid-new", Fingerprint: "fp-v2", StableFP: "n:sfp-tv", BoundAt: now, LastSeen: now}); err != nil {
 		t.Fatalf("second bind: err=%v", err)
 	} else if added {
 		t.Fatal("second bind must MIGRATE (not add) via stable fp")

@@ -380,7 +380,7 @@ func (k *kinoPubChecker) doSearch(req *http.Request, token, title, originalTitle
 	return goSearch(title)
 }
 
-func (k *kinoPubChecker) searchAPI(req *http.Request, token, query string) ([]kinoPubItem, bool) {
+func (k *kinoPubChecker) searchAPIUncached(req *http.Request, token, query string) ([]kinoPubItem, bool) {
 	qs := url.Values{}
 	qs.Set("q", query)
 	qs.Set("access_token", token)
@@ -399,7 +399,14 @@ func (k *kinoPubChecker) searchAPI(req *http.Request, token, query string) ([]ki
 	anyOK := false
 	for i, path := range []string{"/v1/items/search", "/api2/v1.1/items/search"} {
 		var root kinoPubSearchResponse
-		if ok := k.kinopubAPIGet(req, path, qs, &root, 2<<20); !ok {
+		areq := req
+		if i > 0 {
+			// The fallback gets a hard time budget of its own — see kpFallbackBudget.
+			var cancel context.CancelFunc
+			areq, cancel = kpBoundedReq(req, kpFallbackBudget)
+			defer cancel()
+		}
+		if ok := k.kinopubAPIGet(areq, path, qs, &root, 2<<20); !ok {
 			continue
 		}
 		anyOK = true
@@ -427,7 +434,13 @@ func (k *kinoPubChecker) fetchItem(req *http.Request, token string, postid int) 
 	for i, tmpl := range []string{"/v1/items/%d", "/api2/v1.1/items/%d"} {
 		path := fmt.Sprintf(tmpl, postid)
 		var root kpRootObject
-		if ok := k.kinopubAPIGet(req, path, qs, &root, 4<<20); !ok {
+		areq := req
+		if i > 0 {
+			var cancel context.CancelFunc
+			areq, cancel = kpBoundedReq(req, kpFallbackBudget)
+			defer cancel()
+		}
+		if ok := k.kinopubAPIGet(areq, path, qs, &root, 4<<20); !ok {
 			continue
 		}
 		if root.Item.Seasons == nil && root.Item.Videos == nil {
@@ -463,6 +476,11 @@ func (k *kinoPubChecker) kinopubAPIGet(req *http.Request, path string, qs url.Va
 	if attempts < 1 {
 		attempts = 1
 	}
+	if kinopubBreakerOpen() {
+		log.Debug().Str("path", path).Msg("kinopub: API на паузе после полного круга по зеркалам")
+		return false
+	}
+	transportFails := 0
 	for i := 0; i < attempts; i++ {
 		host := k.apiHost()
 		u, perr := url.Parse(host + path)
@@ -502,6 +520,10 @@ func (k *kinoPubChecker) kinopubAPIGet(req *http.Request, path string, qs url.Va
 		if !errors.Is(err, errKinopubTransport) {
 			break // live mirror answered — retrying elsewhere won't help
 		}
+		transportFails++
+	}
+	if transportFails >= attempts && attempts > 1 {
+		kinopubTripBreaker(attempts) // полный круг мёртвых зеркал — не крутить его на каждом запросе
 	}
 	if err != nil || body == "" {
 		log.Debug().Err(err).Str("path", path).Msg("kinopub: fetch failed")

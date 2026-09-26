@@ -215,3 +215,112 @@ func TestReloadRotatesKey(t *testing.T) {
 		t.Fatalf("post-reload encrypt/decrypt broken")
 	}
 }
+
+// TTLHours ставит срок токенам БЕЗ привязки к IP — тем самым, что раньше жили
+// вечно и утекли в чужой плейлист (кража экспорта 2026-08-31). Проверяем оба
+// пути выдачи: с заголовками (EncryptURIWithHeaders) и без них.
+func TestTTLStampsExpiryOnNonIPBoundTokens(t *testing.T) {
+	m, err := New(Options{CacheDir: t.TempDir(), EncryptAES: true, TTLHours: 36})
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+
+	plain := m.EncryptURI("https://example.com/live.m3u8", "1.1.1.1", "iptv", false, false, false)
+	withHdr := m.EncryptURIWithHeaders("https://example.com/live.m3u8", "1.1.1.1", "iptv",
+		map[string]string{"User-Agent": "VLC"})
+
+	for name, hash := range map[string]string{"plain": plain, "headers": withHdr} {
+		model := m.Decrypt(hash, "1.1.1.1")
+		if model == nil {
+			t.Fatalf("%s: decrypt returned nil", name)
+		}
+		if model.Expires.IsZero() {
+			t.Fatalf("%s: token has no expiry — leaked link would live forever", name)
+		}
+		if d := time.Until(model.Expires); d < 35*time.Hour || d > 37*time.Hour {
+			t.Fatalf("%s: expiry %v is not ~36h out", name, d)
+		}
+	}
+}
+
+// Протухший токен не должен играть — иначе TTL бесполезен.
+func TestExpiredAESTokenIsRejected(t *testing.T) {
+	m, err := New(Options{CacheDir: t.TempDir(), EncryptAES: true, TTLHours: 1})
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	hash := m.EncryptURIWithHeaders("https://example.com/live.m3u8", "1.1.1.1", "iptv",
+		map[string]string{"User-Agent": "VLC"})
+
+	// Выдаём токен с микро-сроком и даём ему истечь. (Отрицательный TTL не
+	// подошёл бы: expiry() считает ttl<=0 запросом «без срока».)
+	m.ttlNanos.Store(int64(time.Nanosecond))
+	stale := m.EncryptURIWithHeaders("https://example.com/live.m3u8", "1.1.1.1", "iptv",
+		map[string]string{"User-Agent": "VLC"})
+	time.Sleep(2 * time.Millisecond)
+
+	if m.Decrypt(hash, "1.1.1.1") == nil {
+		t.Fatalf("свежий токен должен играть")
+	}
+	if m.Decrypt(stale, "1.1.1.1") != nil {
+		t.Fatalf("истёкший токен принят — утёкшая ссылка продолжит играть")
+	}
+}
+
+// TTLHours=0 — прежнее поведение: срок не ставится (нужно для постеров и
+// совместимости с инсталляциями, где ротация ссылок нежелательна).
+func TestZeroTTLKeepsTokensEternal(t *testing.T) {
+	m, err := New(Options{CacheDir: t.TempDir(), EncryptAES: true})
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	model := m.Decrypt(m.EncryptURI("https://example.com/a.m3u8", "1.1.1.1", "iptv", false, false, false), "1.1.1.1")
+	if model == nil {
+		t.Fatalf("decrypt returned nil")
+	}
+	if !model.Expires.IsZero() {
+		t.Fatalf("TTLHours=0 не должен ставить срок, получили %v", model.Expires)
+	}
+}
+
+// Добивание украденных ссылок: у них поля E нет вовсе (выданы до TTL), а пустое
+// E = вечное. Плагины из RequireTTLPlugins такие токены не принимают — при этом
+// ссылки прочих источников (фильмы) продолжают играть.
+func TestEternalTokenRejectedOnlyForListedPlugins(t *testing.T) {
+	// Менеджер БЕЗ TTL — так выдавались токены до фикса.
+	old, err := New(Options{CacheDir: t.TempDir(), EncryptAES: true, SharedSecret: "s3cret"})
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	stolenIPTV := old.EncryptURIWithHeaders("https://cdn/live.m3u8", "1.1.1.1", "iptv",
+		map[string]string{"User-Agent": "VLC"})
+	movie := old.EncryptURIWithHeaders("https://cdn/movie.mp4", "1.1.1.1", "kinopub",
+		map[string]string{"User-Agent": "VLC"})
+
+	if old.Decrypt(stolenIPTV, "1.1.1.1") == nil {
+		t.Fatalf("до включения списка бессрочный токен должен играть")
+	}
+
+	// Тот же ключ (shared_secret), но теперь iptv требует срок.
+	guarded, err := New(Options{CacheDir: t.TempDir(), EncryptAES: true, SharedSecret: "s3cret",
+		TTLHours: 36, RequireTTLPlugins: []string{"iptv", "iptv-ru"}})
+	if err != nil {
+		t.Fatalf("new guarded: %v", err)
+	}
+
+	if guarded.Decrypt(stolenIPTV, "1.1.1.1") != nil {
+		t.Fatalf("украденный бессрочный iptv-токен принят")
+	}
+	if guarded.Decrypt(movie, "1.1.1.1") == nil {
+		t.Fatalf("ссылка непрофильного плагина не должна пострадать")
+	}
+	// Свежий iptv-токен уже со сроком — играет.
+	fresh := guarded.EncryptURIWithHeaders("https://cdn/live.m3u8", "1.1.1.1", "iptv",
+		map[string]string{"User-Agent": "VLC"})
+	if guarded.Decrypt(fresh, "1.1.1.1") == nil {
+		t.Fatalf("свежий токен со сроком должен играть")
+	}
+	if r := guarded.DebugDecrypt(stolenIPTV, "1.1.1.1"); !strings.Contains(r, "eternal") {
+		t.Fatalf("диагностика должна называть причину, получили: %s", r)
+	}
+}

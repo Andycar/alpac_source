@@ -40,8 +40,10 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -54,8 +56,8 @@ import (
 )
 
 const (
-	ahueRezkaDefaultHost   = "https://rezka.hdbase.workers.dev"
-	ahueRezkaDefaultKPHost = "https://kp.hdbase.workers.dev"
+	ahueRezkaDefaultHost   = "https://rezka.metrpiva.com"
+	ahueRezkaDefaultKPHost = "https://kp.metrpiva.com"
 	ahueRezkaUA            = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
 
@@ -69,6 +71,124 @@ type ahueRezkaChecker struct {
 	premium      bool         // include premium qualities (1080p Ultra / 2K / 4K)
 	hls          bool         // append :hls:manifest.m3u8 when a quality URL lacks .m3u8
 	links        *proxylink.Manager
+
+	// Пул выходов в сеть: SOCKS из конфига по порядку, последним — прямой.
+	// Воркер банит IP за объём запросов (прод 21.09.2026: наш прямой IP и
+	// выход 40003 отдавали 500 на /movie-stream, а соседние выходы и ноды со
+	// своих адресов — 200). Поэтому на 5xx потока пробуем другой выход и
+	// остаёмся на том, который ответил.
+	egress     []*http.Client
+	egressName []string
+	egressCur  atomic.Int32
+
+	// Короткий кэш ответов каталога. Воркер спрашивают на КАЖДЫЙ показ
+	// карточки, а отвечает он за 1–2 секунды и не всегда: кэш и ускоряет
+	// карточку, и переживает разовый сбой. Потоки не кэшируем — у их ссылок
+	// свой срок.
+	respMu sync.RWMutex
+	resp   map[string]ahueRezkaCacheEntry
+}
+
+type ahueRezkaCacheEntry struct {
+	body    []byte
+	ok      bool
+	expires time.Time
+}
+
+const (
+	ahueRezkaCacheTTL    = time.Hour       // успешный ответ каталога: состав озвучек меняется редко
+	ahueRezkaCacheNegTTL = 3 * time.Minute // «нет такого тайтла» — тоже ответ
+	ahueRezkaCacheMax    = 1024
+)
+
+// Ссылки voidboost несут срок годности прямо в пути: «…/<hash>:2026092206:<token>»
+// — годна до 22.09 06:00. Поток кэшируем не дольше этого срока (с запасом на
+// неизвестный часовой пояс штампа) и не дольше ahueRezkaStreamTTL. Без кэша
+// каждый показ карточки заново спрашивал потоки четырёх озвучек, и воркер за
+// объём банил наш адрес: за час 724 запроса потока, различных среди них 224.
+var ahueRezkaExpiryRe = regexp.MustCompile(`:(20\d{8}):`)
+
+// Потолок 6 часов, а не полчаса: ссылка живёт около суток, а один и тот же
+// тайтл с той же озвучкой за день открывают многие — каждый повторный запрос к
+// воркеру приближает бан адреса. С потолком в полчаса популярная карточка
+// дёргала воркер 48 раз в сутки, с шестичасовым — 4.
+const (
+	ahueRezkaStreamTTL    = 6 * time.Hour
+	ahueRezkaStreamNegTTL = time.Minute
+	ahueRezkaStreamMargin = 4 * time.Hour
+)
+
+// ahueRezkaStreamCacheTTL — сколько можно держать ответ потока. 0 — нельзя.
+func ahueRezkaStreamCacheTTL(body []byte, now time.Time) time.Duration {
+	ttl := ahueRezkaStreamTTL
+	for _, m := range ahueRezkaExpiryRe.FindAllSubmatch(body, -1) {
+		exp, err := time.ParseInLocation("2006010215", string(m[1]), time.UTC)
+		if err != nil {
+			continue
+		}
+		if left := exp.Sub(now) - ahueRezkaStreamMargin; left < ttl {
+			ttl = left
+		}
+	}
+	if ttl <= 0 {
+		return 0
+	}
+	return ttl
+}
+
+// cachedStream — поток с кэшем по пути запроса и сроком из самой ссылки.
+func (a *ahueRezkaChecker) cachedStream(ctx context.Context, path string) ([]byte, bool) {
+	key := "stream|" + path
+	a.respMu.RLock()
+	e, hit := a.resp[key]
+	a.respMu.RUnlock()
+	if hit && time.Now().Before(e.expires) {
+		return e.body, e.ok
+	}
+	body, ok := a.getJSONPath(ctx, path)
+	ttl := ahueRezkaStreamNegTTL
+	if ok {
+		ttl = ahueRezkaStreamCacheTTL(body, time.Now())
+	}
+	if ttl > 0 {
+		a.respMu.Lock()
+		if a.resp == nil || len(a.resp) >= ahueRezkaCacheMax {
+			a.resp = make(map[string]ahueRezkaCacheEntry, 64)
+		}
+		a.resp[key] = ahueRezkaCacheEntry{body: body, ok: ok, expires: time.Now().Add(ttl)}
+		a.respMu.Unlock()
+	}
+	return body, ok
+}
+
+// cachedJSON — getJSONPath с коротким кэшем по пути запроса. Отрицательный
+// ответ кэшируем тоже: иначе карточка, которой у rezka нет, при каждом показе
+// молотит воркер пятисотками — а это ровно то, что раньше выключало источник.
+func (a *ahueRezkaChecker) cachedJSON(ctx context.Context, path string) ([]byte, bool) {
+	a.respMu.RLock()
+	e, hit := a.resp[path]
+	a.respMu.RUnlock()
+	if hit && time.Now().Before(e.expires) {
+		return e.body, e.ok
+	}
+
+	body, ok := a.getJSONPath(ctx, path)
+	ttl := ahueRezkaCacheTTL
+	if !ok {
+		ttl = ahueRezkaCacheNegTTL
+	}
+	a.respMu.Lock()
+	if a.resp == nil {
+		a.resp = make(map[string]ahueRezkaCacheEntry, 64)
+	}
+	if len(a.resp) >= ahueRezkaCacheMax {
+		// Без LRU: карта маленькая, а чистка раз в тысячу записей дешевле
+		// любого учёта обращений.
+		a.resp = make(map[string]ahueRezkaCacheEntry, 64)
+	}
+	a.resp[path] = ahueRezkaCacheEntry{body: body, ok: ok, expires: time.Now().Add(ttl)}
+	a.respMu.Unlock()
+	return body, ok
 }
 
 // Sticky mirror selection, same shape as kinopub's: stay on one host until it
@@ -80,9 +200,139 @@ var (
 	ahueRezkaKPHostIdx atomic.Int32
 )
 
+// Предохранитель воркера. ★20.09.2026: воркер отвечал 200 на /info и 500 на
+// всём, что реально ходит на HDRezka (/episodes, /movie-stream,
+// /episode-stream). checkSearch спрашивает только /info — источник бодро
+// показывался в списке и не отдавал НИЧЕГО. Считаем подряд идущие 5xx: после
+// порога источник честно говорит «меня нет», клиент не предлагает его зря и
+// сам переключается дальше. Любой успех сбрасывает счётчик.
+// Порог считаем ДОЛЕЙ отказов в окне, а не подряд идущими 5xx. Причина —
+// замер прода 21.09.2026: воркер отвечает 500 не только когда лежит, но и на
+// обычный промах по каталогу («{"code":"FILM_INFO_FETCH_FAIL"}» на тайтл,
+// которого у rezka нет). Три таких промаха подряд — обычное дело, а прежний
+// счётчик из-за них выключал ЖИВОЙ источник: 830 срабатываний за шесть часов.
+// Отличить промах от поломки по телу нельзя — блокировка нашего выхода даёт
+// такое же 500 с кодом. Зато их отлично различает доля: промахи разрежены,
+// а неработающий выход заваливает подряд всё.
+const (
+	ahueRezkaWindow      = 20              // сколько последних ответов помним
+	ahueRezkaMinSamples  = 8               // меньше — судить рано
+	ahueRezkaFailPercent = 80              // столько отказов в окне = воркер не работает
+	ahueRezkaBreakerFor  = 5 * time.Minute // на столько убираем источник
+)
+
+var (
+	ahueRezkaHealthMu  sync.Mutex
+	ahueRezkaRing      [ahueRezkaWindow]bool // true — отказ
+	ahueRezkaRingIdx   int
+	ahueRezkaRingLen   int
+	ahueRezkaMutedTill atomic.Int64 // unix-наносекунды
+)
+
+// ahueRezkaNoteUpstream отмечает исход запроса к воркеру.
+func ahueRezkaNoteUpstream(failed bool) {
+	ahueRezkaHealthMu.Lock()
+	ahueRezkaRing[ahueRezkaRingIdx] = failed
+	ahueRezkaRingIdx = (ahueRezkaRingIdx + 1) % ahueRezkaWindow
+	if ahueRezkaRingLen < ahueRezkaWindow {
+		ahueRezkaRingLen++
+	}
+	fails := 0
+	for i := 0; i < ahueRezkaRingLen; i++ {
+		if ahueRezkaRing[i] {
+			fails++
+		}
+	}
+	n := ahueRezkaRingLen
+	ahueRezkaHealthMu.Unlock()
+
+	if !failed {
+		// Успех означает, что воркер отвечает: снимаем молчание сразу, не
+		// дожидаясь конца пятиминутки.
+		ahueRezkaMutedTill.Store(0)
+		return
+	}
+	if n < ahueRezkaMinSamples || fails*100 < n*ahueRezkaFailPercent {
+		return
+	}
+	until := time.Now().Add(ahueRezkaBreakerFor).UnixNano()
+	if ahueRezkaMutedTill.Swap(until) == 0 {
+		log.Warn().Int("отказов", fails).Int("из", n).Dur("на", ahueRezkaBreakerFor).
+			Msg("ahuerezka: воркер почти не отвечает — временно убираем источник из выдачи")
+	}
+}
+
+// ahueRezkaResetHealth очищает окно (используется тестами и при снятии молчания).
+func ahueRezkaResetHealth() {
+	ahueRezkaHealthMu.Lock()
+	ahueRezkaRing = [ahueRezkaWindow]bool{}
+	ahueRezkaRingIdx, ahueRezkaRingLen = 0, 0
+	ahueRezkaHealthMu.Unlock()
+	ahueRezkaMutedTill.Store(0)
+	ahueRezkaLastProbe.Store(0)
+}
+
+// Пока источник молчит, к воркеру не ходим вовсе — кроме одной пробы раз в
+// ahueRezkaProbeEvery. Раньше молчание касалось только проверки наличия
+// (checksearch), а capi продолжал спрашивать потоки: во время бана воркер
+// получал по 75 запросов в минуту, и бан не отходил. Проба нужна, чтобы
+// заметить восстановление: её успех снимает молчание сразу.
+const ahueRezkaProbeEvery = 30 * time.Second
+
+var ahueRezkaLastProbe atomic.Int64
+
+// ahueRezkaPlaybackPath — запрос из тех, от которых зависит, сыграет ли видео.
+// Здоровье источника меряем только по ним: /info у воркера отвечает и тогда,
+// когда потоки лежат, и его успехи раньше тут же снимали молчание — предохранитель
+// дребезжал (18 срабатываний за 4 минуты) и ничего не сдерживал.
+func ahueRezkaPlaybackPath(path string) bool {
+	return strings.HasPrefix(path, "/movie-stream") ||
+		strings.HasPrefix(path, "/episode-stream") ||
+		strings.HasPrefix(path, "/episodes")
+}
+
+// ahueRezkaGate — можно ли сейчас идти к воркеру за path.
+func ahueRezkaGate(path string) bool {
+	if !ahueRezkaMuted() {
+		return true
+	}
+	if !ahueRezkaPlaybackPath(path) {
+		// Источник скрыт (checksearch отвечает «нет»), карточку по нему всё
+		// равно не сыграть — каталог не спрашиваем. Исключение — режим
+		// переключения на ноды: там main показывает источник по каталогу, а
+		// поток добывает нода, поэтому каталог main нужен и во время молчания.
+		return ahueRezkaFailover.Load()
+	}
+	now := time.Now().UnixNano()
+	last := ahueRezkaLastProbe.Load()
+	if now-last < int64(ahueRezkaProbeEvery) {
+		return false
+	}
+	return ahueRezkaLastProbe.CompareAndSwap(last, now)
+}
+
+// ahueRezkaMuted — источник сейчас признан нерабочим.
+func ahueRezkaMuted() bool {
+	till := ahueRezkaMutedTill.Load()
+	if till == 0 {
+		return false
+	}
+	if time.Now().UnixNano() >= till {
+		ahueRezkaMutedTill.CompareAndSwap(till, 0)
+		ahueRezkaResetHealth()
+		return false
+	}
+	return true
+}
+
 // ahueRezkaErrTransport marks a host that could not be reached at all (DNS, TCP,
 // TLS, timeout), as opposed to one that answered with an HTTP error status.
 var ahueRezkaErrTransport = errors.New("ahuerezka: transport failure")
+
+// ahueRezkaErrUpstream5xx — воркер ответил, но ошибкой на своей стороне.
+// Отделён от 404 («нет такого тайтла») специально: 5xx бывает следствием
+// НАШЕГО выхода в сеть, и только его есть смысл повторять напрямую.
+var ahueRezkaErrUpstream5xx = errors.New("ahuerezka: upstream 5xx")
 
 // ahueRezkaHostList builds the failover order: primary first, then the
 // configured spares, then the built-in default. Blanks and duplicates dropped.
@@ -228,23 +478,30 @@ func NewAhueRezkaChecker(cfg config.Config) *ahueRezkaChecker {
 		hls:     src.HLS,
 	}
 
-	r.client = &http.Client{Timeout: 25 * time.Second}
-	r.clientDirect = &http.Client{Timeout: 25 * time.Second} // never proxied — kp-worker fallback
-
-	// Optional SOCKS5 egress (the worker itself is globally reachable, but this
-	// future-proofs the rare case where the upstream needs RU egress).
-	if socksAddr := strings.TrimSpace(src.SocksProxy); socksAddr != "" {
-		if dialer, err := proxy.SOCKS5("tcp", socksAddr, nil, proxy.Direct); err == nil {
-			t := &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
-			if cd, ok := dialer.(proxy.ContextDialer); ok {
-				t.DialContext = cd.DialContext
-			}
-			r.client.Transport = t
-			log.Info().Str("socks", socksAddr).Msg("ahuerezka: HTTP client using SOCKS5 proxy")
-		} else {
-			log.Warn().Err(err).Str("socks", socksAddr).Msg("ahuerezka: failed to create SOCKS5 dialer")
+	r.clientDirect = &http.Client{Timeout: 25 * time.Second} // never proxied
+	// socks_proxy — один адрес или список через запятую: «127.0.0.1:40005,
+	// 127.0.0.1:40010». Каждый — отдельный выход; прямой всегда последний.
+	for _, addr := range strings.FieldsFunc(src.SocksProxy, func(c rune) bool { return c == ',' || c == ' ' || c == ';' }) {
+		addr = strings.TrimSpace(addr)
+		if addr == "" {
+			continue
 		}
+		dialer, err := proxy.SOCKS5("tcp", addr, nil, proxy.Direct)
+		if err != nil {
+			log.Warn().Err(err).Str("socks", addr).Msg("ahuerezka: failed to create SOCKS5 dialer")
+			continue
+		}
+		t := &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
+		if cd, ok := dialer.(proxy.ContextDialer); ok {
+			t.DialContext = cd.DialContext
+		}
+		r.egress = append(r.egress, &http.Client{Timeout: 25 * time.Second, Transport: t})
+		r.egressName = append(r.egressName, addr)
+		log.Info().Str("socks", addr).Msg("ahuerezka: HTTP client using SOCKS5 proxy")
 	}
+	r.egress = append(r.egress, r.clientDirect)
+	r.egressName = append(r.egressName, "direct")
+	r.client = r.egress[0]
 
 	// Voidboost stream CDN expects an HDRezka referer/origin. The proxy handler
 	// applies these to every /proxy/<url>?pl=ahuerezka fetch.
@@ -317,6 +574,9 @@ func (a *ahueRezkaChecker) Handle(cfg config.Config, plugin string, proxyLinks *
 // ---------------------------------------------------------------------------
 
 func (a *ahueRezkaChecker) checkSearch(req *http.Request) bool {
+	if ahueRezkaMuted() && !ahueRezkaFailover.Load() {
+		return false
+	}
 	kp := a.resolveKPID(req)
 	if kp == "" {
 		return false
@@ -332,7 +592,7 @@ func (a *ahueRezkaChecker) checkSearch(req *http.Request) bool {
 // embed — translator (voice) picker
 // ---------------------------------------------------------------------------
 
-func (a *ahueRezkaChecker) embed(w http.ResponseWriter, req *http.Request, plugin string, _ *proxylink.Manager) {
+func (a *ahueRezkaChecker) embed(w http.ResponseWriter, req *http.Request, plugin string, links *proxylink.Manager) {
 	q := req.URL.Query()
 	rjson := parseBoolParam(q.Get("rjson"))
 	title := strings.TrimSpace(q.Get("title"))
@@ -349,6 +609,27 @@ func (a *ahueRezkaChecker) embed(w http.ResponseWriter, req *http.Request, plugi
 	if !ok || len(info.Translators) == 0 {
 		writeGetsTVEmpty(w, rjson)
 		return
+	}
+
+	// ★У СЕРИАЛА первым экраном идут сезоны, а не озвучки. Раньше здесь для
+	// сериала отдавался список переводчиков с type:"voice" — клиент кладёт
+	// такой ответ в фильтр «Сезон», и зритель видел «Сезон: HDrezka Studio»
+	// (скрин 20.09.2026). Переключатель озвучек и так едет рядом с сезонами в
+	// ключе "voice" (buildVoiceList) — ровно так устроены остальные сериальные
+	// источники. Берём озвучку по умолчанию и уходим в сезоны.
+	if info.HasSeasons {
+		tr := strings.TrimSpace(info.DefaultTranslator)
+		if tr == "" {
+			tr = strings.TrimSpace(info.Translators[0].ID)
+		}
+		if tr != "" {
+			q2 := req.URL.Query()
+			q2.Set("t", tr)
+			req2 := req.Clone(req.Context())
+			req2.URL.RawQuery = q2.Encode()
+			a.serial(w, req2, plugin, links)
+			return
+		}
 	}
 
 	host := hostFromRequest(req)
@@ -606,9 +887,18 @@ func (a *ahueRezkaChecker) movie(w http.ResponseWriter, req *http.Request, plugi
 		return
 	}
 
-	streams, qualMap := a.extractStreams(req, streamResp.Stream, plugin)
+	streams, qualMap, firstRaw := a.extractStreams(req, streamResp.Stream, plugin)
 	if len(streams) == 0 {
 		log.Warn().Str("kp", kp).Str("t", t).Msg("ahuerezka: extractStreams returned 0 streams")
+		writeGetsTVEmpty(w, rjson)
+		return
+	}
+	// Самопроверка: воркер отдаёт 200 и ссылку, которая с этого адреса может
+	// быть мёртвой (404) — так он отвечает части адресов. Пустышку не отдаём:
+	// «нет контента» честнее, и тогда main попробует другую ноду.
+	if firstRaw != "" && !a.linkAlive(req.Context(), firstRaw) {
+		a.dropCachedStream(path)
+		log.Warn().Str("kp", kp).Str("t", t).Msg("ahuerezka: ссылка с этого адреса не играет — отвечаем «нет контента»")
 		writeGetsTVEmpty(w, rjson)
 		return
 	}
@@ -743,9 +1033,66 @@ func ahueRezkaLooksLikeMedia(u string) bool {
 	return false
 }
 
-func (a *ahueRezkaChecker) extractStreams(req *http.Request, decoded, plugin string) ([]map[string]any, map[string]string) {
+// linkAlive — отдаёт ли CDN видео по ссылке, если спросить ТЕМ ЖЕ выходом,
+// которым она добыта: ссылка привязана к добывшему адресу. Два байта с
+// переходами по редиректам (voidboost → apollo) — дёшево и к воркеру не ходит.
+func (a *ahueRezkaChecker) linkAlive(ctx context.Context, rawURL string) bool {
+	pool := a.egressList()
+	cl := pool[a.currentEgress(len(pool))]
+	c, cancel := context.WithTimeout(ctx, 8*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(c, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return false
+	}
+	for k, v := range ahueRezkaStreamHeaders() {
+		req.Header.Set(k, v)
+	}
+	req.Header.Set("Range", "bytes=0-1")
+	resp, err := cl.Do(req)
+	if err != nil {
+		// Сеть моргнула — это не приговор ссылке; не выкидываем рабочий источник.
+		return true
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1024))
+	return resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusPartialContent
+}
+
+// dropCachedStream — забыть закэшированный поток: его ссылка оказалась мёртвой.
+func (a *ahueRezkaChecker) dropCachedStream(path string) {
+	a.respMu.Lock()
+	delete(a.resp, "stream|"+path)
+	a.respMu.Unlock()
+}
+
+// ahueRezkaFailover — main умеет добрать поток на ноде, если у него самого не
+// вышло (httpapi, serveLiteWithFailover). Тогда проверка наличия не должна
+// прятать источник из-за молчания main: зритель нажмёт — поток найдёт нода.
+var ahueRezkaFailover atomic.Bool
+
+// SetAhueRezkaFailover включает режим, в котором checksearch смотрит только на
+// каталог, а не на здоровье потоков main.
+func SetAhueRezkaFailover(on bool) { ahueRezkaFailover.Store(on) }
+
+// proxyStreamURL — ссылка на поток через подписанный токен, а не «сырой»
+// /proxy/<адрес>. Разница принципиальна: ссылка voidboost привязана к адресу,
+// который её добыл (добытая через DE играет только через DE, 206; с main и
+// через WARP — 404), и отдавать видео обязан добывший. Токен несёт edge_url
+// ноды, и main отправляет зрителя за видео именно к ней — как у zetflix/hdvb.
+// Сырая форма такой подписи не несёт: видео шло через main и получало 404.
+// Без менеджера ссылок (тесты, крайний случай) — прежняя сырая форма.
+func (a *ahueRezkaChecker) proxyStreamURL(req *http.Request, rawURL, plugin string) string {
+	if a.links == nil {
+		return streamProxyDirectURL(req, rawURL, plugin)
+	}
+	return streamProxyURLWithHeaders(req, rawURL, plugin, a.links, ahueRezkaStreamHeaders())
+}
+
+func (a *ahueRezkaChecker) extractStreams(req *http.Request, decoded, plugin string) ([]map[string]any, map[string]string, string) {
 	streams := make([]map[string]any, 0, 6)
 	qualMap := make(map[string]string, 6)
+	firstRaw := "" // сырая ссылка лучшего качества — по ней проверяем, играет ли
 	// Read once per call so both loops below agree even if a reload lands mid-flight.
 	hlsOn := a.hlsEnabled()
 	premiumOn := a.premiumEnabled()
@@ -796,7 +1143,10 @@ func (a *ahueRezkaChecker) extractStreams(req *http.Request, decoded, plugin str
 				label = trueLabel
 			}
 		}
-		proxied := streamProxyDirectURL(req, rawURL, plugin)
+		proxied := a.proxyStreamURL(req, rawURL, plugin)
+		if firstRaw == "" {
+			firstRaw = rawURL
+		}
 		streams = append(streams, map[string]any{"url": proxied, "label": label})
 		qualMap[label] = proxied
 	}
@@ -817,11 +1167,14 @@ func (a *ahueRezkaChecker) extractStreams(req *http.Request, decoded, plugin str
 			}
 			rawURL = ahueRezkaApplyHLSForm(rawURL, hlsOn)
 			rawURL = fixVoidboostURL(rawURL)
-			proxied := streamProxyDirectURL(req, rawURL, plugin)
+			proxied := a.proxyStreamURL(req, rawURL, plugin)
 			if _, ok := seen[proxied]; ok {
 				continue
 			}
 			seen[proxied] = struct{}{}
+			if firstRaw == "" {
+				firstRaw = rawURL
+			}
 			label := "auto"
 			if i > 0 {
 				label = fmt.Sprintf("alt-%d", i+1)
@@ -831,7 +1184,7 @@ func (a *ahueRezkaChecker) extractStreams(req *http.Request, decoded, plugin str
 		}
 	}
 
-	return streams, qualMap
+	return streams, qualMap, firstRaw
 }
 
 // ---------------------------------------------------------------------------
@@ -927,7 +1280,7 @@ func (a *ahueRezkaChecker) kpSearchOne(ctx context.Context, title, year string) 
 
 func (a *ahueRezkaChecker) fetchInfo(ctx context.Context, kp string) (ahueRezkaInfo, bool) {
 	var info ahueRezkaInfo
-	body, ok := a.getJSONPath(ctx, "/info?id="+url.QueryEscape(kp))
+	body, ok := a.cachedJSON(ctx, "/info?id="+url.QueryEscape(kp))
 	if !ok {
 		return info, false
 	}
@@ -940,7 +1293,7 @@ func (a *ahueRezkaChecker) fetchInfo(ctx context.Context, kp string) (ahueRezkaI
 
 func (a *ahueRezkaChecker) fetchEpisodes(ctx context.Context, kp, t string) (ahueRezkaEpisodes, bool) {
 	var eps ahueRezkaEpisodes
-	body, ok := a.getJSONPath(ctx, "/episodes?id="+url.QueryEscape(kp)+"&translator_id="+url.QueryEscape(t))
+	body, ok := a.cachedJSON(ctx, "/episodes?id="+url.QueryEscape(kp)+"&translator_id="+url.QueryEscape(t))
 	if !ok {
 		return eps, false
 	}
@@ -953,7 +1306,7 @@ func (a *ahueRezkaChecker) fetchEpisodes(ctx context.Context, kp, t string) (ahu
 
 func (a *ahueRezkaChecker) fetchStream(ctx context.Context, path string) (ahueRezkaStream, bool) {
 	var st ahueRezkaStream
-	body, ok := a.getJSONPath(ctx, path)
+	body, ok := a.cachedStream(ctx, path)
 	if !ok {
 		return st, false
 	}
@@ -967,22 +1320,99 @@ func (a *ahueRezkaChecker) fetchStream(ctx context.Context, path string) (ahueRe
 // getJSONPath fetches a worker path (e.g. "/info?id=301"), walking the mirror
 // list on transport failures.
 func (a *ahueRezkaChecker) getJSONPath(ctx context.Context, path string) ([]byte, bool) {
+	if !ahueRezkaGate(path) {
+		return nil, false
+	}
+	playback := ahueRezkaPlaybackPath(path)
+	note := func(failed bool) {
+		if playback {
+			ahueRezkaNoteUpstream(failed)
+		}
+	}
 	attempts := len(a.hosts)
 	if attempts < 1 {
 		attempts = 1
 	}
+	pool := a.egressList()
 	for i := 0; i < attempts; i++ {
 		host := a.activeHost()
-		body, err := a.getJSONVia(ctx, host+path, a.client)
+		cur := a.currentEgress(len(pool))
+		body, err := a.getJSONVia(ctx, host+path, pool[cur])
 		if err == nil {
+			note(false)
 			return body, true
 		}
 		if !errors.Is(err, ahueRezkaErrTransport) {
-			// The mirror is alive and told us something (404 = no such title,
-			// 5xx = worker error). Another mirror would answer the same.
+			// Воркер ответил ошибкой. На /info это почти всегда промах по
+			// каталогу («FILM_INFO_FETCH_FAIL») — другой выход ответит тем же,
+			// и гонять его незачем. А вот 5xx на потоке и сериях — типичный
+			// бан НАШЕГО адреса: пробуем другие выходы, и тот, что ответил,
+			// становится текущим.
+			if errors.Is(err, ahueRezkaErrUpstream5xx) && !strings.HasPrefix(path, "/info") {
+				if body, ok := a.tryOtherEgress(ctx, host+path, pool, cur); ok {
+					note(false)
+					return body, true
+				}
+			}
+			note(errors.Is(err, ahueRezkaErrUpstream5xx))
 			return nil, false
 		}
 		ahueRezkaAdvanceHost(a.hosts, &ahueRezkaHostIdx, host, "worker")
+	}
+	return nil, false
+}
+
+// ahueRezkaMaxEgressTries — сколько ДРУГИХ выходов пробуем на один отказ.
+// Промах по конкретному тайтлу бывает и на потоке; без потолка каждый такой
+// промах обходил бы весь пул.
+const ahueRezkaMaxEgressTries = 2
+
+// egressList — выходы по порядку. Чекеры из тестов пул не строят: у них
+// есть только client и clientDirect.
+func (a *ahueRezkaChecker) egressList() []*http.Client {
+	if len(a.egress) > 0 {
+		return a.egress
+	}
+	if a.clientDirect != nil && a.clientDirect != a.client {
+		return []*http.Client{a.client, a.clientDirect}
+	}
+	return []*http.Client{a.client}
+}
+
+func (a *ahueRezkaChecker) currentEgress(n int) int {
+	cur := int(a.egressCur.Load())
+	if cur < 0 || cur >= n {
+		return 0
+	}
+	return cur
+}
+
+func (a *ahueRezkaChecker) egressLabel(i int) string {
+	if i >= 0 && i < len(a.egressName) {
+		return a.egressName[i]
+	}
+	return strconv.Itoa(i)
+}
+
+// tryOtherEgress повторяет запрос через следующие выходы пула (не больше
+// ahueRezkaMaxEgressTries) и закрепляет тот, что ответил успехом.
+func (a *ahueRezkaChecker) tryOtherEgress(ctx context.Context, target string, pool []*http.Client, cur int) ([]byte, bool) {
+	tries := 0
+	for step := 1; step < len(pool) && tries < ahueRezkaMaxEgressTries; step++ {
+		idx := (cur + step) % len(pool)
+		if pool[idx] == pool[cur] {
+			continue
+		}
+		tries++
+		body, err := a.getJSONVia(ctx, target, pool[idx])
+		if err != nil {
+			continue
+		}
+		if a.egressCur.CompareAndSwap(int32(cur), int32(idx)) {
+			log.Warn().Str("был", a.egressLabel(cur)).Str("стал", a.egressLabel(idx)).
+				Msg("ahuerezka: воркер режет текущий выход — переключились на ответивший")
+		}
+		return body, true
 	}
 	return nil, false
 }
@@ -1040,6 +1470,9 @@ func (a *ahueRezkaChecker) getJSONVia(ctx context.Context, target string, client
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		log.Debug().Int("status", resp.StatusCode).Str("url", target).Msg("ahuerezka: bad status")
+		if resp.StatusCode >= 500 {
+			return nil, fmt.Errorf("%w: status %d", ahueRezkaErrUpstream5xx, resp.StatusCode)
+		}
 		return nil, fmt.Errorf("ahuerezka: status %d", resp.StatusCode)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))

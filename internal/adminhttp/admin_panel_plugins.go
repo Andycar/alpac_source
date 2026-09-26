@@ -10,9 +10,39 @@ import (
 	"lampac-go/internal/config"
 	"lampac-go/internal/tgauth"
 	"lampac-go/internal/torrs"
+
+	"github.com/rs/zerolog/log"
 )
 
 // --- Plugins API ---
+
+// setListPreservingExisting записывает список в секцию TOML, но ПУСТЫМ списком
+// не затирает уже настроенный.
+//
+// Страница плагинов шлёт форму целиком, поэтому поле, которого на ней нет,
+// приходит как []. Прямое присваивание молча выкашивало настройку: на проде
+// одно сохранение из админки стёрло [iptv] global_playlists вместе с платной
+// панелью — 4200 источников каналов. Очистить список по-прежнему можно, но
+// правкой config.toml, где это осознанное действие.
+func setListPreservingExisting(section map[string]any, key string, values []string) {
+	if len(values) > 0 {
+		section[key] = values
+		return
+	}
+	kept := 0
+	switch cur := section[key].(type) {
+	case []any:
+		kept = len(cur)
+	case []string:
+		kept = len(cur)
+	}
+	if kept > 0 {
+		log.Warn().Str("key", key).Int("kept", kept).
+			Msg("admin: пустой список из формы НЕ затирает настроенный — чистите через config.toml")
+		return
+	}
+	section[key] = values
+}
 
 func tgAdminPluginsHandler(store *tgauth.Store, adminStore *tgauth.AdminIDStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -140,6 +170,9 @@ func tgAdminPluginsHandler(store *tgauth.Store, adminStore *tgauth.AdminIDStore)
 				iptvConf["max_playlists"] = ic.MaxPlaylists
 				iptvConf["default_proxy"] = ic.DefaultProxy
 				iptvConf["global_playlists"] = ic.GlobalPlaylists
+				iptvConf["registry"] = ic.Registry
+				iptvConf["registry_auto_add"] = ic.RegistryAutoAdd
+				iptvConf["registry_only"] = ic.RegistryOnly
 			}
 			// antidpi settings
 			antidpiConf := map[string]any{
@@ -245,7 +278,7 @@ func tgAdminPluginsHandler(store *tgauth.Store, adminStore *tgauth.AdminIDStore)
 								out = append(out, strings.TrimSpace(s))
 							}
 						}
-						section["epg_urls"] = out
+						setListPreservingExisting(section, "epg_urls", out)
 					}
 					if gp, ok := req.IPTV["global_playlists"].([]any); ok {
 						var out []string
@@ -254,7 +287,7 @@ func tgAdminPluginsHandler(store *tgauth.Store, adminStore *tgauth.AdminIDStore)
 								out = append(out, strings.TrimSpace(s))
 							}
 						}
-						section["global_playlists"] = out
+						setListPreservingExisting(section, "global_playlists", out)
 					}
 				}); err != nil {
 					writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": err.Error()})

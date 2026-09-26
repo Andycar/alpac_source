@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
 	"github.com/rs/zerolog/log"
 )
 
@@ -58,7 +59,6 @@ type YouTubeAuthProvider interface {
 	Unlink(tgID int64) error
 	ChannelTitle(tgID int64) string
 }
-
 
 // CalendarHandler provides calendar data for the bot.
 // Implemented by httpapi.calendarBotAdapter — avoids circular import.
@@ -854,7 +854,7 @@ func (b *Bot) handleMessage(msg *tgMessage) {
 				extendDays = 30
 			}
 			_ = b.store.Extend(existing.Token, extendDays)
-			b.pending.Approve(code, existing.Token)
+			b.approvePending(code, existing.Token)
 			b.sendMsgWithReply(msg.Chat.ID, t.CodeAccepted, b.mainMenuKeyboard(lang))
 			log.Info().Int64("tg_id", msg.From.ID).Str("code", code).Int("extend_days", extendDays).Msg("tgauth: auto-approved (existing user, extended)")
 			return
@@ -876,7 +876,7 @@ func (b *Bot) handleMessage(msg *tgMessage) {
 				b.sendMsgWithReply(msg.Chat.ID, t.CodeErrorApprove, b.mainMenuKeyboard(lang))
 				return
 			}
-			b.pending.Approve(code, token)
+			b.approvePending(code, token)
 			label := DurationLabelLang(lang, days)
 			b.sendMsgWithReply(msg.Chat.ID, fmt.Sprintf(t.CodeAutoApproved, label), b.mainMenuKeyboard(lang))
 			// Notify admin (informational, no action buttons) — always in admin's lang
@@ -909,6 +909,8 @@ func (b *Bot) handleMessage(msg *tgMessage) {
 				return
 			}
 			b.devicePending.Confirm(code)
+			// Explicit approval of this device lifts any earlier unbind of it.
+			b.store.ApproveDevice(dreq.Token, dreq.UID)
 			dev := DeviceInfo{
 				UID:      dreq.UID,
 				Label:    dreq.Label,
@@ -963,8 +965,8 @@ func (b *Bot) sendRoomJoinButton(msg *tgMessage, code string) {
 		b.sendMsgWithReply(msg.Chat.ID, tr.RoomUnavailable, b.mainMenuKeyboard(lang))
 		return
 	}
-	// host = the FULL SPA base URL (no hardcoded /app prefix): on tv.alcopa.cc the SPA is
-	// served at root → https://tv.alcopa.cc/#/room/<code>. If a deployment serves the SPA
+	// host = the FULL SPA base URL (no hardcoded /app prefix): on tv.example.com the SPA is
+	// served at root → https://tv.example.com/#/room/<code>. If a deployment serves the SPA
 	// under a sub-path, the admin includes it in public_host (e.g. https://host/app).
 	roomURL := host + "/#/room/" + code
 	prompt := tr.RoomPrompt + "\n\n" + fmt.Sprintf(tr.RoomCodeLine, code)
@@ -1466,11 +1468,42 @@ func (b *Bot) handleDevices(msg *tgMessage) {
 // list is shown from three places (the command, the profile button, and after an
 // unbind) and the three copies had already drifted apart.
 func devicesView(tok *ApprovedToken, tr *Messages) (string, *tgInlineKeyboardMarkup) {
+	return devicesViewPage(tok, tr, 0)
+}
+
+// devicesPageSize is how many devices one message shows. Telegram rejects an
+// inline keyboard that grows past ~10 KB with «reply markup is too long» —
+// two buttons per device × a 36-char token in every callback hit that at
+// ~40 devices, and the button in the bot then did nothing at all (2026-09-02,
+// an account with 44 devices). Pages keep every account under the limit.
+const devicesPageSize = 8
+
+// devicesViewPage renders one page of the device list; page is 0-based and
+// clamped. Navigation buttons carry "devpage:<token>:<page>".
+func devicesViewPage(tok *ApprovedToken, tr *Messages, page int) (string, *tgInlineKeyboardMarkup) {
+	total := len(tok.Devices)
+	pages := (total + devicesPageSize - 1) / devicesPageSize
+	if pages < 1 {
+		pages = 1
+	}
+	if page < 0 {
+		page = 0
+	}
+	if page >= pages {
+		page = pages - 1
+	}
+	start := page * devicesPageSize
+	end := min(start+devicesPageSize, total)
+
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf(tr.DevicesTitle, len(tok.Devices)))
+	sb.WriteString(fmt.Sprintf(tr.DevicesTitle, total))
+	if pages > 1 {
+		sb.WriteString(fmt.Sprintf("<i>%d–%d / %d</i>\n\n", start+1, end, total))
+	}
 
 	var rows [][]tgInlineKeyboardButton
-	for i, d := range tok.Devices {
+	for i := start; i < end; i++ {
+		d := tok.Devices[i]
 		lastSeen := "—"
 		if !d.LastSeen.IsZero() {
 			lastSeen = fmtDateTime(d.LastSeen)
@@ -1483,6 +1516,17 @@ func devicesView(tok *ApprovedToken, tr *Messages) (string, *tgInlineKeyboardMar
 			{Text: tr.DeviceUnbindBtn, CallbackData: "unbind:" + tok.Token + ":" + d.UID},
 		})
 	}
+	if pages > 1 {
+		nav := []tgInlineKeyboardButton{}
+		if page > 0 {
+			nav = append(nav, tgInlineKeyboardButton{Text: "◀️", CallbackData: fmt.Sprintf("devpage:%s:%d", tok.Token, page-1)})
+		}
+		nav = append(nav, tgInlineKeyboardButton{Text: fmt.Sprintf("%d / %d", page+1, pages), CallbackData: fmt.Sprintf("devpage:%s:%d", tok.Token, page)})
+		if page < pages-1 {
+			nav = append(nav, tgInlineKeyboardButton{Text: "▶️", CallbackData: fmt.Sprintf("devpage:%s:%d", tok.Token, page+1)})
+		}
+		rows = append(rows, nav)
+	}
 	if len(tok.Devices) > 1 {
 		// Only with something to sweep: on a single device this is just a more
 		// dangerous version of the button right above it.
@@ -1491,6 +1535,24 @@ func devicesView(tok *ApprovedToken, tr *Messages) (string, *tgInlineKeyboardMar
 		})
 	}
 	return sb.String(), &tgInlineKeyboardMarkup{InlineKeyboard: rows}
+}
+
+// approvePending marks the pending code approved with token and, when the
+// request came from a known device UID, records the owner's explicit approval
+// of that device in the token store. The approval is what lets a device the
+// user previously unbound (see Store.RemoveDevice / ErrDeviceRevoked) attach
+// again — pairing through the bot is the only way back after an unbind.
+func (b *Bot) approvePending(code, token string) {
+	b.pending.Approve(code, token)
+	if req, ok := b.pending.FindByCode(code); ok {
+		switch {
+		case req.UID != "":
+			b.store.ApproveDevice(token, req.UID)
+		case req.ClientIP != "":
+			// Browser /tg/auth page pairs by IP, not uid.
+			b.store.ApproveDeviceFromIP(token, req.ClientIP)
+		}
+	}
 }
 
 func (b *Bot) handleUnbindCommand(msg *tgMessage, text string) {
@@ -1586,6 +1648,7 @@ func (b *Bot) handleCallbackQuery(cb *tgCallbackQuery) {
 	}
 
 	// ---- Profile inline buttons: Devices / Language (moved off the reply keyboard) ----
+
 	if data == "profile:devices" || data == "profile:lang" {
 		b.answerCallback(cb.ID, "")
 		if cb.Message != nil {
@@ -1679,6 +1742,27 @@ func (b *Bot) handleCallbackQuery(cb *tgCallbackQuery) {
 			}
 		}
 		b.sendMsg(cb.From.ID, fmt.Sprintf(tr.DeviceRenameAsk, currentLabel, uid), nil)
+		return
+	}
+
+	// ---- User: devices list pagination ----
+	if strings.HasPrefix(data, "devpage:") {
+		parts := strings.SplitN(data, ":", 3)
+		if len(parts) != 3 {
+			b.answerCallback(cb.ID, tr.ErrorData)
+			return
+		}
+		tok := b.store.FindByTelegramID(cb.From.ID)
+		if tok == nil || tok.Token != parts[1] {
+			b.answerCallback(cb.ID, tr.NoAccess)
+			return
+		}
+		page, _ := strconv.Atoi(parts[2])
+		b.answerCallback(cb.ID, "")
+		if cb.Message != nil {
+			text, kb := devicesViewPage(tok, tr, page)
+			b.editMsgWithKeyboard(cb.Message.Chat.ID, cb.Message.MessageID, text, kb)
+		}
 		return
 	}
 
@@ -1969,7 +2053,7 @@ func (b *Bot) handleCallbackQuery(cb *tgCallbackQuery) {
 			}
 		}
 
-		b.pending.Approve(code, token)
+		b.approvePending(code, token)
 
 		label := DurationLabelLang(lang, days)
 		b.answerCallback(cb.ID, "✅ "+label)
@@ -2638,9 +2722,10 @@ type tgUser struct {
 }
 
 type tgChat struct {
-	ID    int64  `json:"id"`
-	Type  string `json:"type"` // "private", "group", "supergroup", "channel"
-	Title string `json:"title"`
+	ID       int64  `json:"id"`
+	Type     string `json:"type"` // "private", "group", "supergroup", "channel"
+	Title    string `json:"title"`
+	Username string `json:"username"`
 }
 
 type tgInlineKeyboardMarkup struct {

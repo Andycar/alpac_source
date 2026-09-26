@@ -8,14 +8,22 @@ import (
 	"time"
 
 	"github.com/rs/zerolog/log"
+
+	"lampac-go/internal/browsertmp"
 )
 
 // chromeTmpPrefixes are leading filename fragments for transient Chrome
 // scratch directories that Chrome itself or our balancer pools create
 // in $TMPDIR. The janitor only ever touches names matching one of these
 // prefixes; persistent profiles ("rezka-chrome", "zona-chrome-profiles",
-// "turbo-chrome-pac", "puppeteer_dev_chrome_profile-*") are intentionally
-// omitted — they are managed by their owners.
+// "turbo-chrome-pac") are intentionally omitted — they are managed by
+// their owners.
+//
+// "puppeteer_dev_chrome_profile-*" used to be excluded on the same
+// "managed by their owners" reasoning, which was wrong: the owner was a
+// node subprocess that got SIGKILLed on timeout, so nobody ever cleaned
+// them. They are now swept by internal/browsertmp, which applies a
+// staleness cutoff — see Prefixes there.
 //
 // "com.google.Chrome." and ".org.chromium.Chromium." are created by the
 // Chrome / Chromium binary itself for Crashpad scratch space whenever a
@@ -51,13 +59,26 @@ const (
 // entries. Failures are logged at debug level and never propagated —
 // the caller continues even if a single removal fails.
 //
-// Pass tmpDir == "" to use os.TempDir(). Pass maxAge == 0 to skip the
+// Pass tmpDir == "" to sweep every root in browsertmp.Roots() —
+// os.TempDir() plus snap Chromium's private /tmp, where a snap browser
+// really keeps these directories. Pass maxAge == 0 to skip the
 // freshness check (NOT recommended in production — a live Chrome
-// session can have an arbitrary ModTime).
+// session can have an arbitrary ModTime). A directory some running
+// process names as its --user-data-dir is never removed.
 func CleanupStaleChromeTmp(tmpDir string, maxAge time.Duration) int {
+	roots := []string{tmpDir}
 	if tmpDir == "" {
-		tmpDir = os.TempDir()
+		roots = browsertmp.Roots()
 	}
+	inUse := browsertmp.InUse()
+	removed := 0
+	for _, root := range roots {
+		removed += cleanupChromeTmpRoot(root, maxAge, inUse)
+	}
+	return removed
+}
+
+func cleanupChromeTmpRoot(tmpDir string, maxAge time.Duration, inUse map[string]struct{}) int {
 	entries, err := os.ReadDir(tmpDir)
 	if err != nil {
 		log.Debug().Err(err).Str("dir", tmpDir).Msg("chrome tmp janitor: readdir failed")
@@ -74,6 +95,9 @@ func CleanupStaleChromeTmp(tmpDir string, maxAge time.Duration) int {
 		// Only directories — never touch sockets / regular files that
 		// happen to share a prefix.
 		if !e.IsDir() {
+			continue
+		}
+		if _, live := inUse[name]; live {
 			continue
 		}
 		full := filepath.Join(tmpDir, name)

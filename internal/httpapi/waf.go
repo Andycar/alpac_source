@@ -403,6 +403,14 @@ func newWafState(cfg wafConfig, geo *geoip.DB) *wafState {
 	}
 
 	// Rate limit rules — compile path regexps.
+	//
+	// The order matters and must not depend on map iteration: checkRateLimit
+	// applies the FIRST rule whose pattern matches, and a catch-all like ".*"
+	// matches every path. Ranging a Go map gives a random order, so a catch-all
+	// landed ahead of the specific rules on some starts and behind them on
+	// others — the same server silently enforced 10 req/s on /proxy/ after one
+	// restart and the intended 50 after the next. Sorted below: specific rules
+	// first (alphabetically, for a stable result), catch-alls last.
 	for pattern, rule := range cfg.LimitMap {
 		re, err := regexp.Compile(pattern)
 		if err != nil {
@@ -425,6 +433,7 @@ func newWafState(cfg wafConfig, geo *geoip.DB) *wafState {
 			queryIDs: rule.QueryIDs,
 		})
 	}
+	sortWAFLimitRules(s.limitRules)
 
 	if bans, err := loadManualBans(); err == nil {
 		now := time.Now().Unix()
@@ -819,7 +828,19 @@ func staticResourceBuiltin(path string) bool {
 		strings.HasPrefix(path, "/lite/youtube/mux") ||
 		// /api/iptv/logo?channel_id=ID — channel-logo proxy. Same story: the Live
 		// TV grid fans out ~100 logo requests at once → would 429 half the tiles.
-		path == "/api/iptv/logo"
+		path == "/api/iptv/logo" ||
+		// /api/iptv/play — каждый зэппинг (Ch+/Ch− подряд) и каждый реконнект
+		// плеера; 429 здесь = «канал не открылся» и ускоренный выброс из плеера.
+		// /api/iptv/preview — сетка Live TV дёргает превью на каждую видимую
+		// карточку (до 3 ретраев), /epg/ — той же сеткой. Все — за auth-гейтом.
+		path == "/api/iptv/play" ||
+		path == "/api/iptv/preview" ||
+		strings.HasPrefix(path, "/api/iptv/epg/") ||
+		// /capi/quality[/batch] — бейджи качества карточек. Сетка фанаутит их на каждую плитку
+		// (старые клиенты — по одному, новые — пачкой на экран); за signed-гейтом capi, read-only,
+		// серверный кэш 24ч — лимитировать нечего, а 429 = «бейдж не пришёл» на половине плиток.
+		path == "/capi/quality" ||
+		path == "/capi/quality/batch"
 }
 
 // isAuthPath returns true for auth-related paths that must never be rate-limited.

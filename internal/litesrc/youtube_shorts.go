@@ -283,15 +283,147 @@ func (y *YoutubeChecker) ensureCookieWork() string {
 		// Master gone/empty — fall back to it rather than silently dropping authentication.
 		return y.cookiePath
 	}
-	tmp := fmt.Sprintf("%s.%d.tmp", y.cookieWorkPath, os.Getpid())
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		log.Warn().Err(err).Msg("youtube: cannot stage cookie work copy — using the master")
-		return y.cookiePath
+	// The temp name must be unique per CALL, not per process. ensureCookieWork runs
+	// on EVERY yt-dlp invocation and those overlap (ytdlpSem admits several at once),
+	// so a PID-named temp gave every concurrent caller the same path: the first
+	// Rename consumed it and the rest failed with ENOENT. Measured on prod
+	// 2026-09-01 — «cannot publish cookie work copy» fired ~10 times in 3 hours.
+	//
+	// The fallback below is what made that race destructive. Handing yt-dlp the
+	// master is never safe: its rewrite is lossy (see the doc comment above), so
+	// every lost race stripped auth cookies from the master itself. That is how the
+	// master decayed from 8780 to 1887 bytes and lost SID/SIDTS/__Secure-1PSID/
+	// LOGIN_INFO, which is what makes the tv client answer «The page needs to be
+	// reloaded». On failure we reuse the existing work copy — stale but complete,
+	// and disposable — and only give up cookies entirely if there is none.
+	f, err := os.CreateTemp(filepath.Dir(y.cookieWorkPath), filepath.Base(y.cookieWorkPath)+".*.tmp")
+	if err != nil {
+		log.Warn().Err(err).Msg("youtube: cannot stage cookie work copy — reusing the previous one")
+		return y.existingCookieWork()
+	}
+	tmp := f.Name()
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		log.Warn().Err(err).Msg("youtube: cannot stage cookie work copy — reusing the previous one")
+		return y.existingCookieWork()
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmp)
+		log.Warn().Err(err).Msg("youtube: cannot stage cookie work copy — reusing the previous one")
+		return y.existingCookieWork()
+	}
+	if err := os.Chmod(tmp, 0o600); err != nil {
+		_ = os.Remove(tmp)
+		log.Warn().Err(err).Msg("youtube: cannot stage cookie work copy — reusing the previous one")
+		return y.existingCookieWork()
 	}
 	if err := os.Rename(tmp, y.cookieWorkPath); err != nil {
 		_ = os.Remove(tmp)
-		log.Warn().Err(err).Msg("youtube: cannot publish cookie work copy — using the master")
-		return y.cookiePath
+		log.Warn().Err(err).Msg("youtube: cannot publish cookie work copy — reusing the previous one")
+		return y.existingCookieWork()
 	}
 	return y.cookieWorkPath
+}
+
+// existingCookieWork is the fallback when staging a fresh copy fails. It returns
+// the previous work copy when one exists, and otherwise "" (no --cookies) — never
+// the master, because yt-dlp rewrites whatever it is given and that rewrite drops
+// authentication cookies for good.
+func (y *YoutubeChecker) existingCookieWork() string {
+	if st, err := os.Stat(y.cookieWorkPath); err == nil && st.Size() > 0 {
+		return y.cookieWorkPath
+	}
+	return ""
+}
+
+// ── learned byte window of a POT-less googlevideo URL ──
+//
+// A URL without a PO Token serves a fixed number of BYTES and then answers 403/416 forever
+// (measured 2026-08-17 with sequential 1 MiB chunks: ~15 MiB on mweb, ~22 MiB on android_vr; the
+// same URL with a POT served 20/20 without a hiccup). The size is YouTube's to change, so it is
+// learned at runtime rather than hard-coded: every reactive 403 reports how far the dead URL got,
+// and the estimate walks down to the smallest observed window.
+//
+// Downloads re-mint proactively a little before this mark, which turns "two 403s, a wait and a
+// retry per window" into a plain URL swap.
+var ytWindow struct {
+	mu   sync.Mutex
+	est  int64
+	low  int // consecutive observations below the current estimate
+	last time.Time
+}
+
+const (
+	// ytWindowDefault sits below the smallest window ever measured (15 MiB on mweb, 22 on
+	// android_vr) so the very first download already swaps in time.
+	ytWindowDefault = 12 << 20
+	// ytWindowFloor is a REAL floor, not a formality. It was 4 MiB, and prod 2026-08-17 promptly
+	// collapsed the estimate to 3.5 MiB off a single unrelated 403 — after which every download
+	// re-minted every 3.5 MiB. Each re-mint is a yt-dlp extraction, so that became an extraction
+	// storm: «yt-dlp returned 0 formats» × 256 in ten minutes (anti-bot), torn chunk seams and
+	// «Invalid NAL unit size» in ffmpeg. No real window has ever been observed near this value.
+	ytWindowFloor = 8 << 20
+	// ytWindowShrinkAfter requires the wall to be seen repeatedly before believing it. One 403 can
+	// be a dead route, a stale URL or a proxy hiccup; three in a row is a pattern.
+	ytWindowShrinkAfter = 3
+	// ytRemintMinInterval bounds how often ONE download may swap its URL, regardless of what the
+	// window estimate claims. This is the circuit breaker that keeps a bad estimate from turning
+	// into a yt-dlp extraction storm.
+	ytRemintMinInterval = 8 * time.Second
+	// mintFailRetries is how many times a download waits for extraction to recover before it
+	// truncates the file. Anti-bot bursts are short; a paused pipe costs the viewer a stall,
+	// a closed one costs them an error.
+	mintFailRetries = 3
+	// ytMuxRetryAfter / ytMuxMaxAttempts bound the retry of a mux job that died. ffmpeg failures
+	// are usually transient (an anti-bot burst truncated the download), but a genuinely dead
+	// video must not spin ffmpeg and yt-dlp for ever.
+	ytMuxRetryAfter  = 5 * time.Second
+	ytMuxMaxAttempts = 3
+)
+
+// ytWindowEstimate returns the current best guess at the POT-less byte window.
+func ytWindowEstimate() int64 {
+	ytWindow.mu.Lock()
+	defer ytWindow.mu.Unlock()
+	if ytWindow.est <= 0 {
+		ytWindow.est = ytWindowDefault
+	}
+	return ytWindow.est
+}
+
+// ytLearnWindow records how many bytes a URL served before the CDN cut it off.
+//
+// Shrinking is deliberately reluctant: the estimate drives how often we re-mint, and re-minting
+// costs a yt-dlp extraction, so an over-eager estimate does far more damage (extraction storm →
+// anti-bot → nothing plays) than an over-generous one (a few reactive 403s, which the download
+// already recovers from).
+func ytLearnWindow(served int64) {
+	if served < ytWindowFloor {
+		return // implausible as a window — treat as an unrelated 403
+	}
+	target := served - (served / 8) // aim a little under what was actually served
+	if target < ytWindowFloor {
+		target = ytWindowFloor
+	}
+
+	ytWindow.mu.Lock()
+	defer ytWindow.mu.Unlock()
+	if ytWindow.est <= 0 {
+		ytWindow.est = ytWindowDefault
+	}
+	if target >= ytWindow.est {
+		// The URL lasted at least as long as we expected — the estimate is fine, and any earlier
+		// low readings were noise.
+		ytWindow.low = 0
+		return
+	}
+	ytWindow.low++
+	if ytWindow.low < ytWindowShrinkAfter {
+		return
+	}
+	ytWindow.low = 0
+	ytWindow.est = target
+	ytWindow.last = time.Now()
+	log.Info().Int64("window_bytes", target).Msg("youtube: learned a smaller POT-less byte window")
 }
