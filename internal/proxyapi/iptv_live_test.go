@@ -59,10 +59,10 @@ func TestTrimLiveDVRInsertsMediaSequence(t *testing.T) {
 
 func TestTrimLiveDVRPassThrough(t *testing.T) {
 	cases := map[string]string{
-		"vod": "#EXTM3U\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXTINF:6,\na.ts\n#EXTINF:6,\nb.ts\n#EXT-X-ENDLIST\n",
+		"vod":                         "#EXTM3U\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXTINF:6,\na.ts\n#EXTINF:6,\nb.ts\n#EXT-X-ENDLIST\n",
 		"endlist (flussonic catchup)": "#EXTM3U\n#EXTINF:6,\na.ts\n#EXTINF:6,\nb.ts\n#EXT-X-ENDLIST\n",
-		"master": "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=2000000,RESOLUTION=1280x720\nhd.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=800000\nsd.m3u8\n",
-		"short live": buildLivePlaylist(5, 100),
+		"master":                      "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=2000000,RESOLUTION=1280x720\nhd.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=800000\nsd.m3u8\n",
+		"short live":                  buildLivePlaylist(5, 100),
 	}
 	for name, src := range cases {
 		if out := trimLiveDVR(src, 20); out != src {

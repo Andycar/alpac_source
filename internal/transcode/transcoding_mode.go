@@ -2,6 +2,7 @@ package transcode
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/rs/zerolog/log"
@@ -432,6 +433,104 @@ func NormalizeLangCodes(shortCode string) []string {
 // summarizeStreams converts the raw ffprobe streams array into a compact
 // shape suitable for the /transcoding/start response.  Used by the plugin
 // to populate the player's audio track menu without re-probing.
+// hdrKind — какой это HDR, если это вообще он. Сигналы перечислены по УБЫВАНИЮ достоверности,
+// потому что ни один из них не обязателен: контейнер может нести полный набор, а может — только
+// матрицу цвета.
+//
+//	side_data «DOVI configuration record»          → Dolby Vision (профиль лежит там же)
+//	side_data «HDR Dynamic Metadata SMPTE2094-40»  → HDR10+
+//	color_transfer smpte2084                       → HDR10 (PQ)
+//	color_transfer arib-std-b67                    → HLG
+//	bt2020 + 10 бит                                → просто «HDR»: это тот случай, когда кривая
+//	                                                 передачи в файле не проставлена, но широкий
+//	                                                 охват с 10 битами SDR-ом не бывает
+//
+// Проверено на файле, собранном ffmpeg: у него доезжает только color_space=bt2020nc с
+// yuv420p10le — то есть последняя ветка, и именно она чаще всего и спасает.
+func hdrKind(sm map[string]any) string {
+	if sd, ok := sm["side_data_list"].([]any); ok {
+		for _, it := range sd {
+			m, _ := it.(map[string]any)
+			t, _ := m["side_data_type"].(string)
+			switch {
+			case strings.Contains(t, "DOVI"), strings.Contains(strings.ToLower(t), "dolby vision"):
+				if p, ok := m["dv_profile"].(float64); ok {
+					return fmt.Sprintf("Dolby Vision %d", int(p))
+				}
+				return "Dolby Vision"
+			case strings.Contains(t, "2094-40"):
+				return "HDR10+"
+			}
+		}
+	}
+	trc, _ := sm["color_transfer"].(string)
+	switch trc {
+	case "smpte2084":
+		return "HDR10"
+	case "arib-std-b67":
+		return "HLG"
+	}
+	prim, _ := sm["color_primaries"].(string)
+	space, _ := sm["color_space"].(string)
+	pix, _ := sm["pix_fmt"].(string)
+	wide := strings.HasPrefix(prim, "bt2020") || strings.HasPrefix(space, "bt2020")
+	deep := strings.Contains(pix, "10le") || strings.Contains(pix, "10be") || strings.Contains(pix, "12le")
+	if wide && deep {
+		return "HDR"
+	}
+	return ""
+}
+
+// dispositionFlags — те флаги дорожки, которые НЕСУТ СМЫСЛ ДЛЯ ЗРИТЕЛЯ. В Matroska единственное
+// человекочитаемое имя дорожки — элемент Name (он же tags.title), и заполняют его далеко не все
+// муксеры: на 4K-ремуксах меню озвучек нередко вырождалось в список языков («Русская 1, Русская 2,
+// Русская 3»). Флаги — второй и последний источник смысла внутри контейнера: dub = дубляж,
+// original = язык оригинала, comment = комментарии режиссёра/актёров. Клиент подписывает ими
+// безымянные дорожки, а default/forced использует, чтобы выбрать дорожку по умолчанию.
+// Отдаём списком строк, а не картой: он короче в JSON и его удобно проверять на клиенте.
+func dispositionFlags(sm map[string]any) []string {
+	d, _ := sm["disposition"].(map[string]any)
+	if d == nil {
+		return nil
+	}
+	out := make([]string, 0, 3)
+	for _, k := range []string{"dub", "original", "comment", "default", "forced", "hearing_impaired", "visual_impaired"} {
+		if v, ok := d[k].(float64); ok && v != 0 {
+			out = append(out, k)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// streamBitrate — bit_rate самой дорожки, а если ffprobe его не вывел (частый случай для MKV, где
+// битрейт не хранится в заголовке), то из тегов статистики mkvmerge (BPS / BPS-eng). Нужен, чтобы
+// одинаково названные дорожки различались хотя бы качеством: «Русская · 5.1 · 640 кбит/с».
+func streamBitrate(sm map[string]any) int {
+	if s, ok := sm["bit_rate"].(string); ok {
+		if n, err := strconv.Atoi(strings.TrimSpace(s)); err == nil && n > 0 {
+			return n
+		}
+	}
+	if f, ok := sm["bit_rate"].(float64); ok && f > 0 {
+		return int(f)
+	}
+	tags, _ := sm["tags"].(map[string]any)
+	for k, v := range tags {
+		if !strings.EqualFold(k, "BPS") && !strings.HasPrefix(strings.ToUpper(k), "BPS-") {
+			continue
+		}
+		if s, ok := v.(string); ok {
+			if n, err := strconv.Atoi(strings.TrimSpace(s)); err == nil && n > 0 {
+				return n
+			}
+		}
+	}
+	return 0
+}
+
 func SummarizeStreams(probe map[string]any) map[string]any {
 	if probe == nil {
 		return nil
@@ -459,6 +558,12 @@ func SummarizeStreams(probe map[string]any) map[string]any {
 					"codec":   sm["codec_name"],
 					"pix_fmt": sm["pix_fmt"],
 				}
+				if br := streamBitrate(sm); br > 0 {
+					entry["bit_rate"] = br
+				}
+				if h := hdrKind(sm); h != "" {
+					entry["hdr"] = h
+				}
 				if w, ok := sm["width"].(float64); ok {
 					entry["width"] = int(w)
 				}
@@ -475,6 +580,22 @@ func SummarizeStreams(probe map[string]any) map[string]any {
 			if ch, ok := sm["channels"].(float64); ok {
 				entry["channels"] = int(ch)
 			}
+			if br := streamBitrate(sm); br > 0 {
+				entry["bit_rate"] = br
+			}
+			if f := dispositionFlags(sm); len(f) > 0 {
+				entry["flags"] = f
+			}
+			// profile у аудио — это и есть признак объектного звука: декодер ffmpeg ставит сюда
+			// «Dolby Digital Plus + Dolby Atmos» для E-AC-3 с JOC и «Dolby TrueHD + Dolby Atmos»
+			// для TrueHD. По кодеку и числу каналов Atmos не отличить: тот же eac3 6 каналов
+			// бывает и обычным.
+			if pr, ok := sm["profile"].(string); ok && pr != "" && pr != "unknown" {
+				entry["profile"] = pr
+				if strings.Contains(strings.ToLower(pr), "atmos") {
+					entry["atmos"] = true
+				}
+			}
 			if tags, ok := sm["tags"].(map[string]any); ok {
 				if l, ok := tags["language"].(string); ok {
 					entry["lang"] = l
@@ -482,12 +603,20 @@ func SummarizeStreams(probe map[string]any) map[string]any {
 				if t, ok := tags["title"].(string); ok {
 					entry["title"] = t
 				}
+				// …а если декодер профиль не выставил (частый случай на «холодном» пробе, когда
+				// кадр не декодировался), Atmos обычно назван в имени самой дорожки.
+				if t, ok := tags["title"].(string); ok && strings.Contains(strings.ToLower(t), "atmos") {
+					entry["atmos"] = true
+				}
 			}
 			audios = append(audios, entry)
 			audioRel++
 		case "subtitle":
 			entry := map[string]any{
 				"codec": sm["codec_name"],
+			}
+			if f := dispositionFlags(sm); len(f) > 0 {
+				entry["flags"] = f
 			}
 			if tags, ok := sm["tags"].(map[string]any); ok {
 				if l, ok := tags["language"].(string); ok {

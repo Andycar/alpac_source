@@ -7,16 +7,27 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	neturl "net/url"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/rs/zerolog/log"
 )
 
 const (
-	ytAPIBase    = "https://www.googleapis.com/youtube/v3"
-	ytFeedTTL    = 5 * time.Minute
-	maxSubResult = 50 // max subscriptions to fetch
+	ytFeedTTL = 5 * time.Minute
+	// subPageSize — жёсткий потолок YouTube на одну страницу списка подписок.
+	subPageSize = 50
+	// maxSubPages — сколько страниц обходим максимум. 10 × 50 = 500 подписок; дальше не идём,
+	// чтобы один аккаунт с тысячей подписок не выедал квоту (subscriptions.list — 1 единица
+	// за страницу при суточных 10 000).
+	maxSubPages = 10
 )
+
+// ytAPIBase — переменная, а не константа, ТОЛЬКО ради теста: он подменяет базу на httptest,
+// иначе постраничный обход нечем проверить. В бою не меняется.
+var ytAPIBase = "https://www.googleapis.com/youtube/v3"
 
 // YTVideo represents a video card in the feed.
 type YTVideo struct {
@@ -87,6 +98,77 @@ func NewAPIClient(store *Store, oauth OAuthConfig) *APIClient {
 	}
 }
 
+// fetchAllSubscriptions собирает ВСЕ страницы списка подписок.
+//
+// ★Раньше брали ровно одну страницу (maxResults=50 — потолок API) и на этом останавливались.
+// При order=alphabetical YouTube сортирует по названию, а латиница в этом порядке идёт РАНЬШЕ
+// кириллицы — поэтому у человека с более чем полусотней подписок в списке оставались только
+// каналы с английскими названиями, а все русские молча пропадали. Симптом выглядел как
+// «фильтрует по языку», хотя это была обрезка по границе страницы.
+//
+// Частичный результат лучше пустого: если страница посреди обхода отвалилась, отдаём то, что
+// успели собрать, и не роняем весь список.
+func (a *APIClient) fetchAllSubscriptions(ctx context.Context, token, order string, maxPages int) ([]YTChannel, error) {
+	out := make([]YTChannel, 0, subPageSize)
+	seen := make(map[string]bool, subPageSize)
+	pageToken := ""
+	for page := 0; page < maxPages; page++ {
+		u := fmt.Sprintf("%s/subscriptions?part=snippet&mine=true&maxResults=%d&order=%s",
+			ytAPIBase, subPageSize, order)
+		if pageToken != "" {
+			u += "&pageToken=" + neturl.QueryEscape(pageToken)
+		}
+		body, err := a.apiGet(ctx, token, u)
+		if err != nil {
+			if len(out) > 0 {
+				log.Warn().Err(err).Int("page", page).Msg("youtube: подписки — страница не пришла, отдаём собранное")
+				break
+			}
+			return nil, fmt.Errorf("subscriptions list: %w", err)
+		}
+		var resp struct {
+			NextPageToken string `json:"nextPageToken"`
+			Items         []struct {
+				Snippet struct {
+					Title      string `json:"title"`
+					ResourceID struct {
+						ChannelID string `json:"channelId"`
+					} `json:"resourceId"`
+					Thumbnails map[string]struct {
+						URL string `json:"url"`
+					} `json:"thumbnails"`
+				} `json:"snippet"`
+			} `json:"items"`
+		}
+		if err := json.Unmarshal(body, &resp); err != nil {
+			if len(out) > 0 {
+				break
+			}
+			return nil, err
+		}
+		for _, it := range resp.Items {
+			cid := it.Snippet.ResourceID.ChannelID
+			if cid == "" || seen[cid] {
+				continue
+			}
+			seen[cid] = true
+			thumb := ""
+			for _, key := range []string{"medium", "default", "high"} {
+				if t, ok := it.Snippet.Thumbnails[key]; ok && t.URL != "" {
+					thumb = t.URL
+					break
+				}
+			}
+			out = append(out, YTChannel{ChannelID: cid, Title: it.Snippet.Title, Thumbnail: thumb})
+		}
+		if resp.NextPageToken == "" {
+			break
+		}
+		pageToken = resp.NextPageToken
+	}
+	return out, nil
+}
+
 // GetSubscriptions returns the user's subscribed channels (id + title + avatar) for the sidebar.
 // Cached 10 min per user — the channel list changes far less often than its videos.
 func (a *APIClient) GetSubscriptions(ctx context.Context, tgID int64) ([]YTChannel, error) {
@@ -101,43 +183,9 @@ func (a *APIClient) GetSubscriptions(ctx context.Context, tgID int64) ([]YTChann
 	if err != nil {
 		return nil, err
 	}
-	url := fmt.Sprintf("%s/subscriptions?part=snippet&mine=true&maxResults=%d&order=alphabetical", ytAPIBase, maxSubResult)
-	body, err := a.apiGet(ctx, token, url)
+	out, err := a.fetchAllSubscriptions(ctx, token, "alphabetical", maxSubPages)
 	if err != nil {
-		return nil, fmt.Errorf("subscriptions list: %w", err)
-	}
-
-	var resp struct {
-		Items []struct {
-			Snippet struct {
-				Title      string `json:"title"`
-				ResourceID struct {
-					ChannelID string `json:"channelId"`
-				} `json:"resourceId"`
-				Thumbnails map[string]struct {
-					URL string `json:"url"`
-				} `json:"thumbnails"`
-			} `json:"snippet"`
-		} `json:"items"`
-	}
-	if err := json.Unmarshal(body, &resp); err != nil {
 		return nil, err
-	}
-
-	out := make([]YTChannel, 0, len(resp.Items))
-	for _, it := range resp.Items {
-		cid := it.Snippet.ResourceID.ChannelID
-		if cid == "" {
-			continue
-		}
-		thumb := ""
-		for _, key := range []string{"medium", "default", "high"} {
-			if t, ok := it.Snippet.Thumbnails[key]; ok && t.URL != "" {
-				thumb = t.URL
-				break
-			}
-		}
-		out = append(out, YTChannel{ChannelID: cid, Title: it.Snippet.Title, Thumbnail: thumb})
 	}
 
 	a.chMu.Lock()
@@ -242,38 +290,26 @@ func (a *APIClient) GetSubscriptionsFeed(ctx context.Context, tgID int64) ([]YTV
 	}
 
 	// Step 1: Get user's subscriptions.
-	subsURL := fmt.Sprintf("%s/subscriptions?part=snippet&mine=true&maxResults=%d&order=relevance", ytAPIBase, maxSubResult)
-	body, err := a.apiGet(ctx, token, subsURL)
+	// ОДНА страница, в отличие от списка каналов, и это не забывчивость, а квота: шаг 3 ниже
+	// делает ОТДЕЛЬНЫЙ запрос playlistItems на КАЖДЫЙ канал (1 единица за штуку). 50 подписок —
+	// 50 единиц за пересборку ленты, 500 подписок было бы 500 при суточных 10 000 на всех.
+	// Порядок здесь relevance, а не alphabetical, поэтому языкового перекоса нет: в отличие от
+	// боковой панели, русские каналы сюда попадают наравне с остальными.
+	subs, err := a.fetchAllSubscriptions(ctx, token, "relevance", 1)
 	if err != nil {
-		return nil, fmt.Errorf("subscriptions list: %w", err)
-	}
-
-	var subsResp struct {
-		Items []struct {
-			Snippet struct {
-				ResourceID struct {
-					ChannelID string `json:"channelId"`
-				} `json:"resourceId"`
-				Title string `json:"title"`
-			} `json:"snippet"`
-		} `json:"items"`
-	}
-	if err := json.Unmarshal(body, &subsResp); err != nil {
 		return nil, err
 	}
-
-	if len(subsResp.Items) == 0 {
+	if len(subs) == 0 {
 		return nil, nil
 	}
 
 	// Step 2: For each channel, get uploads playlist and latest video.
 	// Batch channel IDs to get their uploads playlists.
-	channelIDs := make([]string, 0, len(subsResp.Items))
-	channelTitles := make(map[string]string) // channelID → title
-	for _, item := range subsResp.Items {
-		cid := item.Snippet.ResourceID.ChannelID
-		channelIDs = append(channelIDs, cid)
-		channelTitles[cid] = item.Snippet.Title
+	channelIDs := make([]string, 0, len(subs))
+	channelTitles := make(map[string]string, len(subs)) // channelID → title
+	for _, c := range subs {
+		channelIDs = append(channelIDs, c.ChannelID)
+		channelTitles[c.ChannelID] = c.Title
 	}
 
 	// Fetch channels in batches of 50.

@@ -16,7 +16,7 @@ func TestVibixStreamLive(t *testing.T) {
 		t.Skip("set VIBIX_LIVE=1")
 	}
 	cfg := config.Config{Online: config.OnlineConfig{
-		Vibix: config.HostTokenSource{Host: "https://vibix.org", Token: os.Getenv("VIBIX_TOKEN")},
+		Vibix: config.VibixSource{Host: "https://vibix.org", Token: os.Getenv("VIBIX_TOKEN")},
 	}}
 	checker := NewVibixChecker(cfg)
 	handler := checker.Handle(cfg, nil) // nil proxyLinks → segments not rewritten, but m3u8 still served

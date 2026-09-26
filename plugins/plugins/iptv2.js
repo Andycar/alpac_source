@@ -126,6 +126,15 @@
     }
     if (!t) { try { t = localStorage.getItem('lampac_auth_token') || ''; } catch (e) {} }
     if (t) q.push('token=' + encodeURIComponent(t));
+    // uid — вторая опознавалка, и после перезапуска зачастую единственная:
+    // куку WebView теряет, а сервер по uid сессию восстанавливает. Раньше
+    // IPTV его не слал вовсе, и человек с живой авторизацией получал пустой
+    // список каналов (замер: 606 клиентов IPTV из 622 не шлют ни того, ни другого).
+    try {
+      var duid = Lampa.Storage.get('lampac_unic_id', '') || '';
+      if (!duid) { try { duid = localStorage.getItem('lampac_uid_backup') || ''; } catch (e) {} }
+      if (duid) q.push('uid=' + encodeURIComponent(duid));
+    } catch (e) {}
     if (q.length) url += '?' + q.join('&');
     return url;
   }
@@ -139,6 +148,10 @@
 
   function apiPost(path, body, ok, err) {
     $.ajax({ url: apiUrl(path), type: 'POST', contentType: 'application/json', data: JSON.stringify(body), timeout: 15000, success: ok, error: function (x, s, e) { if (err) err(e || s); } });
+  }
+
+  function apiPatch(path, body, ok, err) {
+    $.ajax({ url: apiUrl(path), type: 'PATCH', contentType: 'application/json', data: JSON.stringify(body), timeout: 15000, success: ok, error: function (x, s, e) { if (err) err(e || s); } });
   }
 
   function apiDelete(path, ok, err) {
@@ -489,6 +502,21 @@
 
       var head = $('<div class="iptv2-head"></div>');
       head.append('<div class="iptv2-head__title">IPTV</div>');
+      // «Игнорировать встроенные»: у кого есть свой список, тому наши доноры и реестр
+      // только мешают — он их не выбирал. Прячем только при наличии своего плейлиста,
+      // иначе настройка оставила бы пустой экран.
+      var prefBtn = $('<div class="iptv2-head__add selector"><span>' + lang('builtin_toggle') + '</span></div>');
+      prefBtn.on('hover:enter', function () {
+        apiGet('/api/iptv/prefs', {}, function (cur) {
+          var next = !(cur && cur.hide_builtin);
+          apiPost('/api/iptv/prefs', { hide_builtin: next }, function () {
+            Lampa.Noty.show(lang(next ? 'builtin_hidden' : 'builtin_shown'));
+            loadPlaylists();
+          }, function () { Lampa.Noty.show(lang('error')); });
+        }, function () { Lampa.Noty.show(lang('error')); });
+      });
+      head.append(prefBtn);
+
       var addBtn = $('<div class="iptv2-head__add selector"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg><span>' + lang('add') + '</span></div>');
       addBtn.on('hover:enter', promptAdd);
       addBtn.on('hover:focus', function () { last = this; });
@@ -507,6 +535,7 @@
         var meta = $('<div class="iptv2-pl__meta"></div>');
         meta.append('<span>' + (pl.channel_count || 0) + ' ' + lang('ch') + '</span>');
         if (pl.is_global) meta.append('<span>global</span>');
+        if (!pl.is_global && pl.proxy_mode === 'none') meta.append('<span>' + lang('direct') + '</span>');
         body.append(meta);
         row.append(body);
         row.append('<div class="iptv2-pl__arrow">›</div>');
@@ -516,6 +545,11 @@
         row.on('hover:long', function () {
           var items = [{ title: lang('open'), value: 'open' }];
           if (!pl.is_global) {
+            // Проксирование СВОЕГО плейлиста: раньше режим задавался только при
+            // добавлении, клиенты его не слали, и сервер молча включал «через
+            // сервер» всем. Теперь это переключатель.
+            var proxied = pl.proxy_mode !== 'none';
+            items.push({ title: lang(proxied ? 'proxy_off' : 'proxy_on'), value: 'proxy' });
             items.push({ title: lang('refresh'), value: 'refresh' });
             items.push({ title: lang('delete'), value: 'delete' });
           }
@@ -524,6 +558,15 @@
             items: items,
             onSelect: function (a) {
               if (a.value === 'open') { openChannels(pl); return; }
+              if (a.value === 'proxy') {
+                var mode = pl.proxy_mode === 'none' ? 'all' : 'none';
+                apiPatch('/api/iptv/playlists/' + pl.id, { proxy_mode: mode }, function () {
+                  Lampa.Noty.show(lang(mode === 'none' ? 'proxy_is_off' : 'proxy_is_on'));
+                  loadPlaylists();
+                }, function () { Lampa.Noty.show(lang('error')); });
+                Lampa.Controller.toggle('content');
+                return;
+              }
               if (a.value === 'delete') apiDelete('/api/iptv/playlists/' + pl.id, function () { Lampa.Noty.show(lang('deleted')); comp._initialized = true; loadPlaylists(); });
               else apiPost('/api/iptv/playlists/' + pl.id + '/refresh', {}, function () { Lampa.Noty.show(lang('refreshed')); loadPlaylists(); });
               Lampa.Controller.toggle('content');
@@ -1113,6 +1156,14 @@
 
   Lampa.Lang.add({
     iptv2_add: { ru: 'Добавить', en: 'Add', uk: 'Додати' },
+    iptv2_builtin_toggle: { ru: 'Встроенные', en: 'Built-in', uk: 'Вбудовані' },
+    iptv2_builtin_hidden: { ru: 'Встроенные плейлисты скрыты', en: 'Built-in playlists hidden', uk: 'Вбудовані плейлисти сховані' },
+    iptv2_builtin_shown: { ru: 'Встроенные плейлисты показаны', en: 'Built-in playlists shown', uk: 'Вбудовані плейлисти показані' },
+    iptv2_proxy_off: { ru: 'Играть напрямую, мимо сервера', en: 'Play directly, bypass server', uk: 'Грати напряму, повз сервер' },
+    iptv2_proxy_on: { ru: 'Играть через сервер', en: 'Play through server', uk: 'Грати через сервер' },
+    iptv2_proxy_is_off: { ru: 'Плейлист играет напрямую', en: 'Playlist plays directly', uk: 'Плейлист грає напряму' },
+    iptv2_proxy_is_on: { ru: 'Плейлист играет через сервер', en: 'Playlist plays through server', uk: 'Плейлист грає через сервер' },
+    iptv2_direct: { ru: 'прямой', en: 'direct', uk: 'прямий' },
     iptv2_open: { ru: 'Открыть', en: 'Open', uk: 'Відкрити' },
     iptv2_empty: { ru: 'Нет плейлистов<br>Добавьте M3U ссылку', en: 'No playlists<br>Add an M3U URL', uk: 'Немає плейлистів<br>Додайте M3U посилання' },
     iptv2_url_title: { ru: 'URL плейлиста (M3U)', en: 'Playlist URL (M3U)', uk: 'URL плейлиста (M3U)' },

@@ -289,8 +289,11 @@ func TestFilmixFXMoviePreferredOverLegacy(t *testing.T) {
 	if len(streams) != 3 {
 		t.Fatalf("unexpected streamquality count: %d body=%s", len(streams), rec.Body.String())
 	}
-	if legacyCalled {
-		t.Fatalf("legacy API must not be called when api-fx answers")
+	// ★С 2026-08-22 легаси ВЫЗЫВАЕТСЯ и при успешном api-fx — но только чтобы добрать озвучки,
+	// которых там нет вовсе (HEVC-рипы; см. filmix_merge.go). Приоритет остаётся за api-fx: его
+	// строки идут первыми и не подменяются, что и проверяется выше по url и streamquality.
+	if !legacyCalled {
+		t.Fatalf("легаси должен опрашиваться для добора эксклюзивных озвучек")
 	}
 }
 
@@ -315,9 +318,20 @@ func TestFilmixFXSerialSeasonsAndEpisodes(t *testing.T) {
 		}
 	}`)
 
+	// Легаси-плечо должно молчать, но глушить его мёртвым портом нельзя:
+	// filmixAPIHosts() ротирует зеркало именно на ТРАНСПОРТНОЙ ошибке, и
+	// недозвон на 127.0.0.1:1 уводил запрос на зашитый живой filmixapp.cyou —
+	// тест тянул настоящие серии с werkecdn.me, а заодно «залипал» на боевом
+	// зеркале в process-wide filmixHostIdx и ронял соседние FilmixFX-тесты.
+	// Явный 404 — это РЕАЛЬНЫЙ ответ мирроринга, он не ротирует (см. filmix.go).
+	legacy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer legacy.Close()
+
 	cfg := config.Config{
 		Online: config.OnlineConfig{
-			Filmix:   config.FilmixSource{Host: "http://127.0.0.1:1", Token: "token"},
+			Filmix:   config.FilmixSource{Host: legacy.URL, Token: "token"},
 			FilmixTV: config.HostSource{Host: fx.URL},
 		},
 	}
@@ -486,7 +500,8 @@ func TestFilmixDirectDescriptor(t *testing.T) {
 
 	cfg := config.Config{
 		Online: config.OnlineConfig{
-			Filmix:   config.FilmixSource{Host: upstream.URL, Token: "token"},
+			// Рецепт отдаётся только при включённом direct_lampa — параметра в запросе мало.
+			Filmix:   config.FilmixSource{Host: upstream.URL, Token: "token", DirectLampa: true},
 			FilmixTV: config.HostSource{Host: "https://api.filmix.tv"},
 		},
 	}
@@ -520,5 +535,33 @@ func TestFilmixDirectDescriptor(t *testing.T) {
 	fb := toString(data["fallback"])
 	if !strings.Contains(fb, "postid=7430") || strings.Contains(fb, "fxdirect") {
 		t.Fatalf("bad fallback: %s", fb)
+	}
+}
+
+// Сниппет прямого CDN живёт СТАТИКОЙ в plugins/online.js, поэтому Лампа шлёт `fxdirect=1` и
+// после выключения `direct_lampa`. Раньше сервер честно отдавал рецепт: браузеры минтили хеш
+// сами и упирались в 429 от werkecdn, тогда как приложение (параметр не шлёт) спокойно играло
+// через /proxy. Выключатель обязан действовать без переката клиентов.
+func TestFilmixDirectIgnoredWhenDisabled(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer upstream.Close()
+
+	cfg := config.Config{
+		Online: config.OnlineConfig{
+			Filmix:   config.FilmixSource{Host: upstream.URL, Token: "token"}, // DirectLampa не задан
+			FilmixTV: config.HostSource{Host: "https://api.filmix.tv"},
+		},
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet,
+		"http://lampac.local/lite/filmix?rjson=true&fxdirect=1&postid=7430&title=HA", nil)
+	authedHandler(liteSourceHandler(cfg, nil, nil)).ServeHTTP(rec, req)
+
+	body := rec.Body.String()
+	if strings.Contains(body, "\"recipe\"") || strings.Contains(body, "fallback") {
+		t.Fatalf("при выключенном флаге отдан рецепт прямого CDN: %s", body)
 	}
 }

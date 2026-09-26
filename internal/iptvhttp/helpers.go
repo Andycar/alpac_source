@@ -4,7 +4,12 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
+	"time"
 
+	"github.com/rs/zerolog/log"
+
+	"lampac-go/internal/auth"
 	"lampac-go/internal/tgauth"
 )
 
@@ -43,12 +48,57 @@ func hostFromRequest(r *http.Request) string {
 // calendarTgID resolves the caller's Telegram ID from a tgauth.Store via the
 // lampac_token cookie, an explicit token query param, or the device UID. Named
 // for its original calendar use but a pure tgauth resolver — no calendar state.
+// logIPTVDeny — почему отказано и ЧТО принёс запрос.
+//
+// Отказы IPTV выглядят снаружи одинаково («нет доступа»), а причин минимум
+// три: не опознали человека, канал реестра без авторизации, не прошла
+// аттестация приложения. Без записи причины разбор превращается в гадание —
+// это тот же приём, что уже выручил на /capi.
+//
+// ЗНАЧЕНИЯ токенов не пишем никогда, только наличие источника: строка отказа
+// должна помогать искать причину, а не становиться новой утечкой (в логах
+// nginx живых ключей и так было 834 за сутки).
+var iptvDenyThrottle sync.Map // ip → время последней записи, unixnano
+
+func logIPTVDeny(r *http.Request, what string) {
+	ip := clientIP(r)
+	now := time.Now().UnixNano()
+	if v, ok := iptvDenyThrottle.Load(ip); ok {
+		if last, _ := v.(int64); now-last < int64(20*time.Second) {
+			return // один и тот же клиент долбится десятками запросов в минуту
+		}
+	}
+	iptvDenyThrottle.Store(ip, now)
+	have := func(name string) bool {
+		c, err := r.Cookie(name)
+		return err == nil && strings.TrimSpace(c.Value) != ""
+	}
+	log.Warn().
+		Str("почему", what).
+		Str("path", r.URL.Path).
+		Str("ip", ip).
+		Str("uid", r.URL.Query().Get("uid")).
+		Bool("token_в_адресе", r.URL.Query().Get("token") != "").
+		Bool("кука_lampac_token", have("lampac_token")).
+		Bool("кука_alpac_token", have("alpac_token")).
+		Bool("кука_httponly", have("_lampac_auth")).
+		Bool("заголовок_токена", r.Header.Get("X-Lampac-Token") != "" || r.Header.Get("X-Alpac-Token") != "").
+		Str("ua", r.UserAgent()).
+		Msg("iptv: отказано")
+}
+
 func calendarTgID(r *http.Request, store *tgauth.Store) int64 {
 	if store == nil {
 		return 0
 	}
-	if cookie, err := r.Cookie("lampac_token"); err == nil && cookie.Value != "" {
-		if at, ok := store.Lookup(cookie.Value); ok && at.TelegramID != 0 {
+	// ★Общий разбор источников токена, а не одна кука `lampac_token`. IPTV в
+	// обходном списке гейта и опознаёт человека сам; на телевизоре при
+	// перезапуске приложения вычищается именно JS-видимая банка кук, а
+	// HttpOnly `_lampac_auth` переживает — и человек, у которого /lite/*
+	// работал через гейт, для IPTV оставался анонимом (жалоба 20.09.2026:
+	// «в статусе авторизация есть, а торрентов и IPTV нет»).
+	if tok := auth.ExtractToken(r); tok != "" {
+		if at, ok := store.Lookup(tok); ok && at.TelegramID != 0 {
 			return at.TelegramID
 		}
 	}

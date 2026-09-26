@@ -229,6 +229,13 @@ router.register({
   loader: () => import('./pages/music-sources.js'),
 });
 router.register({
+  key: 'iptv-registry',
+  title: 'IPTV каналы',
+  icon: '📺',
+  group: 'Контент',
+  loader: () => import('./pages/iptv-registry.js'),
+});
+router.register({
   key: 'calendar',
   title: 'Календарь',
   icon: '📅',

@@ -175,8 +175,15 @@ func (f *filmixChecker) fxRightsConfirmed() bool {
 
 // filmixHideUnplayable сообщает, что озвучку показывать не надо: она требует подписки, а прав у нас
 // сейчас нет — зритель получит «купите премиум» вместо фильма.
+//
+// Права даёт либо подтверждённый аккаунт api-fx, либо pro-токен legacy API: проверено
+// 2026-09-02 с прод-токеном — HDR10+ «Дюна: Часть вторая» 2160p = 8.98 ГБ, HEVC-рип =
+// 9.96 ГБ, «Обсессия» 2160p = 15.6 ГБ, все 206. Заглушка приходит только без прав.
+//
+// 22.09.2026: `pro` из конфига учитывается только пока хоть один токен живой и с подпиской
+// (legacyRights) — мёртвый токен на FI показывал HEVC-строки, а CDN отдавал по ним заглушку.
 func (f *filmixChecker) filmixHideUnplayable(name, link string) bool {
-	if f.fxRightsConfirmed() {
+	if f.legacyRights() || f.fxRightsConfirmed() {
 		return false
 	}
 	return filmixHEVCNameRe.MatchString(name) || filmixHEVCNameRe.MatchString(link)

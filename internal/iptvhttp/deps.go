@@ -26,6 +26,11 @@ type Deps struct {
 	LiveConfig  func(fallback config.Config) config.Config
 	ServerReady func() bool
 	ClientIP    func(r *http.Request) string
+	// DeviceLimit — сколько одновременных потоков разрешено профилю этого
+	// запроса. Считается в httpapi (effectiveDeviceLimit: личный лимит →
+	// группа с премиум-оверлеем → серверный дефолт), сюда приходит функцией,
+	// чтобы не тащить сюда весь стор групп. nil или <=0 = без лимита.
+	DeviceLimit func(r *http.Request) int
 }
 
 var deps Deps
@@ -40,6 +45,18 @@ func liveConfig(fallback config.Config) config.Config {
 }
 
 func serverReady() bool { return deps.ServerReady != nil && deps.ServerReady() }
+
+// deviceLimit — предел одновременных потоков профиля. 0 = не ограничиваем
+// (лимит не настроен либо резолвер не подключён).
+func deviceLimit(r *http.Request) int {
+	if deps.DeviceLimit == nil {
+		return 0
+	}
+	if n := deps.DeviceLimit(r); n > 0 {
+		return n
+	}
+	return 0
+}
 
 func clientIP(r *http.Request) string {
 	if deps.ClientIP != nil {

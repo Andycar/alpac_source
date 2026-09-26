@@ -37,7 +37,7 @@ import (
 // postMessage stays in-process) — hence a dedicated Chrome, not the shared one.
 //
 // The Chrome is kept WARM across resolves (a fresh process cold-starts ~2-3s):
-// resolves are serialized through vibixWarmMu and reuse one browser, opening a
+// resolves are serialized through vibixWarmSem and reuse one browser, opening a
 // fresh tab per resolve. The browser is recycled on failure or after a TTL /
 // use cap so it can't wedge the way a long-lived shared Chrome did historically.
 // ---------------------------------------------------------------------------
@@ -90,15 +90,97 @@ type vibixWarmBrowser struct {
 }
 
 const (
-	vibixWarmTTL     = 10 * time.Minute
-	vibixWarmUseCap  = 30
-	vibixWarmMaxOpen = 25 * time.Second
+	vibixWarmTTL    = 10 * time.Minute
+	vibixWarmUseCap = 30
+
+	// vibixWarmMaxOpen bounds ONE resolve.
+	//
+	// It was 25s, which protected nothing: measured over 24h on prod
+	// 2026-09-01, a resolve that succeeds is fast and tightly grouped —
+	// n=415, p50 1.46s, p99 2.96s, slowest 4.25s — while a resolve that fails
+	// runs to the ceiling (n=244, p50 9.6s, p90 24.4s). So the ceiling was
+	// never the difference between a hit and a miss; it only decided how long
+	// a miss occupied the single browser slot. 46.5 minutes a day went into
+	// failures alone.
+	//
+	// 6s clears the slowest observed success by ~1.7s and cuts the time spent
+	// on failures by ~61%. Raise it only if successes start landing near it —
+	// the p99 has ~2x of headroom today.
+	vibixWarmMaxOpen = 6 * time.Second
+
+	// vibixNegativeTTL is how long a FAILED resolve is remembered.
+	//
+	// Without it every repeat of a failing title re-drove the headless browser
+	// for up to vibixWarmMaxOpen, and recycled it on the way out. Measured on
+	// prod 2026-09-01: 117 of 289 resolves failed in 40 minutes and vibix
+	// accounted for 12.7% of the primary's entire wait time (p50 4.7s, max
+	// 53.3s) — while vibix.org itself answered in 0.4s. The cost was the
+	// retries, not the upstream.
+	//
+	// Kept far shorter than the 20-minute success TTL: a failure is usually
+	// transient (a wedged browser, a slow SDK load), so the title should become
+	// available again quickly — just not at the price of a browser run per
+	// request in the meantime.
+	vibixNegativeTTL = 5 * time.Minute
+	// vibixNegativeShortTTL — память о провале по ТАЙМАУТУ браузера. Таймаут — не
+	// ответ «нет»: на main половина резолвов упиралась в vibixWarmMaxOpen и на пять
+	// минут ложилась в отрицательный кэш (278 из 285 ответов 502 за два часа
+	// 22.09.2026 отданы из кэша за 0 мс). Коротко — чтобы повтор через полминуты
+	// имел шанс, но шторм одинаковых запросов всё же не занимал браузер.
+	vibixNegativeShortTTL = 30 * time.Second
+	// vibixLaunchBackoff — пауза после неудачного запуска Chrome (см. vibixEnsureWarmLocked).
+	vibixLaunchBackoff = time.Minute
 )
 
 var (
-	vibixWarmMu sync.Mutex // serializes resolves and guards the warm browser
-	vibixWarm   *vibixWarmBrowser
+	// vibixWarmSem serializes resolves and guards the warm browser. A channel
+	// rather than a sync.Mutex because waiting for it must be BOUNDED.
+	//
+	// A resolve holds this slot for its whole run — up to vibixWarmMaxOpen — so
+	// with a plain mutex the queue multiplied: measured on prod 2026-09-01, a
+	// resolve took 1.5s when it succeeded and 6.5s (max 25.1s) when it failed,
+	// while /lite/vibix requests came back at p90 24s and max 134.9s. That gap
+	// is queueing, not the resolve — five requests behind one doomed 25s attempt
+	// is two minutes for the last of them.
+	vibixWarmSem = make(chan struct{}, 1)
+	vibixWarm    *vibixWarmBrowser
+	// vibixLaunchFailUntil — до этого момента Chrome не пробуем запускать (под vibixMu, как и vibixWarm).
+	vibixLaunchFailUntil time.Time
 )
+
+// vibixQueueWait caps how long a request waits for the resolve slot. Past it the
+// caller gives up and vibix reports nothing for this title — the same answer the
+// queue would have produced eventually, minus the wait.
+//
+// Set to one full resolve: nobody should wait longer than the holder can
+// legally hold the slot. With a 1.46s median resolve that still lets roughly
+// four requests queue and be served; what it cuts off is the pile-up. Worst
+// case per request is now vibixQueueWait + vibixWarmMaxOpen = 12s, against 33s
+// before and an unbounded wait (134.9s observed) before that.
+const vibixQueueWait = 6 * time.Second
+
+// vibixAcquireWarm takes the resolve slot. It gives up when the caller's context
+// ends (client disconnected) or the wait exceeds vibixQueueWait.
+func vibixAcquireWarm(ctx context.Context) bool {
+	// Fast path: free slot, no timer.
+	select {
+	case vibixWarmSem <- struct{}{}:
+		return true
+	default:
+	}
+	t := time.NewTimer(vibixQueueWait)
+	defer t.Stop()
+	select {
+	case vibixWarmSem <- struct{}{}:
+		return true
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return false
+	}
+}
+
+func vibixReleaseWarm() { <-vibixWarmSem }
 
 func vibixWarmTeardown(b *vibixWarmBrowser) {
 	if b == nil {
@@ -136,7 +218,7 @@ func vibixWarmTeardown(b *vibixWarmBrowser) {
 }
 
 // vibixEnsureWarmLocked returns a live warm browser context, launching or
-// recycling as needed. Caller holds vibixWarmMu.
+// recycling as needed. Caller holds the resolve slot.
 func vibixEnsureWarmLocked() (context.Context, bool) {
 	if b := vibixWarm; b != nil {
 		if b.browserCtx.Err() == nil && time.Since(b.createdAt) < vibixWarmTTL && b.uses < vibixWarmUseCap {
@@ -145,6 +227,12 @@ func vibixEnsureWarmLocked() (context.Context, bool) {
 		}
 		vibixWarmTeardown(b)
 		vibixWarm = nil
+	}
+	// Chrome здесь не поднимается (ноды без браузера: ch/de/jp/msk2 — 2165 провалов
+	// запуска за два часа 22.09.2026, каждый со стартом процесса) — не пробуем чаще
+	// раза в минуту: зритель получает отказ сразу, а не после холодного старта.
+	if time.Now().Before(vibixLaunchFailUntil) {
+		return nil, false
 	}
 
 	tmpDir, err := browsertmp.New("vibix-chrome-")
@@ -174,6 +262,7 @@ func vibixEnsureWarmLocked() (context.Context, bool) {
 	case err := <-launched:
 		if err != nil {
 			log.Warn().Err(err).Msg("vibix: warm chrome launch failed")
+			vibixLaunchFailUntil = time.Now().Add(vibixLaunchBackoff)
 			browserCancel()
 			allocCancel()
 			go browsertmp.Remove(tmpDir)
@@ -238,9 +327,13 @@ func vibixResolveViaColdfilm(parentCtx context.Context, imdbID string, kinopoisk
 	}
 
 	// Serialize resolves through the warm browser. checksearch uses the API (no
-	// browser), and results cache, so contention here is rare.
-	vibixWarmMu.Lock()
-	defer vibixWarmMu.Unlock()
+	// browser), and results cache, so contention here is rare — but when it does
+	// happen the wait is bounded, see vibixQueueWait.
+	if !vibixAcquireWarm(parentCtx) {
+		log.Debug().Str("id", dataID).Msg("vibix: gave up waiting for the resolve slot")
+		return nil, false
+	}
+	defer vibixReleaseWarm()
 
 	// Another goroutine may have resolved this while we waited for the lock.
 	if pl, ok := vibixCacheGet(cacheKey); ok {
@@ -262,7 +355,19 @@ func vibixResolveViaColdfilm(parentCtx context.Context, imdbID string, kinopoisk
 	if !ok {
 		// Recycle on failure — a wedged browser would otherwise fail every resolve.
 		vibixInvalidateWarmLocked()
-		log.Warn().Str("id", dataID).Dur("took", time.Since(start)).Msg("vibix: coldfilm resolve failed")
+		// Remember the failure. An empty playlist is exactly what vibixCacheGet
+		// already models: it reports a cache HIT, and every caller reads
+		// len(pl) > 0 as "resolved", so repeats now fail in microseconds instead
+		// of occupying the warm browser again. See vibixNegativeTTL.
+		ttl := vibixNegativeTTL
+		timedOut := time.Since(start) >= vibixWarmMaxOpen-200*time.Millisecond
+		if timedOut {
+			ttl = vibixNegativeShortTTL
+		}
+		vibixPlaylistCache.Store(cacheKey, vibixPlaylistCacheEntry{
+			expires: time.Now().Add(ttl),
+		})
+		log.Warn().Str("id", dataID).Dur("took", time.Since(start)).Bool("timeout", timedOut).Msg("vibix: coldfilm resolve failed")
 		return nil, false
 	}
 

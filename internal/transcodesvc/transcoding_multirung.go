@@ -234,6 +234,9 @@ func (svc *TranscodingService) buildMultiRungArgs(ctx transcodingContext) []stri
 		}
 	}
 
+	// Ключевые кадры на границах сегментов у КАЖДОГО rung'а: иначе объявленные SegDur в
+	// плейлисте не совпадают с GOP кодировщика (см. createProcess).
+	args = append(args, "-force_key_frames", fmt.Sprintf("expr:gte(t,n_forced*%d)", max(ctx.HLS.SegDur, 1)))
 	args = append(args, "-hls_time", strconv.Itoa(ctx.HLS.SegDur))
 	if !ctx.Live && !tc.DisableFastStart && svc.ffmpegMajorVersion >= 5 && ctx.HLS.SegDur > 1 {
 		args = append(args, "-hls_init_time", "1")

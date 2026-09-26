@@ -3,6 +3,7 @@ package httpapi
 import (
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"path/filepath"
@@ -351,7 +352,7 @@ h1 { font-size: 24px; margin-bottom: 12px; color: #fff; }
         statusEl.textContent = msgs[data.status] || data.status;
         if (data.status === "approved" && data.token) {
           // SameSite tuning: cross-origin Lampa installs (lampa.mx player
-          // hitting beta.l-vid.online lampac) need SameSite=None so the
+          // hitting beta.example.com lampac) need SameSite=None so the
           // cookie is sent on subsequent XHRs. None mandates Secure, so
           // we only use it on HTTPS; HTTP installs fall back to Lax.
           var sas = (location.protocol === 'https:' ? "; SameSite=Lax; Secure" : "; SameSite=Lax");
@@ -547,9 +548,18 @@ func tgAuthStatusHandler(store *tgauth.Store, pending *tgauth.PendingStore, botN
 		// fatal on external Lampa hosts (lampa.mx): cookies don't travel
 		// cross-site, /lite/* resolves the user by ?uid= alone, and an
 		// unbound uid keeps the "authorize" banner up despite a valid token.
-		bindDeviceIfNew := func(tok string) {
+		//
+		// Returns false when the account's device limit is full and the device
+		// was therefore NOT bound: this rung used to bind unconditionally, which
+		// is how one token ended up with 442 devices under a limit of 3.
+		bindDeviceIfNew := func(tok string) bool {
 			if uid == "" || store.HasDevice(tok, uid) {
-				return
+				return true
+			}
+			if limit := effectiveDeviceLimit(store, tok, tgServerMaxDevices); limit > 0 && store.DeviceCount(tok) >= limit {
+				log.Info().Str("uid", uid).Int("limit", limit).Str("ip", clientIP(r)).
+					Msg("tgauth: status — device limit reached, not binding")
+				return false
 			}
 			now := time.Now().UTC()
 			_, _ = store.AddDevice(tok, tgauth.DeviceInfo{
@@ -557,39 +567,103 @@ func tgAuthStatusHandler(store *tgauth.Store, pending *tgauth.PendingStore, botN
 				Label:   deviceLabel(label, r.UserAgent()),
 				BoundAt: now, LastSeen: now, LastIP: clientIP(r),
 			})
+			return true
 		}
 
-		// Check if user has a valid token (check _lampac_auth first, then lampac_token)
+		// recoverInto is the tail shared by the recovery rungs (fingerprint,
+		// stable fingerprint, CUB): bind this device to the recovered token and
+		// issue cookies. Returns false — and authorizes nothing — when the
+		// device is on the token's revocation list.
+		recoverInto := func(tok, bindUID, via string) bool {
+			if bindUID != "" {
+				// Лимит устройств тут не проверялся вовсе — одна из двух веток,
+				// мимо которых утекало (вторая — tgAuthBindDeviceHandler). Спрашиваем
+				// его ТОЛЬКО когда появится новая запись: восстановление своей же
+				// коробки, потерявшей uid, счётчик не увеличивает, и рубить его
+				// на потолке значило бы отнять у человека собственное устройство.
+				lbl := deviceLabel(label, r.UserAgent())
+				if !store.DeviceAlreadyKnown(tok, bindUID, fp, sfp, lbl) {
+					if limit := effectiveDeviceLimit(store, tok, tgServerMaxDevices); limit > 0 && store.DeviceCount(tok) >= limit {
+						log.Warn().Str("uid", bindUID).Str("via", via).Int("limit", limit).
+							Int("devices", store.DeviceCount(tok)).Str("ip", clientIP(r)).
+							Msg("tgauth: recover — device limit reached, not binding")
+						return false
+					}
+				}
+				now := time.Now().UTC()
+				_, err := store.AddDevice(tok, tgauth.DeviceInfo{
+					UID: bindUID, Fingerprint: fp, StableFP: sfp,
+					Label:   deviceLabel(label, r.UserAgent()),
+					BoundAt: now, LastSeen: now, LastIP: clientIP(r),
+				})
+				if errors.Is(err, tgauth.ErrDeviceRevoked) {
+					log.Warn().Str("uid", bindUID).Str("via", via).Str("ip", clientIP(r)).
+						Msg("tgauth: status — recovery matched a device the user unbound, refusing")
+					return false
+				}
+				if fp != "" {
+					store.UpdateDeviceFingerprint(tok, bindUID, fp)
+				}
+				if sfp != "" {
+					store.UpdateDeviceStableFP(tok, bindUID, sfp)
+				}
+			}
+			setAuthCookies(w, r, tok) // restore both cookies
+			learnCub(tok)
+			log.Info().Str("uid", bindUID).Str("via", via).Str("ip", clientIP(r)).Msg("tgauth: status — recovered via device anchor")
+			resp := map[string]any{"authorized": true, "token": tok}
+			attachProofKey(resp, store, tok, bindUID)
+			writeJSON(w, http.StatusOK, resp)
+			return true
+		}
+
+		// Check if user has a valid token (check _lampac_auth first, then lampac_token, then ?token=)
+		authTok, authVia := "", ""
 		for _, cookieName := range []string{"_lampac_auth", "lampac_token"} {
 			if c, err := r.Cookie(cookieName); err == nil {
 				if token := strings.TrimSpace(c.Value); token != "" {
 					if _, ok := store.Lookup(token); ok {
-						setAuthCookies(w, r, token)
-						learnCub(token)
-						bindDeviceIfNew(token)
-						resp := map[string]any{"authorized": true, "token": token}
-						if detectCrossTokenConflict(token) {
-							log.Warn().Str("uid", uid).Str("token_prefix", token[:min(8, len(token))]).
-								Msg("tgauth: status — UID belongs to another token, signaling regen")
-							resp["uid_conflict"] = true
-						}
-						log.Info().Str("cookie", cookieName).Str("ip", clientIP(r)).Msg("tgauth: status — authorized via cookie")
-						writeJSON(w, http.StatusOK, resp)
-						return
+						authTok, authVia = token, "cookie:"+cookieName
+						break
 					}
 				}
 			}
 		}
-		if qToken := strings.TrimSpace(r.URL.Query().Get("token")); qToken != "" {
-			if _, ok := store.Lookup(qToken); ok {
-				setAuthCookies(w, r, qToken)
-				learnCub(qToken)
-				bindDeviceIfNew(qToken)
-				resp := map[string]any{"authorized": true, "token": qToken}
-				if detectCrossTokenConflict(qToken) {
+		if authTok == "" {
+			if qToken := strings.TrimSpace(r.URL.Query().Get("token")); qToken != "" {
+				if _, ok := store.Lookup(qToken); ok {
+					authTok, authVia = qToken, "query"
+				}
+			}
+		}
+		revoked := false
+		if authTok != "" {
+			// Holding the account token is not enough for an UNBOUND uid: the
+			// owner may have thrown exactly this device out through the bot.
+			// The device still has the token in cookie/localStorage, so without
+			// this check "unbind" was cosmetic — it re-attached on the next boot.
+			if uid != "" && !store.HasDevice(authTok, uid) && store.IsDeviceRevoked(authTok, uid, fp, sfp, clientIP(r)) {
+				log.Warn().Str("uid", uid).Str("ip", clientIP(r)).Str("token_prefix", authTok[:min(8, len(authTok))]).
+					Msg("tgauth: status — device was unbound by the user, refusing token and clearing cookies")
+				clearAuthCookies(w, r)
+				revoked = true
+			} else {
+				setAuthCookies(w, r, authTok)
+				learnCub(authTok)
+				resp := map[string]any{"authorized": true, "token": authTok}
+				if !bindDeviceIfNew(authTok) {
+					resp["device_limit"] = true
+				}
+				// ПОСЛЕ привязки: у только что заведённого устройства ключа ещё
+				// нет, и порядок здесь определяет, получит ли новый клиент
+				// аттестацию с первого же ответа или только со второго.
+				attachProofKey(resp, store, authTok, uid)
+				if detectCrossTokenConflict(authTok) {
+					log.Warn().Str("uid", uid).Str("token_prefix", authTok[:min(8, len(authTok))]).
+						Msg("tgauth: status — UID belongs to another token, signaling regen")
 					resp["uid_conflict"] = true
 				}
-				log.Info().Str("ip", clientIP(r)).Msg("tgauth: status — authorized via query token")
+				log.Info().Str("via", authVia).Str("ip", clientIP(r)).Msg("tgauth: status — authorized via token")
 				writeJSON(w, http.StatusOK, resp)
 				return
 			}
@@ -615,15 +689,23 @@ func tgAuthStatusHandler(store *tgauth.Store, pending *tgauth.PendingStore, botN
 				// instead of showing the login. A request that omits fp while the stored
 				// device HAS one is provably not that device → refuse and signal
 				// uid_conflict so the client regenerates its uid and lands on its own QR.
-				if dev.Fingerprint == "" || dev.Fingerprint == fp {
+				allow, cloned, why := uidRestoreVerdict(store, dev, uid, fp, clientIP(r))
+				if allow {
 					setAuthCookies(w, r, tok) // restore both cookies
 					learnCub(tok)
-					writeJSON(w, http.StatusOK, map[string]any{"authorized": true, "token": tok})
+					resp := map[string]any{"authorized": true, "token": tok}
+					attachProofKey(resp, store, tok, uid)
+					writeJSON(w, http.StatusOK, resp)
 					return
 				}
-				log.Warn().Str("uid", uid).Str("ip", clientIP(r)).Bool("req_has_fp", fp != "").
-					Msg("tgauth: status — UID bound to a device with a different/absent fp, refusing auto-auth (uid collision / clone)")
-				uidConflict = true
+				log.Warn().Str("uid", uid).Str("ip", clientIP(r)).Bool("req_has_fp", fp != "").Str("why", why).
+					Msg("tgauth: status — по uid не восстанавливаем")
+				// ★Перегенерацию uid просим только там, где доказано, что им
+				// пользуется не одно устройство (общий uid или чужой отпечаток).
+				// Раньше uid_conflict выставлялся на ЛЮБОЙ отказ, включая обычный
+				// запрос без отпечатка, — и клиент выбрасывал рабочий идентификатор
+				// устройства, терял привязку и шёл на QR по кругу.
+				uidConflict = cloned
 			}
 		}
 
@@ -635,33 +717,29 @@ func tgAuthStatusHandler(store *tgauth.Store, pending *tgauth.PendingStore, botN
 		// nobody rather than the wrong user. On a hit, re-bind this (fresh) UID
 		// to the recovered device so subsequent boots recover via the cheaper
 		// UID path.
+		//
+		// The precise fp is a hash of screen/GPU/canvas/audio — identical across
+		// units of one TV or PC model, so a lone match is NOT proof of identity
+		// (production: one fp on 54 accounts). It restores only with
+		// corroboration: same network as the device's last visit, or a native
+		// device id in the stable fp. Otherwise the device gets a QR code.
 		if fp != "" {
-			if tok, _, ok := store.FindTokenByDeviceFingerprint(fp); ok && tok != "" {
-				if uid != "" {
-					store.UpdateDeviceFingerprint(tok, uid, fp)
-					if _, _ = store.AddDevice(tok, tgauth.DeviceInfo{UID: uid, Fingerprint: fp, StableFP: sfp, BoundAt: time.Now().UTC(), LastSeen: time.Now().UTC(), LastIP: clientIP(r)}); sfp != "" {
-						store.UpdateDeviceStableFP(tok, uid, sfp)
+			if tok, dev, ok := store.FindTokenByDeviceFingerprint(fp); ok && tok != "" {
+				if fpRecoveryCorroborated(dev, sfp, clientIP(r)) {
+					if recoverInto(tok, uid, "fingerprint") {
+						return
 					}
+				} else {
+					log.Info().Str("uid", uid).Str("ip", clientIP(r)).
+						Msg("tgauth: status — fingerprint matches an account but from another network and without native id, not restoring")
 				}
-				setAuthCookies(w, r, tok) // restore both cookies
-				learnCub(tok)
-				log.Info().Str("ip", clientIP(r)).Msg("tgauth: status — recovered via device fingerprint")
-				writeJSON(w, http.StatusOK, map[string]any{"authorized": true, "token": tok})
-				return
 			}
 		}
 		if sfp != "" {
 			if tok, _, ok := store.FindTokenByStableFP(sfp); ok && tok != "" {
-				if uid != "" {
-					if _, _ = store.AddDevice(tok, tgauth.DeviceInfo{UID: uid, Fingerprint: fp, StableFP: sfp, BoundAt: time.Now().UTC(), LastSeen: time.Now().UTC(), LastIP: clientIP(r)}); fp != "" {
-						store.UpdateDeviceFingerprint(tok, uid, fp)
-					}
+				if recoverInto(tok, uid, "stable-fp") {
+					return
 				}
-				setAuthCookies(w, r, tok) // restore both cookies
-				learnCub(tok)
-				log.Info().Str("ip", clientIP(r)).Msg("tgauth: status — recovered via stable fingerprint")
-				writeJSON(w, http.StatusOK, map[string]any{"authorized": true, "token": tok})
-				return
 			}
 		}
 
@@ -691,13 +769,10 @@ func tgAuthStatusHandler(store *tgauth.Store, pending *tgauth.PendingStore, botN
 							bindUID = "cub-" + info.ID[:min(8, len(info.ID))]
 						}
 					}
-					if _, _ = store.AddDevice(tok, tgauth.DeviceInfo{UID: bindUID, Fingerprint: fp, StableFP: sfp, BoundAt: time.Now().UTC(), LastSeen: time.Now().UTC(), LastIP: clientIP(r)}); fp != "" {
-						store.UpdateDeviceFingerprint(tok, bindUID, fp)
+					if recoverInto(tok, bindUID, "cub:"+info.ID) {
+						return
 					}
-					setAuthCookies(w, r, tok) // restore both cookies
-					log.Info().Str("cub_uid", info.ID).Str("uid", bindUID).Str("ip", clientIP(r)).Msg("tgauth: status — recovered via CUB account")
-					writeJSON(w, http.StatusOK, map[string]any{"authorized": true, "token": tok})
-					return
+					break
 				}
 				activeLinks, expiredLinks := store.CubLinkStats(info.ID)
 				log.Info().Str("cub_uid", info.ID).Int("active_links", activeLinks).Int("expired_links", expiredLinks).Str("ip", clientIP(r)).
@@ -739,6 +814,11 @@ func tgAuthStatusHandler(store *tgauth.Store, pending *tgauth.PendingStore, botN
 		if uidConflict {
 			resp["uid_conflict"] = true
 		}
+		if revoked {
+			// Tell the client to drop its stored token so it stops presenting
+			// it on every boot; the QR code above is the way back in.
+			resp["revoked"] = true
+		}
 		writeJSON(w, http.StatusOK, resp)
 	}
 }
@@ -767,6 +847,20 @@ func tgAuthBindDeviceHandler(store *tgauth.Store) http.HandlerFunc {
 				uid = "sfp-" + sfp[:min(8, len(sfp))]
 			}
 		}
+		// Лимит устройств. Эта ручка (GET /tg/auth/bind-device) привязывала
+		// безусловно — при живом лимите в группе. Утёкший токен через неё
+		// набирал устройства сколько угодно. Спрашиваем лимит только когда
+		// появится НОВАЯ запись, иначе повторная привязка своей же коробки
+		// упиралась бы в потолок, ничего к нему не добавляя.
+		if !store.DeviceAlreadyKnown(token, uid, fp, sfp, "") {
+			if limit := effectiveDeviceLimit(store, token, tgServerMaxDevices); limit > 0 && store.DeviceCount(token) >= limit {
+				log.Warn().Str("uid", uid).Int("limit", limit).Int("devices", store.DeviceCount(token)).
+					Str("ip", clientIP(r)).Str("token_prefix", token[:min(8, len(token))]).
+					Msg("tgauth: bind-device — device limit reached, refusing")
+				writeJSON(w, http.StatusOK, map[string]any{"ok": false, "device_limit": limit})
+				return
+			}
+		}
 		dev := tgauth.DeviceInfo{
 			UID:         uid,
 			Fingerprint: fp,
@@ -791,13 +885,7 @@ func tgAuthBindDeviceHandler(store *tgauth.Store) http.HandlerFunc {
 // Response: {"platform":"alcopac","authorized":true,"expires_at":"2026-06-01T00:00:00Z","days_left":75}
 func userInfoHandler(store *tgauth.Store, version string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		token := ""
-		if c, err := r.Cookie("lampac_token"); err == nil {
-			token = strings.TrimSpace(c.Value)
-		}
-		if token == "" {
-			token = strings.TrimSpace(r.URL.Query().Get("token"))
-		}
+		token := auth.ExtractToken(r)
 		// UID-based lookup fallback.
 		if token == "" {
 			if uid := strings.TrimSpace(r.URL.Query().Get("uid")); uid != "" && store != nil {
@@ -865,12 +953,40 @@ func authCookieSameSite(r *http.Request) (http.SameSite, bool) {
 // checks _lampac_auth first.
 //
 // SameSite=None when over HTTPS so the cookies survive cross-origin XHRs.
-// That's the canonical Lampa-on-lampa.mx ↔ lampac-on-beta.l-vid.online
+// That's the canonical Lampa-on-lampa.mx ↔ lampac-on-beta.example.com
 // scenario: without SameSite=None the browser withholds the cookies on
 // any subresource request, plugins see "not authenticated" even though
 // the TG OAuth redirect set the cookies correctly. SameSite=None also
 // requires Secure, which is why we keep Lax for plain HTTP installs
 // (LAN testing, no Secure available there).
+// gateToken — кандидат в токен запроса и откуда он.
+type gateToken struct{ token, src string }
+
+// gateTokenCandidates — все токены запроса без повторов, в порядке auth.ExtractToken: HttpOnly-кук
+// `_lampac_auth`, куки `alpac_token`/`lampac_token`, заголовки X-Alpac-Token/X-Lampac-Token и
+// последним ?token=. Гейт перебирает их, пропуская токен, отвязанный от этого устройства.
+func gateTokenCandidates(r *http.Request) []gateToken {
+	var out []gateToken
+	seen := map[string]bool{}
+	add := func(tok, src string) {
+		tok = strings.TrimSpace(tok)
+		if tok == "" || seen[tok] {
+			return
+		}
+		seen[tok] = true
+		out = append(out, gateToken{token: tok, src: src})
+	}
+	for _, name := range []string{"_lampac_auth", "alpac_token", "lampac_token"} {
+		if c, err := r.Cookie(name); err == nil {
+			add(c.Value, "cookie:"+name)
+		}
+	}
+	add(r.Header.Get("X-Alpac-Token"), "header:X-Alpac-Token")
+	add(r.Header.Get("X-Lampac-Token"), "header:X-Lampac-Token")
+	add(r.URL.Query().Get("token"), "query")
+	return out
+}
+
 func setAuthCookies(w http.ResponseWriter, r *http.Request, token string) {
 	sameSite, secure := authCookieSameSite(r)
 	// Two JS-readable cookies with the same value: the legacy `lampac_token`
@@ -1228,7 +1344,20 @@ func gatePreAuthAllowed(r *http.Request) bool {
 	// Health/system endpoints.
 	if slices.Contains([]string{
 		"/ping", "/version", "/healthz", "/readyz", "/metrics",
-	}, path) {
+		// Список нод для замера скорости: приложение спрашивает его до входа,
+		// иначе первый же замер меряет не то, что будет отдавать видео.
+		"/api/edges",
+		// BlurHash постеров: публичные картинки TMDB, ответ — 28 символов на постер; без гейта,
+		// иначе заглушки рейлов на экране входа и у гостей остаются серыми.
+		"/api/blurhash",
+		// Доклад ТВ-лаунчера: он по определению работает ДО входа — гейт отвечал ему
+		// приглашением с QR-кодом, и про телевизоры мы не видели ничего.
+		"/api/tvlauncher",
+		// Замер по времени (/api/edges/speed?ms=…) — та же проба, что и
+		// /api/edges/speed/{mb}, только без завершающего слэша: под прежний
+		// префикс она не попадала и упиралась в гейт.
+		"/api/edges/speed",
+	}, path) || strings.HasPrefix(path, "/api/edges/speed/") {
 		return true
 	}
 
@@ -1244,6 +1373,18 @@ func gatePreAuthAllowed(r *http.Request) bool {
 		strings.HasPrefix(path, "/proxyimg/") || strings.HasPrefix(path, "/proxyimg:") ||
 		strings.HasPrefix(path, "/vibix_m3u8/") || strings.HasPrefix(path, "/vibix_embed/") ||
 		(strings.HasPrefix(path, "/lite/pidtor/s") && !strings.HasPrefix(path, "/lite/pidtor/serial/")) {
+		return true
+	}
+
+	// /api/cluster/* — межсерверный контур кластера, он аутентифицируется САМ
+	// (ключ в X-Cluster-Key или Bearer, см. cluster). Гейт его глотал: на запрос
+	// обновляльщика ноды (`Authorization: Bearer <api_key>`) main отвечал не
+	// бинарником, а JSON «требуется авторизация» — и с кодом 200. Нода честно
+	// считала sha256 этой страницы, он не сходился с ожидаемым, и обновление
+	// срывалось КАЖДЫЕ 10 минут молча: обе ноды простояли на сборке от 1 сентября
+	// двое суток (найдено 2026-09-04). Ровно так же они однажды отстали на месяц
+	// и отвечали 501 на трети запросов.
+	if strings.HasPrefix(path, "/api/cluster/") {
 		return true
 	}
 
@@ -1338,9 +1479,12 @@ func gatePreAuthAllowed(r *http.Request) bool {
 	}
 
 	// Static asset extensions (needed for the auth page itself).
+	// ★.wgt здесь НЕ место: единственный такой путь — /samsung.wgt, а это готовый
+	// виджет с бэкенда, ровно как /webos.ipk, который закрыт входом. Из-за
+	// расширения в этом списке Samsung-оболочка раздавалась анонимам (2026-09-10).
 	switch filepath.Ext(path) {
 	case ".js", ".css", ".png", ".jpg", ".svg", ".ico", ".woff", ".woff2", ".ttf", ".eot", ".mp3", ".webmanifest",
-		".m3u8", ".m4s", ".ts", ".mp4", ".m4a", ".wgt", ".lampa":
+		".m3u8", ".m4s", ".ts", ".mp4", ".m4a", ".lampa":
 		return true
 	}
 
@@ -1356,6 +1500,11 @@ func tgAuthGateMiddleware(store *tgauth.Store, dp *tgauth.DevicePendingStore, pe
 			// so the mirror-mode delegating gate (mirror.go) applies the EXACT
 			// same allowlist before consulting the origin. Keep both in sync.
 			if gatePreAuthAllowed(r) {
+				// ★Аллоулист пропускает /capi/* — а это и есть весь обычный день
+				// пользователя. Единственная запись LastSeen жила НИЖЕ по этой
+				// функции, поэтому активность живых устройств не фиксировалась
+				// вовсе. Отмечаем здесь, с троттлингом (device_activity.go).
+				touchDeviceActivity(store, r)
 				next.ServeHTTP(w, r)
 				return
 			}
@@ -1389,50 +1538,62 @@ func tgAuthGateMiddleware(store *tgauth.Store, dp *tgauth.DevicePendingStore, pe
 			}
 
 			uid := strings.TrimSpace(r.URL.Query().Get("uid"))
+			fpQ := strings.TrimSpace(r.URL.Query().Get("fp"))
+			sfpQ := strings.TrimSpace(r.URL.Query().Get("sfp"))
 
-			// Try to find a valid token from cookies or query param.
-			// Check _lampac_auth (HttpOnly, tamper-proof) FIRST, then lampac_token.
-			var validToken string
-			if c, err := r.Cookie("_lampac_auth"); err == nil {
-				token := strings.TrimSpace(c.Value)
-				if token != "" {
-					if _, ok := store.Lookup(token); ok {
-						validToken = token
-					}
+			// Токен запроса. Кандидаты — в ТОМ ЖЕ порядке, что у middleware (auth.ExtractToken): куки,
+			// заголовки, и только потом ?token=. Раньше гейт брал ?token= РАНЬШЕ заголовков, и на этом
+			// ломалась Лампа, восстановленная из чужого бэкапа CUB: в адресе её плагина вшит ЧУЖОЙ токен
+			// (online.js подставляет его в ?token=), а свой наша авторизация уже положила в хранилище и
+			// шлёт заголовком. Владелец чужого токена отвязал этот uid — гейт выбрасывал токен, показывал
+			// новый QR, человек подтверждал код, и всё повторялось («ввожу код — просит новый», LG,
+			// 24.09.2026: uid 1brbgdka записан у 95 аккаунтов). Поэтому же токен, отвязанный от ЭТОГО
+			// устройства, не конец разбора: берём следующий кандидат того же запроса.
+			var validToken, validSrc, revokedToken string
+			for _, c := range gateTokenCandidates(r) {
+				if _, ok := store.Lookup(c.token); !ok {
+					continue
 				}
+				if uid != "" && !store.HasDevice(c.token, uid) && store.IsDeviceRevoked(c.token, uid, fpQ, sfpQ, clientIP(r)) {
+					if revokedToken == "" {
+						revokedToken = c.token
+					}
+					continue
+				}
+				validToken, validSrc = c.token, c.src
+				break
 			}
-			if validToken == "" {
-				if c, err := r.Cookie("lampac_token"); err == nil {
-					token := strings.TrimSpace(c.Value)
-					if token != "" {
-						if _, ok := store.Lookup(token); ok {
-							validToken = token
-							// lampac_token valid but _lampac_auth missing —
-							// set the HttpOnly cookie for tamper protection.
-							http.SetCookie(w, &http.Cookie{
-								Name: "_lampac_auth", Value: token,
-								Path: "/", MaxAge: 365 * 24 * 3600,
-								SameSite: http.SameSiteLaxMode, HttpOnly: true,
-							})
-						}
-					}
-				}
+			if validToken != "" && revokedToken != "" {
+				log.Info().Str("uid", uid).Str("ip", clientIP(r)).Str("revoked_prefix", revokedToken[:min(8, len(revokedToken))]).
+					Str("token_prefix", validToken[:min(8, len(validToken))]).Str("src", validSrc).
+					Msg("tgauth-gate: skipped a token unbound from this device, using another from the same request")
 			}
 			// Track whether the cookie-setting paths below already wrote
 			// fresh cookies. The symmetric recovery block must not re-issue
 			// if we just set them via the query-token branch.
 			cookiesAlreadyIssued := false
-			if validToken == "" {
-				if qToken := strings.TrimSpace(r.URL.Query().Get("token")); qToken != "" {
-					if _, ok := store.Lookup(qToken); ok {
-						validToken = qToken
-						// Token from query param (post-auth redirect) — set cookies
-						// so subsequent requests work without ?token= in URL.
-						setAuthCookies(w, r, qToken)
-						cookiesAlreadyIssued = true
-						log.Info().Str("ip", clientIP(r)).Msg("tgauth-gate: token from query param, cookies set")
-					}
-				}
+			switch validSrc {
+			case "":
+			case "cookie:_lampac_auth":
+			case "cookie:lampac_token":
+				// lampac_token valid but _lampac_auth missing —
+				// set the HttpOnly cookie for tamper protection.
+				http.SetCookie(w, &http.Cookie{
+					Name: "_lampac_auth", Value: validToken,
+					Path: "/", MaxAge: 365 * 24 * 3600,
+					SameSite: http.SameSiteLaxMode, HttpOnly: true,
+				})
+			case "query":
+				// Token from query param (post-auth redirect) — set cookies
+				// so subsequent requests work without ?token= in URL.
+				setAuthCookies(w, r, validToken)
+				cookiesAlreadyIssued = true
+				log.Info().Str("ip", clientIP(r)).Msg("tgauth-gate: token from query param, cookies set")
+			default:
+				// кук `alpac_token` или заголовок X-Alpac-Token/X-Lampac-Token (Android WebView не
+				// переигрывает куки в XHR) — выдаём настоящие куки, чтобы следующие запросы их несли.
+				setAuthCookies(w, r, validToken)
+				cookiesAlreadyIssued = true
 			}
 
 			// SYMMETRIC COOKIE RECOVERY (2026-05-20).
@@ -1488,6 +1649,19 @@ func tgAuthGateMiddleware(store *tgauth.Store, dp *tgauth.DevicePendingStore, pe
 					})
 					return
 				}
+			}
+
+			// Revoked device: the owner unbound exactly this device (by uid or
+			// hardware hash) through the bot, yet it still carries the shared
+			// account token — and no other token in the request is usable (see the
+			// candidate loop above). Forget it and fall into Case B, which ends in a
+			// fresh QR code — an approval in the bot lifts the revocation. Without
+			// this, unbinding was undone on the next request.
+			if validToken == "" && revokedToken != "" {
+				log.Warn().Str("uid", uid).Str("ip", clientIP(r)).Str("token_prefix", revokedToken[:min(8, len(revokedToken))]).
+					Msg("tgauth-gate: device was unbound by the user, dropping its token")
+				w.Header().Del("Set-Cookie") // undo any cookie refresh issued above
+				clearAuthCookies(w, r)
 			}
 
 			// Case A: Valid token
@@ -1579,24 +1753,7 @@ func tgAuthGateMiddleware(store *tgauth.Store, dp *tgauth.DevicePendingStore, pe
 				}
 
 				// New device — auto-bind if within device limit
-				maxDevices := store.GetMaxDevices(validToken) // personal limit (-1 = unlimited)
-				if maxDevices == 0 {
-					// Check group-level device limit using the EFFECTIVE
-					// group (premium tier may have a different max_devices).
-					if groupStoreRef != nil && tgTokenStoreRef != nil {
-						gid := tgTokenStoreRef.GetEffectiveGroup(validToken, currentPremiumGroupID())
-						if g, _ := groupStoreRef.Get(gid); g.MaxDevices != 0 {
-							maxDevices = g.MaxDevices
-						}
-					}
-				}
-				if maxDevices == 0 {
-					// 0 = use server-wide default
-					maxDevices = cfg.TelegramAuth.MaxDevicesPerUser
-					if maxDevices == 0 {
-						maxDevices = 3 // hardcoded fallback
-					}
-				}
+				maxDevices := effectiveDeviceLimit(store, validToken, cfg.TelegramAuth.MaxDevicesPerUser)
 				// -1 means unlimited (skip device limit check)
 				if maxDevices > 0 && store.DeviceCount(validToken) >= maxDevices {
 					msg := fmt.Sprintf("Лимит устройств (%d). Отвяжите старое через бота:\n/devices", maxDevices)
@@ -1624,6 +1781,14 @@ func tgAuthGateMiddleware(store *tgauth.Store, dp *tgauth.DevicePendingStore, pe
 					// (cookie path checks cross-token UID) and regenerate.
 					log.Warn().Str("uid", uid).Str("token_prefix", validToken[:min(8, len(validToken))]).
 						Str("ip", clientIP(r)).Msg("tgauth-gate: UID belongs to another token, skipping bind")
+				} else if errors.Is(addErr, tgauth.ErrDeviceRevoked) {
+					// Matched a revocation the pre-check above missed (e.g. a
+					// stable fp the client sent only here). Same outcome: no token.
+					log.Warn().Str("uid", uid).Str("ip", clientIP(r)).Msg("tgauth-gate: device was unbound by the user, refusing bind")
+					w.Header().Del("Set-Cookie")
+					clearAuthCookies(w, r)
+					writeJSON(w, http.StatusOK, accsdbResponse("Устройство было отвязано. Авторизуйтесь заново через бота"))
+					return
 				} else if added && bot != nil {
 					// Notify user in TG about new device (only if actually added)
 					t, _ := store.Lookup(validToken)
@@ -1644,7 +1809,8 @@ func tgAuthGateMiddleware(store *tgauth.Store, dp *tgauth.DevicePendingStore, pe
 				// having restored a cub backup) silently gets the bound token.
 				if tok, dev, ok := store.FindDeviceByUID(uid); ok {
 					reqFP := r.URL.Query().Get("fp")
-					if reqFP == "" || dev.Fingerprint == "" || dev.Fingerprint == reqFP {
+					allow, _, why := uidRestoreVerdict(store, dev, uid, reqFP, clientIP(r))
+					if allow {
 						setAuthCookies(w, r, tok)
 						store.UpdateLastSeen(tok, uid)
 						store.UpdateDeviceIP(tok, uid, clientIP(r))
@@ -1654,8 +1820,8 @@ func tgAuthGateMiddleware(store *tgauth.Store, dp *tgauth.DevicePendingStore, pe
 						next.ServeHTTP(w, r)
 						return
 					}
-					log.Warn().Str("uid", uid).Str("ip", clientIP(r)).
-						Msg("tgauth-gate: UID/fp mismatch on auto-reauth, falling through to pending")
+					log.Warn().Str("uid", uid).Str("ip", clientIP(r)).Str("why", why).
+						Msg("tgauth-gate: по uid сессию не восстанавливаем")
 					// Fall through — pending creation path will set uid_conflict.
 				}
 
@@ -1671,7 +1837,14 @@ func tgAuthGateMiddleware(store *tgauth.Store, dp *tgauth.DevicePendingStore, pe
 				var recOldUID string
 				if reqFP != "" {
 					if fpToken, fpDev, unique := store.FindTokenByDeviceFingerprint(reqFP); unique && fpToken != "" {
-						recToken, recVia, recOldUID = fpToken, "fingerprint", fpDev.UID
+						// A lone fp match is a model match, not a device match (see
+						// the status handler) — require same network or native id.
+						if fpRecoveryCorroborated(fpDev, reqSFP, clientIP(r)) {
+							recToken, recVia, recOldUID = fpToken, "fingerprint", fpDev.UID
+						} else {
+							log.Info().Str("uid", uid).Str("ip", clientIP(r)).
+								Msg("tgauth-gate: fingerprint matches an account but from another network and without native id, not restoring")
+						}
 					}
 				}
 				if recToken == "" && reqSFP != "" {
@@ -1712,8 +1885,11 @@ func tgAuthGateMiddleware(store *tgauth.Store, dp *tgauth.DevicePendingStore, pe
 				// NAT-safe: each device gets its own pending by UID, no IP collisions.
 				if existing, ok := pending.FindByUID(uid); ok {
 					if existing.Status == tgauth.StatusApproved && existing.Token != "" {
-						log.Info().Str("uid", uid).Str("token", existing.Token[:8]+"...").Msg("tgauth-gate: approved pending found by UID")
+						log.Info().Str("uid", uid).Str("token", existing.Token[:min(8, len(existing.Token))]+"...").Msg("tgauth-gate: approved pending found by UID")
 						setAuthCookies(w, r, existing.Token)
+						// The owner just confirmed this very device in the bot —
+						// that lifts any earlier unbind of it.
+						store.ApproveDevice(existing.Token, uid)
 
 						// ── Label-based migration before adding ──
 						// Check if same device type already exists — migrate UID instead of adding.
@@ -1740,21 +1916,7 @@ func tgAuthGateMiddleware(store *tgauth.Store, dp *tgauth.DevicePendingStore, pe
 						if !migrated {
 							// Device limit check (same as Case A) — uses
 							// EFFECTIVE group (premium overlay aware).
-							maxDevices := store.GetMaxDevices(existing.Token)
-							if maxDevices == 0 {
-								if groupStoreRef != nil && tgTokenStoreRef != nil {
-									gid := tgTokenStoreRef.GetEffectiveGroup(existing.Token, currentPremiumGroupID())
-									if g, _ := groupStoreRef.Get(gid); g.MaxDevices != 0 {
-										maxDevices = g.MaxDevices
-									}
-								}
-							}
-							if maxDevices == 0 {
-								maxDevices = cfg.TelegramAuth.MaxDevicesPerUser
-								if maxDevices == 0 {
-									maxDevices = 3
-								}
-							}
+							maxDevices := effectiveDeviceLimit(store, existing.Token, cfg.TelegramAuth.MaxDevicesPerUser)
 							if maxDevices > 0 && store.DeviceCount(existing.Token) >= maxDevices {
 								msg := fmt.Sprintf("Лимит устройств (%d). Отвяжите старое через бота:\n/devices", maxDevices)
 								writeJSON(w, http.StatusOK, accsdbResponse(msg))
@@ -1807,6 +1969,9 @@ func tgAuthGateMiddleware(store *tgauth.Store, dp *tgauth.DevicePendingStore, pe
 				if existing, ok := pending.FindByClientIP(ip); ok {
 					if existing.Status == tgauth.StatusApproved && existing.Token != "" {
 						setAuthCookies(w, r, existing.Token)
+						// uid-less pairing: the approval is keyed by client IP so a
+						// previously unbound device from this address may re-attach.
+						store.ApproveDeviceFromIP(existing.Token, ip)
 						pending.Consume(existing.Code)
 						next.ServeHTTP(w, r)
 						return
@@ -1830,6 +1995,135 @@ func tgAuthGateMiddleware(store *tgauth.Store, dp *tgauth.DevicePendingStore, pe
 			http.Redirect(w, r, "/tg/auth", http.StatusFound)
 		})
 	}
+}
+
+// attachProofKey кладёт в ответ ПЕРСОНАЛЬНЫЙ ключ аттестации этого устройства.
+// Выдаём только тому, кто уже доказал владение токеном И назвал свой uid — то
+// есть по тому же каналу, по которому и так ездит токен доступа. Ключ заменяет
+// общий секрет, зашитый во все клиенты: тот лежал открытым текстом в бандле и
+// в APK, и подделать подпись мог кто угодно.
+func attachProofKey(resp map[string]any, store *tgauth.Store, token, uid string) {
+	if store == nil || token == "" || uid == "" {
+		return
+	}
+	if key, ok := store.EnsureProofKey(token, uid); ok {
+		resp["proof_key"] = key
+		resp["proof_uid"] = uid
+	}
+}
+
+// streamTokenOf достаёт tgauth-токен запроса тем же порядком, что и
+// iptvhttp.streamAuthToken: ?token= главнее, кука lampac_token — фолбэк.
+// Нужен для резолва лимита одновременных потоков на IPTV-ручках.
+func streamTokenOf(r *http.Request) string {
+	if t := strings.TrimSpace(r.URL.Query().Get("token")); t != "" {
+		return t
+	}
+	return auth.ExtractToken(r)
+}
+
+// tgServerMaxDevices mirrors cfg.TelegramAuth.MaxDevicesPerUser for handlers
+// that are wired without the config (the /tg/auth/status rung). Set once at
+// server start; 0 falls back to the hardcoded default inside effectiveDeviceLimit.
+var tgServerMaxDevices int
+
+// effectiveDeviceLimit resolves the device cap for a token: personal limit,
+// then the EFFECTIVE group's limit (premium overlay aware), then the server
+// default, then 3. Returns -1 for unlimited.
+func effectiveDeviceLimit(store *tgauth.Store, token string, serverDefault int) int {
+	maxDevices := store.GetMaxDevices(token) // personal limit (-1 = unlimited)
+	if maxDevices == 0 && groupStoreRef != nil && tgTokenStoreRef != nil {
+		gid := tgTokenStoreRef.GetEffectiveGroup(token, currentPremiumGroupID())
+		if g, _ := groupStoreRef.Get(gid); g.MaxDevices != 0 {
+			maxDevices = g.MaxDevices
+		}
+	}
+	if maxDevices == 0 {
+		maxDevices = serverDefault
+	}
+	if maxDevices == 0 {
+		maxDevices = 3 // hardcoded fallback
+	}
+	return maxDevices
+}
+
+// fpRecoveryCorroborated decides whether a precise-fingerprint match may
+// restore an account. The fp hashes screen, GPU, canvas and audio — every unit
+// of the same TV or PC model produces the same value, so on its own it only
+// says "same model". It counts as the same device when either the request
+// comes from the network the device was last seen on, or the client also
+// presents a stable fp carrying a NATIVE device id that matches the record.
+// uidRestoreVerdict решает, можно ли восстановить сессию по одному лишь uid, и
+// возвращает причину — она уходит в лог, чтобы отказы можно было пересчитать.
+//
+// ★Правило «нет отпечатка — значит клон» (15.08.2026) неверно в посылке. Замер
+// 20.09.2026 по логу nginx: отпечаток шлют только плагины, которые строят URL
+// сами (/lite — 10 924 запроса из 10 947, /lifeevents — 9 880 из 9 893), а
+// синхронизация не шлёт его ВОВСЕ: /timecode 0 из 2 499, /bookmark 0 из 359,
+// /storage 0 из 571. То есть половина запросов ОДНОГО устройства выглядела
+// клоном: вместо данных Лампа получала приглашение с QR-кодом, а по
+// uid_conflict клиент ещё и перегенерировал свой uid. Отсюда петли в журнале —
+// 881 отказ за 2,5 часа от 47 устройств.
+//
+// Отказываем там, где сигнал ЕСТЬ и он против нас:
+//   - uid записан у нескольких токенов — по нему нельзя опознать никого;
+//   - отпечаток прислан и не совпал — это другое железо;
+//   - отпечатка нет, а у записанного устройства он есть — пускаем только из той
+//     же сети, где устройство видели в прошлый раз (та же подпорка, что и у
+//     восстановления по отпечатку: чужой uid из лога почти никогда не приходит
+//     с /24 владельца).
+// Второе возвращаемое значение — «доказано, что этим uid пользуется не одно
+// устройство». Только по нему клиента просят ПЕРЕГЕНЕРИРОВАТЬ uid: иначе
+// честное устройство выбрасывало рабочий идентификатор на каждом запросе без
+// отпечатка, теряло привязку и шло на QR по кругу.
+func uidRestoreVerdict(store *tgauth.Store, dev *tgauth.DeviceInfo, uid, reqFP, ip string) (allow, cloned bool, why string) {
+	if dev == nil {
+		return false, false, "нет записи об устройстве"
+	}
+	if n := store.DeviceUIDOwners(uid); n > 1 {
+		return false, true, "uid записан у нескольких аккаунтов"
+	}
+	if reqFP != "" {
+		if dev.Fingerprint == "" || dev.Fingerprint == reqFP {
+			return true, false, "отпечаток совпал"
+		}
+		// Отпечаток прислан и он чужой — этим uid пользуется второе железо.
+		// Здесь перегенерация как раз и нужна: она не даёт коллизии записаться.
+		return false, true, "отпечаток не совпал"
+	}
+	if dev.Fingerprint == "" {
+		return true, false, "отпечатка нет ни в запросе, ни в записи"
+	}
+	if sameNetwork(dev.LastIP, ip) {
+		return true, false, "без отпечатка, но из той же сети"
+	}
+	return false, false, "без отпечатка и из другой сети"
+}
+
+func fpRecoveryCorroborated(dev *tgauth.DeviceInfo, reqSFP, ip string) bool {
+	if dev == nil {
+		return false
+	}
+	if reqSFP != "" && strings.HasPrefix(reqSFP, tgauth.StableFPNativePrefix) && dev.StableFP == reqSFP {
+		return true
+	}
+	return sameNetwork(dev.LastIP, ip)
+}
+
+// sameNetwork reports whether two addresses share a /24 (IPv4) or /48 (IPv6)
+// prefix — the granularity of one household or one small ISP pool.
+func sameNetwork(a, b string) bool {
+	ipA, ipB := net.ParseIP(strings.TrimSpace(a)), net.ParseIP(strings.TrimSpace(b))
+	if ipA == nil || ipB == nil {
+		return false
+	}
+	if a4, b4 := ipA.To4(), ipB.To4(); a4 != nil || b4 != nil {
+		if a4 == nil || b4 == nil {
+			return false
+		}
+		return a4[0] == b4[0] && a4[1] == b4[1] && a4[2] == b4[2]
+	}
+	return ipA.Mask(net.CIDRMask(48, 128)).Equal(ipB.Mask(net.CIDRMask(48, 128)))
 }
 
 // accsdbResponse builds the standard CUB/Lampa auth-required JSON response.

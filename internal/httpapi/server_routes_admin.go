@@ -341,6 +341,13 @@ func registerAdminRoutes(router chi.Router, deps adminRouteDeps) (adminPath stri
 	router.Get("/"+adminPath+"/api/incidents", incidentFn)
 	router.Post("/"+adminPath+"/api/incidents", incidentFn)
 
+	// netdiag — матрица «провайдер × хост × шаг (DNS/TCP/TLS/HTTP)» из клиентских проб
+	// (netdiag.go): где именно провайдер режет путь до нас и до какой ноды.
+	router.Get("/"+adminPath+"/netdiag", netDiagAdminPageHandler(deps.tgTokenStore, adminIDStore))
+	netDiagFn := netDiagAdminAPIHandler(deps.tgTokenStore, adminIDStore)
+	router.Get("/"+adminPath+"/api/netdiag", netDiagFn)
+	router.Post("/"+adminPath+"/api/netdiag", netDiagFn)
+
 	// TOML config editor + /api/proxy + /api/proxycore/* (moved to internal/adminhttp).
 	adminhttp.RegisterConfigTOMLRoutes(router, adminPath, deps.tgTokenStore, adminIDStore)
 	adminhttp.RegisterProxyRoutes(router, adminPath, deps.tgTokenStore, adminIDStore, func() error { return reloadProxies() })
@@ -361,6 +368,10 @@ func registerAdminRoutes(router chi.Router, deps adminRouteDeps) (adminPath stri
 	// Healthcheck — tunables (interval, thresholds), per-balancer status,
 	// manual re-enable & reset of auto-disable streaks.
 	adminhttp.RegisterHealthcheckRoutes(router, adminPath, deps.tgTokenStore, adminIDStore)
+
+	// IPTV-реестр — свои каналы: состав, источники и их живость, ручной
+	// ingest/refresh. Отвечает 503, пока [iptv] registry не включён.
+	adminhttp.RegisterIPTVRegistryRoutes(router, adminPath, deps.tgTokenStore, adminIDStore)
 
 	// Branding — public-facing brand strings (online plugin name in 4
 	// locales, HTML title, version, …). Saves persist to
@@ -397,6 +408,7 @@ func registerAdminRoutes(router chi.Router, deps adminRouteDeps) (adminPath stri
 	adminhttp.RegisterConstructorRoutes(router, adminPath, deps.tgTokenStore, adminIDStore, deps.custBalPool, deps.dynRoutes, deps.cfg)
 
 	// Cluster — manage cascade of lampac-go nodes (moved to internal/adminhttp).
+	adminhttp.TrustedRequest = isTrustedClusterRequest
 	adminhttp.RegisterClusterRoutes(router, adminPath, deps.tgTokenStore, adminIDStore)
 
 	// TorrServer balancer — pool of backend TorrServers (moved to internal/adminhttp).

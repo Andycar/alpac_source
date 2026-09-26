@@ -4,6 +4,7 @@ import (
 	stdjson "encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -87,6 +88,20 @@ func TestZetflixMovieRjson(t *testing.T) {
 	}
 }
 
+// Заглушка отвечает одним и тем же телом на ЛЮБОЙ &season=N — сезон в запросе
+// она не смотрит. Пока index() брал число сезонов только из TMDB, это было
+// незаметно и тест ждал одну строку. Теперь для serial включается
+// probeSeasonCount: он идёт вверх от базы (TMDB здесь молчит — tmdb_id не
+// передан, значит база 1) и останавливается на первом пустом сезоне, потолок
+// +4. Сезон-слепая заглушка пустого ответа не даёт никогда, поэтому проба
+// упирается в потолок: 1 + 4 = 5 строк. Это и есть контракт probeSeasonCount,
+// его тут и фиксируем.
+//
+// Сделать заглушку сезон-зависимой (404 на season>1) нельзя без похода в сеть:
+// промах по videodb.php уводит fetchEmbed в player.php, а затем в обязательный
+// внешний obrut.show (хост зашит константой zetflixObrutHost). Тест обязан
+// оставаться герметичным, поэтому граничный промах здесь не разыгрывается, а
+// разбор сезонов проверяется юнит-тестом в internal/litesrc.
 func TestZetflixSerialRjson(t *testing.T) {
 	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/iplayer/videodb.php" {
@@ -122,8 +137,26 @@ func TestZetflixSerialRjson(t *testing.T) {
 		t.Fatalf("unexpected season type: %#v body=%s", seasonPayload["type"], seasonRec.Body.String())
 	}
 	seasons, _ := seasonPayload["data"].([]any)
-	if len(seasons) != 1 {
-		t.Fatalf("unexpected season rows count: %d", len(seasons))
+	if len(seasons) != 5 {
+		t.Fatalf("unexpected season rows count: %d (ожидался потолок probeSeasonCount: база 1 + 4)", len(seasons))
+	}
+	// Строки должны быть пронумерованы подряд и вести на свой сезон: по полю s
+	// ориентируется capi-скан, по url — Lampa.
+	for i, raw := range seasons {
+		row, _ := raw.(map[string]any)
+		if row == nil {
+			t.Fatalf("season row %d is not an object: %#v", i, raw)
+		}
+		want := i + 1
+		if got := toString(row["s"]); got != strconv.Itoa(want) {
+			t.Fatalf("season row %d: unexpected s=%q, want %d", i, got, want)
+		}
+		if !strings.Contains(toString(row["url"]), "&s="+strconv.Itoa(want)) {
+			t.Fatalf("season row %d: url does not point at season %d: %#v", i, want, row["url"])
+		}
+		if toString(row["method"]) != "link" {
+			t.Fatalf("season row %d: unexpected method: %#v", i, row["method"])
+		}
 	}
 
 	episodeRec := httptest.NewRecorder()

@@ -2,6 +2,7 @@ package skipsrc
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"net/http"
@@ -21,6 +22,11 @@ const (
 	positiveTTL = 24 * time.Hour // timings for a given cut do not change
 	negativeTTL = 10 * time.Minute
 	maxCache    = 4096
+
+	// A failing source is logged at once, then at most once per this interval
+	// with the number of failures in between: loud enough to notice a dead or
+	// reshaped database, quiet enough not to log every lookup.
+	reportEvery = 15 * time.Minute
 )
 
 // Aggregator probes the public skip databases and caches the reconciled answer.
@@ -29,6 +35,8 @@ type Aggregator struct {
 
 	mu    sync.Mutex
 	cache map[string]cacheEntry
+
+	health sourceHealth
 }
 
 type cacheEntry struct {
@@ -74,6 +82,18 @@ func (a *Aggregator) Lookup(ctx context.Context, q Query) []Segment {
 		}(i, f)
 	}
 	wg.Wait()
+
+	now := time.Now()
+	for _, r := range results {
+		// Canceled = the viewer left before the answer; not the source's fault.
+		if r.err == nil || errors.Is(r.err, context.Canceled) {
+			continue
+		}
+		if report, n := a.health.fail(r.name, now); report {
+			log.Warn().Str("source", r.name).Int("failures", n).Err(r.err).
+				Msg("skipsrc: source failed")
+		}
+	}
 
 	nonEmpty := results[:0:0]
 	for _, r := range results {
@@ -124,4 +144,30 @@ func cacheKey(q Query) string {
 		bucket = int(math.Round(q.Duration/30)) * 30
 	}
 	return fmt.Sprintf("%s|%d|%d|%d|%d", q.ImdbID, q.TmdbID, q.Season, q.Episode, bucket)
+}
+
+// sourceHealth rate-limits failure reports per source. Without them a dead
+// database is indistinguishable from one that simply has no data — which is how
+// SkipMe (410), IntroHater (503) and a reshaped IntroDB answer went unnoticed.
+type sourceHealth struct {
+	mu     sync.Mutex
+	last   map[string]time.Time // when the source was last reported
+	failed map[string]int       // failures since that report
+}
+
+// fail records one failure and says whether to log it now, with how many
+// failures the line accounts for (this one included).
+func (h *sourceHealth) fail(name string, now time.Time) (report bool, n int) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.last == nil {
+		h.last, h.failed = map[string]time.Time{}, map[string]int{}
+	}
+	h.failed[name]++
+	if t, ok := h.last[name]; ok && now.Sub(t) < reportEvery {
+		return false, 0
+	}
+	n = h.failed[name]
+	h.last[name], h.failed[name] = now, 0
+	return true, n
 }

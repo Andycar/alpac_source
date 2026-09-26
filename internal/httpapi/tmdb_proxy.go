@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"lampac-go/internal/litesrc"
 	"lampac-go/internal/tmdbcache"
 
 	"github.com/rs/zerolog/log"
@@ -23,10 +24,14 @@ type tmdbProxy struct {
 	imgCache   *tmdbcache.ImageCache // bounded on-disk cache for images; nil = disabled
 	apiKey     string                // server-side TMDB API key
 	baseTTLMin int                   // base TTL for cache entries (minutes)
+	// finder подкладывает трейлер в videos.results, когда TMDB пуст (см. tmdb_trailers.go).
+	finder *litesrc.TrailerFinder
+	// groups склеивает антологии, которые TMDB держит разными карточками (см. tmdb_groups.go).
+	groups *tmdbGroupStore
 }
 
 // tmdbProxyHandler creates the /tmdb/* HTTP handler.
-func tmdbProxyHandler(cache *tmdbcache.Cache, pool *tmdbcache.Pool, imgCache *tmdbcache.ImageCache, apiKey string, baseTTLMin int) http.Handler {
+func tmdbProxyHandler(cache *tmdbcache.Cache, pool *tmdbcache.Pool, imgCache *tmdbcache.ImageCache, apiKey string, baseTTLMin int, finder *litesrc.TrailerFinder, groups *tmdbGroupStore) http.Handler {
 	if baseTTLMin <= 0 {
 		baseTTLMin = 120
 	}
@@ -36,6 +41,8 @@ func tmdbProxyHandler(cache *tmdbcache.Cache, pool *tmdbcache.Pool, imgCache *tm
 		imgCache:   imgCache,
 		apiKey:     strings.TrimSpace(apiKey),
 		baseTTLMin: baseTTLMin,
+		finder:     finder,
+		groups:     groups,
 	}
 }
 
@@ -73,7 +80,21 @@ func (h *tmdbProxy) handleAPI(w http.ResponseWriter, r *http.Request) {
 		q.Set("api_key", h.apiKey)
 	}
 
+	// Трейлеры: TMDB отдаёт видео ТОЛЬКО на языке запроса, если не сказать иначе.
+	// С language=ru-RU без include_video_language карточка видит 2 ролика вместо 214
+	// (замер 18.09.2026: Android/Lampa получали трейлер у 31% тайтлов, веб — у 78%
+	// ровно из-за этого параметра). Дописываем за всех клиентов; кто передал сам —
+	// не трогаем. До q.Encode() и до ключа кэша — иначе кэш склеит старые ответы.
+	withVideoLanguage(tail, q)
+
 	query := q.Encode()
+
+	// Антология: /collection/<синтетический id> отдаём сами, наверх идти незачем — такой
+	// коллекции в TMDB нет (см. tmdb_groups.go).
+	if body, ok := h.serveGroupCollection(r.Context(), tail, query); ok {
+		h.writeResponse(w, body, map[string]string{"Content-Type": "application/json; charset=utf-8"}, 200)
+		return
+	}
 
 	// Cache lookup.
 	cacheKey := tmdbcache.CacheKey(tail, q)
@@ -99,6 +120,12 @@ func (h *tmdbProxy) handleAPI(w http.ResponseWriter, r *http.Request) {
 					log.Debug().Err(err).Str("path", tail).Msg("tmdb: background refresh failed")
 					return
 				}
+				h.normalizeFetch(ctx, tail, fr) // см. tmdb_normalize.go — кэшируем уже чистое тело
+				h.fillTrailer(ctx, tail, fr)
+				h.fillGroup(tail, fr)
+				if fr.NoCache {
+					return
+				}
 				h.cache.Put(cacheKey, fr.Body, fr.Headers, fr.Status, tail, h.baseTTLMin)
 			}()
 		}
@@ -120,8 +147,17 @@ func (h *tmdbProxy) handleAPI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Store in cache and serve.
-	h.cache.Put(cacheKey, fr.Body, fr.Headers, fr.Status, tail, h.baseTTLMin)
+	// Чистим карточки (нечитаемые названия, кракозябры, мусор без постеров) ДО записи в кэш,
+	// чтобы цена прохода платилась один раз на промах, а не на каждый запрос. См. tmdb_normalize.go.
+	h.normalizeFetch(ctx, tail, fr)
+	h.fillTrailer(ctx, tail, fr)
+	h.fillGroup(tail, fr)
+
+	// Store in cache and serve. NoCache — карточка ждёт трейлер из фона:
+	// следующий запрос перечитает апстрим и застанет его уже в кэше finder'а.
+	if !fr.NoCache {
+		h.cache.Put(cacheKey, fr.Body, fr.Headers, fr.Status, tail, h.baseTTLMin)
+	}
 	h.writeResponse(w, fr.Body, fr.Headers, fr.Status)
 }
 

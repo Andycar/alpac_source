@@ -46,6 +46,14 @@ type StoredBackend struct {
 	SSHUser     string `json:"ssh_user,omitempty"` // пусто → root
 	SSHPassword string `json:"ssh_password,omitempty"`
 	SSHCmd      string `json:"ssh_cmd,omitempty"` // пусто → systemctl restart torrserver
+
+	// Прямая отдача зрителю (см. DirectLink). DirectURL — публичный https-фронт
+	// ЭТОЙ машины (nginx перед 127.0.0.1:8090, deploy/ts-direct.conf); когда он
+	// задан, /ts/stream отвечает 302 на подписанную ссылку, и байты идут
+	// бэкенд→зритель, минуя main. Пусто = отдача через main, как прежде — так
+	// бэкенды переводятся по одному. DirectSecret — общий с nginx secure_link.
+	DirectURL    string `json:"direct_url,omitempty"`
+	DirectSecret string `json:"direct_secret,omitempty"`
 }
 
 // Settings controls pool behaviour. Persisted alongside backends.
@@ -63,6 +71,11 @@ type Settings struct {
 	// systemd Restart=always deployment restarts it automatically. Off by
 	// default — the operator must opt in to remote restarts.
 	AutoRestartZombie bool `json:"auto_restart_zombie"`
+	// DirectTTLSec — срок жизни подписанной прямой ссылки (DirectLink). Плеер
+	// открывает каждый seek заново через main и получает свежий 302, так что
+	// срок важен лишь для одного непрерывного чтения; 6 часов покрывают любой
+	// фильм с запасом и не дают ссылке жить сутками.
+	DirectTTLSec int `json:"direct_ttl_sec"`
 }
 
 // DefaultSettings returns sane defaults.
@@ -72,6 +85,7 @@ func DefaultSettings() Settings {
 		RecoverThreshold: 2,
 		ProbeIntervalSec: 30,
 		DebugHeader:      true,
+		DirectTTLSec:     6 * 3600,
 	}
 }
 
@@ -84,6 +98,9 @@ func (st *Settings) normalize() {
 	}
 	if st.ProbeIntervalSec < 5 {
 		st.ProbeIntervalSec = 30
+	}
+	if st.DirectTTLSec < 60 {
+		st.DirectTTLSec = 6 * 3600
 	}
 }
 
@@ -182,6 +199,14 @@ func (s *Store) load() error {
 	return nil
 }
 
+// Reload перечитывает backends.json и settings.json с диска. См. cluster.Store.Reload:
+// без этого смена веса бэкенда в файле требовала перезапуска всего сервера.
+func (s *Store) Reload() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.load()
+}
+
 func (s *Store) persist() error {
 	bb, err := json.MarshalIndent(s.backends, "", "  ")
 	if err != nil {
@@ -277,6 +302,9 @@ type UpdatePatch struct {
 	SSHUser     *string
 	SSHPassword *string
 	SSHCmd      *string
+
+	DirectURL    *string
+	DirectSecret *string
 }
 
 // Update mutates an existing backend by ID.
@@ -343,6 +371,12 @@ func (s *Store) Update(id string, p UpdatePatch) (StoredBackend, error) {
 		}
 		if p.SSHCmd != nil {
 			b.SSHCmd = strings.TrimSpace(*p.SSHCmd)
+		}
+		if p.DirectURL != nil {
+			b.DirectURL = strings.TrimRight(strings.TrimSpace(*p.DirectURL), "/")
+		}
+		if p.DirectSecret != nil {
+			b.DirectSecret = strings.TrimSpace(*p.DirectSecret)
 		}
 		b.UpdatedAt = time.Now().UTC()
 		if err := s.persist(); err != nil {

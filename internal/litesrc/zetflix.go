@@ -86,6 +86,9 @@ type zetflixChecker struct {
 	// has more episodes (= came from a better CDN node).
 	obrutEmbedCache sync.Map // map[string]obrutEmbedCacheEntry
 
+	// seasonCountCache: kp → подтверждённое пробами число сезонов (см. probeSeasonCount).
+	seasonCountCache sync.Map // map[int64]zetflixSeasonCountEntry
+
 	janitorOnce sync.Once
 }
 
@@ -307,7 +310,8 @@ func (z *zetflixChecker) manifestMulti(w http.ResponseWriter, r *http.Request, p
 			if !z.useHLS {
 				ext = ".mp4"
 			}
-			target = host + "/lite/zetflix/manifest" + ext + "?link=" + url.QueryEscape(target)
+			// edge= — резолвить на добывшей ноде (см. liteEdgeHint).
+			target = host + "/lite/zetflix/manifest" + ext + "?link=" + url.QueryEscape(target) + liteEdgeHint()
 			qualityMap[label] = target
 			if res > bestRes {
 				bestRes = res
@@ -556,6 +560,13 @@ func (z *zetflixChecker) index(w http.ResponseWriter, r *http.Request, links *pr
 		if serial && embed.SeasonCount > seasonCount {
 			seasonCount = embed.SeasonCount
 		}
+		if serial {
+			// КП-разбивка часто ДЛИННЕЕ TMDB («Наруто»: 5 сезонов против 4 — серии
+			// 186–220 живут в S5), а embed.SeasonCount на анти-бот пути videodb.php
+			// не заполняется. Список из TMDB прятал хвостовые сезоны и от Lampa, и от
+			// capi-скана. Пробуем сезоны вверх (кэш по kp, потолок +4).
+			seasonCount = z.probeSeasonCount(r.Context(), kinopoiskID, seasonCount)
+		}
 		log.Debug().Int("seasonCount", seasonCount).Int64("tmdb_id", id).Msg("zetflix: writeSeason")
 		z.writeSeason(w, r, rjson, kinopoiskID, title, originalTitle, seasonCount, embed.Quality)
 		return
@@ -648,6 +659,7 @@ func (z *zetflixChecker) writeSeason(
 		rows = append(rows, map[string]any{
 			"method":  "link",
 			"id":      i,
+			"s":       i, // явный номер сезона — capi-скан ориентируется по нему
 			"url":     link,
 			"name":    name,
 			"quality": quality,
@@ -849,10 +861,18 @@ func (z *zetflixChecker) fetchEmbed(ctx context.Context, kinopoiskID int64, seas
 	// 2026 — the anti-bot videodb.php endpoint is the only one that survives.
 	if fileData, ok := zetflixFetchEmbedBrowserWithHTML(ctx, apiHost, kinopoiskID, season, ""); ok && fileData != "" {
 		if embed, pok := z.parsePlayerHTML(fileData); pok && len(embed.PL) > 0 {
-			if season <= 0 || !embed.Movie {
+			switch {
+			case z.embedOnDeadCDN(embed):
+				// videodb.php still hands out prosto.hdvideobox.me for some titles —
+				// a host that has not resolved since Nov 2025. Don't return those
+				// rows; the obrut fallback below serves the same title live.
+				log.Warn().Int64("kp", kinopoiskID).Int("season", season).Int("pl", len(embed.PL)).
+					Msg("zetflix: videodb embed points at the dead hdvideobox CDN, trying live fallbacks")
+			case season <= 0 || !embed.Movie:
 				return embed, true
+			default:
+				log.Debug().Int64("kp", kinopoiskID).Int("season", season).Msg("zetflix: serial requested, videodb returned flat movie; trying legacy fallback")
 			}
-			log.Debug().Int64("kp", kinopoiskID).Int("season", season).Msg("zetflix: serial requested, videodb returned flat movie; trying legacy fallback")
 		}
 	}
 
@@ -2151,43 +2171,132 @@ func (z *zetflixChecker) cacheAndReturnDateHost() string {
 	return resolved
 }
 
+type zetflixSeasonCountEntry struct {
+	count int
+	exp   time.Time
+}
+
+// probeSeasonCount проверяет, есть ли у источника сезоны ВЫШЕ base, пробуя
+// fetchEmbed(kp, n+1) до первого пустого (потолок +4). Результат кэшируется
+// на 6 часов — повторные списки сезонов проб не делают.
+func (z *zetflixChecker) probeSeasonCount(ctx context.Context, kinopoiskID int64, base int) int {
+	if kinopoiskID <= 0 || base <= 0 {
+		return base
+	}
+	if v, ok := z.seasonCountCache.Load(kinopoiskID); ok {
+		if e, ok := v.(zetflixSeasonCountEntry); ok && time.Now().Before(e.exp) {
+			return max(base, e.count)
+		}
+	}
+	n := base
+	for extra := 0; extra < 4; extra++ {
+		if ctx.Err() != nil {
+			return n // бюджет вышел — НЕ кэшируем недопробованное
+		}
+		embed, ok := z.fetchEmbed(ctx, kinopoiskID, n+1)
+		if !ok || embed.Movie || len(embed.PL) == 0 {
+			break
+		}
+		n++
+	}
+	z.seasonCountCache.Store(kinopoiskID, zetflixSeasonCountEntry{count: n, exp: time.Now().Add(6 * time.Hour)})
+	return n
+}
+
 func (z *zetflixChecker) numberOfSeasons(ctx context.Context, id int64) int {
 	if id <= 0 {
 		return 1
 	}
 
-	target := "https://tmdb.mirror-kurwa.men/3/tv/" + strconv.FormatInt(id, 10) + "?api_key=4ef0d7355d9ffb5151e987764708ce96"
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
-	if err != nil {
-		return 1
-	}
-	req.Header.Set("Accept", "application/json, text/plain, */*")
-	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
-	req.Header.Set("X-Lampac-Go", "1")
+	// Two bases, first regex hit wins: the mirror answers from RU egress but has been
+	// serving Cloudflare «error code: 1016» (origin DNS) — with only it, every multi-season
+	// serial degraded to a one-row season list. The official host covers that case.
+	path := "/3/tv/" + strconv.FormatInt(id, 10) + "?api_key=4ef0d7355d9ffb5151e987764708ce96"
+	for _, base := range []string{"https://tmdb.mirror-kurwa.men", "https://api.themoviedb.org"} {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+path, nil)
+		if err != nil {
+			continue
+		}
+		req.Header.Set("Accept", "application/json, text/plain, */*")
+		req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
+		req.Header.Set("X-Lampac-Go", "1")
 
-	resp, err := z.client.Do(req)
-	if err != nil {
-		return 1
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return 1
-	}
-
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		return 1
-	}
-
-	if m := submatch1(zetflixTmdbSeasonsRe, string(raw)); m != "" {
-		if n, err := strconv.Atoi(m); err == nil && n > 0 {
-			return n
+		resp, err := z.client.Do(req)
+		if err != nil {
+			continue
+		}
+		raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		resp.Body.Close()
+		if err != nil || resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			continue
+		}
+		if m := submatch1(zetflixTmdbSeasonsRe, string(raw)); m != "" {
+			if n, err := strconv.Atoi(m); err == nil && n > 0 {
+				return n
+			}
 		}
 	}
 	return 1
 }
 
+// buildStreamQuality parses a player "file" field into quality rows and drops
+// rows on the dead CDN (prosto.hdvideobox.me: NXDOMAIN since Nov 2025) when no
+// replacement host is configured. Handing such a row to the player is a
+// guaranteed 502 after the proxy's dial timeout — incident 0901: «Холод» sat on
+// 27 consecutive 502s while the same title resolves fine through obrut.
 func (z *zetflixChecker) buildStreamQuality(file string) []map[string]any {
+	rows := z.buildStreamQualityAll(file)
+	if z.cdnReplace != "" || len(rows) == 0 {
+		return rows
+	}
+	kept := rows[:0]
+	for _, row := range rows {
+		u, _ := row["url"].(string)
+		if zetflixOnDeadCDN(u) {
+			continue
+		}
+		kept = append(kept, row)
+	}
+	if len(kept) == 0 {
+		return nil
+	}
+	return kept
+}
+
+// zetflixOnDeadCDN reports whether a stream url points at the dead hdvideobox CDN.
+func zetflixOnDeadCDN(u string) bool {
+	return strings.Contains(strings.ToLower(u), zetflixDeadCDN)
+}
+
+// embedOnDeadCDN reports whether EVERY playable file of the embed sits on the
+// dead CDN (with no replacement configured) — the signal to keep walking the
+// fallback chain (player.php → obrut) instead of returning unplayable rows,
+// the same rule lampac-nextgen applies (NeedLiveMovieFallback).
+func (z *zetflixChecker) embedOnDeadCDN(embed zetflixEmbed) bool {
+	if z.cdnReplace != "" {
+		return false
+	}
+	total, dead := 0, 0
+	for _, item := range embed.PL {
+		if f := strings.TrimSpace(item.File); f != "" {
+			total++
+			if zetflixOnDeadCDN(f) {
+				dead++
+			}
+		}
+		for _, ep := range item.Folder {
+			if f := strings.TrimSpace(ep.File); f != "" {
+				total++
+				if zetflixOnDeadCDN(f) {
+					dead++
+				}
+			}
+		}
+	}
+	return total > 0 && dead == total
+}
+
+func (z *zetflixChecker) buildStreamQualityAll(file string) []map[string]any {
 	matches := zetflixQualityURLRe.FindAllStringSubmatch(file, -1)
 	if len(matches) == 0 {
 		// Fallback: if file is a single URL (no quality markers), use it directly
@@ -2294,7 +2403,8 @@ func (z *zetflixChecker) proxyStreams(r *http.Request, streams []map[string]any,
 	if hasObrut && len(qualLinks) > 0 {
 		// Build one manifest URL with all quality links encoded as JSON.
 		linksJSON, _ := stdjson.Marshal(qualLinks)
-		manifestURL := host + "/lite/zetflix/manifest?links=" + url.QueryEscape(string(linksJSON))
+		// edge= — манифест должен прийти на ЭТУ ноду: ссылка obrut привязана к её адресу (liteEdgeHint).
+		manifestURL := host + "/lite/zetflix/manifest?links=" + url.QueryEscape(string(linksJSON)) + liteEdgeHint()
 
 		// Set manifest URL on all obrut streams (main url uses first/best quality).
 		for i := range streams {

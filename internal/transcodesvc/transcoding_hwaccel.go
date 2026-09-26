@@ -419,8 +419,11 @@ func is10BitPixFmt(pixFmt string) bool {
 // Probed once per process from `ffmpeg -filters` (static builds vary: BtbN
 // bundles zimg, distro ffmpeg may not).
 type tonemapFilters struct {
-	ZScale  bool // zscale (libzimg) — precise transfer/matrix conversions
-	Tonemap bool // tonemap — the linear-light HDR→SDR operator
+	// TonemapX — SIMD-тонмаппер jellyfin-ffmpeg: один фильтр вместо цепочки zscale→tonemap→zscale
+	// (в 2–4 раза дешевле по CPU при том же результате; умеет bt2390, HLG, DoVi-метаданные).
+	TonemapX bool
+	ZScale   bool // zscale (libzimg) — precise transfer/matrix conversions
+	Tonemap  bool // tonemap — the linear-light HDR→SDR operator
 }
 
 var (
@@ -441,11 +444,12 @@ func detectTonemapFilters(ffmpegPath string) {
 		}
 		s := string(out)
 		tonemapFiltersHave = tonemapFilters{
-			ZScale:  strings.Contains(s, " zscale "),
-			Tonemap: strings.Contains(s, " tonemap "),
+			ZScale:   strings.Contains(s, " zscale "),
+			Tonemap:  strings.Contains(s, " tonemap "),
+			TonemapX: strings.Contains(s, " tonemapx "),
 		}
 		log.Info().Bool("zscale", tonemapFiltersHave.ZScale).Bool("tonemap", tonemapFiltersHave.Tonemap).
-			Msg("transcoding: HDR tonemap filter support")
+			Bool("tonemapx", tonemapFiltersHave.TonemapX).Msg("transcoding: HDR tonemap filter support")
 	})
 }
 
@@ -483,6 +487,13 @@ func buildTonemapPrefilter(kind HWKind) []string {
 		target = "nv12"
 	}
 
+	if tonemapFiltersHave.TonemapX {
+		// jellyfin-ffmpeg: tonemapx делает всю цепочку (линеаризация PQ/HLG, оператор bt2390,
+		// обратно в BT.709 tv-range) одним SIMD-проходом в yuv, без float-RGB через zscale —
+		// та же картинка, что у Jellyfin, и заметно меньше CPU на 4K HDR.
+		chain := "tonemapx=tonemap=bt2390:desat=0:peak=100:t=bt709:m=bt709:p=bt709:r=tv:format=" + target + hwupload
+		return []string{"-vf", chain}
+	}
 	if tonemapFiltersHave.ZScale && tonemapFiltersHave.Tonemap {
 		// Canonical ffmpeg HDR→SDR chain: linear light in float RGB, hable
 		// tonemap (npl=100 nits nominal SDR peak), back to BT.709 tv-range.

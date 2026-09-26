@@ -201,6 +201,31 @@ func RegisterEdgeHashClient(c *mirageWSClient, keys ...string) {
 }
 
 // GetEdgeHash returns the latest edge_hash for any matching key, or "".
+// CloseEdgeHashClient closes and unregisters the WS client registered under
+// key (and every alias pointing at the same client). Called right before a
+// browser tab is opened for that stream: the tab's own player connects with the
+// SAME sid, and the CDN allows one live connection per sid — whichever side is
+// second gets close 4005. Letting our client keep fighting the tab produced
+// the 4005 reconnect loop that starved the heartbeat (2026-09-02).
+func CloseEdgeHashClient(key string) {
+	if key == "" {
+		return
+	}
+	edgeHashRegistryMu.Lock()
+	c, ok := edgeHashRegistry[key]
+	if ok {
+		for k, v := range edgeHashRegistry {
+			if v == c {
+				delete(edgeHashRegistry, k)
+			}
+		}
+	}
+	edgeHashRegistryMu.Unlock()
+	if ok {
+		c.Close()
+	}
+}
+
 func GetEdgeHash(keys ...string) string {
 	edgeHashRegistryMu.RLock()
 	defer edgeHashRegistryMu.RUnlock()

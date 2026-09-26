@@ -59,3 +59,31 @@ func TestLiveCacheHit(t *testing.T) {
 		t.Fatal("result was not cached")
 	}
 }
+
+// Every source answers without failing — a dead host (410/503), a Cloudflare
+// wall or a reshaped answer shows up here as an error, not as "0 segments".
+// Breaking Bad S01E02 is known to SkipDB and IntroDB (2026-09-25).
+func TestLiveSourcesHealthy(t *testing.T) {
+	if os.Getenv("SKIPSRC_LIVE") == "" {
+		t.Skip("set SKIPSRC_LIVE=1 to hit the real skip databases")
+	}
+	c := New().client
+	ep := Query{ImdbID: "tt0903747", TmdbID: 1396, Season: 1, Episode: 2, Duration: 2880}
+	anime := Query{ImdbID: "tt2560140", TmdbID: 1429, Season: 1, Episode: 1, Duration: 1540}
+	for _, tc := range []struct {
+		f fetcher
+		q Query
+	}{{fetchSkipDB, ep}, {fetchIntroDB, ep}, {fetchAniskip, anime}} {
+		ctx, cancel := context.WithTimeout(context.Background(), probeDeadline)
+		r := tc.f(ctx, c, tc.q)
+		cancel()
+		if r.err != nil {
+			t.Errorf("%s failed: %v", r.name, r.err)
+			continue
+		}
+		if len(r.segments) == 0 {
+			t.Errorf("%s answered but knows nothing about a well-covered title", r.name)
+		}
+		t.Logf("%s: %d segments", r.name, len(r.segments))
+	}
+}

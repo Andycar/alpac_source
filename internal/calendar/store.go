@@ -63,8 +63,17 @@ type Subscription struct {
 	// A rev mismatch is treated as "no baseline" so the next poll re-baselines in
 	// silence. Old records carry 0, which never matches a shipped rev.
 	VoicesRev int `json:"voices_rev,omitempty"`
+	// VoicesSeason/VoicesEpisode — К КАКОЙ СЕРИИ относится снимок. Озвучки берутся
+	// сверлением балансеров по конкретной серии, поэтому список от S1E10 несравним
+	// со списком от S2E1: без этой привязки новый сезон либо промолчал бы про свои
+	// дорожки (имена студий те же), либо объявил бы их все скопом.
+	VoicesSeason  int `json:"voices_season,omitempty"`
+	VoicesEpisode int `json:"voices_episode,omitempty"`
 	// ReleaseNotified guards the one-shot movie-release alert.
 	ReleaseNotified bool `json:"release_notified,omitempty"`
+	// DigitalNotified — разослано «вышел в цифре» (цифровой релиз, TMDB release_dates тип 4).
+	// Для нашего зрителя это и есть «можно смотреть»: премьера в кино даёт только экранки.
+	DigitalNotified bool `json:"digital_notified,omitempty"`
 }
 
 // TrackKind returns the effective kind, treating the zero value as a series.
@@ -174,6 +183,7 @@ func (s *Store) Subscribe(tgID int64, sub Subscription) {
 			sub.Voices = existing.Voices
 			sub.LastSeason, sub.LastEpisode = existing.LastSeason, existing.LastEpisode
 			sub.ReleaseNotified = existing.ReleaseNotified
+			sub.DigitalNotified = existing.DigitalNotified
 			sub.AddedAt = existing.AddedAt
 			us.Shows[i] = sub
 			s.saveSubs()
@@ -408,7 +418,8 @@ func (s *Store) GetNotifyApp(tgID int64) bool {
 // UpdateVoices stores the newly observed voice set for a tracked title across
 // every subscriber, so the next poll diffs against what we have already told
 // people about.
-func (s *Store) UpdateVoices(key string, voices []string) {
+// UpdateVoices сохраняет снимок озвучек и помечает, к какой серии он относится.
+func (s *Store) UpdateVoices(key string, voices []string, season, episode int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -420,6 +431,8 @@ func (s *Store) UpdateVoices(key string, voices []string) {
 			}
 			s.subs[i].Shows[j].Voices = append([]string(nil), voices...)
 			s.subs[i].Shows[j].VoicesRev = VoicesRev
+			s.subs[i].Shows[j].VoicesSeason = season
+			s.subs[i].Shows[j].VoicesEpisode = episode
 			changed = true
 		}
 	}
@@ -447,6 +460,44 @@ func (s *Store) MarkReleaseNotified(key string) {
 	if changed {
 		s.saveSubs()
 	}
+}
+
+// MarkDigitalNotified — «вышел в цифре» разослано (или устарело и погашено молча).
+func (s *Store) MarkDigitalNotified(key string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	changed := false
+	for i := range s.subs {
+		for j := range s.subs[i].Shows {
+			if s.subs[i].Shows[j].Key() != key || s.subs[i].Shows[j].DigitalNotified {
+				continue
+			}
+			s.subs[i].Shows[j].DigitalNotified = true
+			changed = true
+		}
+	}
+	if changed {
+		s.saveSubs()
+	}
+}
+
+// SubscribersOfKeySince — подписчики ключа с моментом подписки: подписавшемуся уже после
+// события сообщать о нём незачем, он и так видел, что фильм вышел.
+func (s *Store) SubscribersOfKeySince(key string) []SubscriberSince {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var out []SubscriberSince
+	for i := range s.subs {
+		for _, sh := range s.subs[i].Shows {
+			if sh.Key() == key {
+				out = append(out, SubscriberSince{TelegramID: s.subs[i].TelegramID, AddedAt: sh.AddedAt})
+				break
+			}
+		}
+	}
+	return out
 }
 
 // SubscriberSince pairs a subscriber with the moment they subscribed, so the
@@ -506,6 +557,15 @@ func (s *Store) AllTracked() []Subscription {
 			if idx, ok := seen[key]; ok {
 				if sh.TrackVoices {
 					out[idx].TrackVoices = true
+				}
+				// Разовые вести — по ключу, а не по первой попавшейся записи: иначе
+				// свежая подписка давнего пользователя (он раньше в списке) без флага
+				// повторила бы «фильм вышел» всем, кто его уже получил.
+				if sh.ReleaseNotified {
+					out[idx].ReleaseNotified = true
+				}
+				if sh.DigitalNotified {
+					out[idx].DigitalNotified = true
 				}
 				continue
 			}
@@ -582,21 +642,24 @@ func (s *Store) PopularShows(n int) []PopularShow {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	counts := map[int]*PopularShow{}
+	// Ключ — с видом (Key: "tv:1413" / "movie:1413"): у фильмов и сериалов TMDB свои
+	// пространства id, и по одному числу фильм со сериалом склеивались в общий счётчик.
+	counts := map[string]*PopularShow{}
 	for _, us := range s.subs {
 		for _, sh := range us.Shows {
 			if sh.TmdbID == 0 {
 				continue
 			}
-			p, ok := counts[sh.TmdbID]
+			p, ok := counts[sh.Key()]
 			if !ok {
 				p = &PopularShow{
+					Kind:       sh.TrackKind(),
 					TmdbID:     sh.TmdbID,
 					ImdbID:     sh.ImdbID,
 					Title:      sh.Title,
 					PosterPath: sh.PosterPath,
 				}
-				counts[sh.TmdbID] = p
+				counts[sh.Key()] = p
 			}
 			p.Subscribers++
 		}
@@ -607,7 +670,14 @@ func (s *Store) PopularShows(n int) []PopularShow {
 		out = append(out, *p)
 	}
 	sort.Slice(out, func(i, j int) bool {
-		return out[i].Subscribers > out[j].Subscribers
+		if out[i].Subscribers != out[j].Subscribers {
+			return out[i].Subscribers > out[j].Subscribers
+		}
+		// При равенстве порядок из карты случаен — «Ждут в ALPAC» прыгал бы между открытиями.
+		if out[i].Kind != out[j].Kind {
+			return out[i].Kind < out[j].Kind
+		}
+		return out[i].TmdbID < out[j].TmdbID
 	})
 	if n > 0 && len(out) > n {
 		out = out[:n]
@@ -617,6 +687,7 @@ func (s *Store) PopularShows(n int) []PopularShow {
 
 // PopularShow is a show with subscriber count.
 type PopularShow struct {
+	Kind        string `json:"kind"` // tv | movie
 	TmdbID      int    `json:"tmdb_id"`
 	ImdbID      string `json:"imdb_id"`
 	Title       string `json:"title"`

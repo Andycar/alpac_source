@@ -31,9 +31,18 @@ func clusterPingHandler() http.HandlerFunc {
 			return
 		}
 
+		// version lets the primary see, in one place, whether the fleet is
+		// running the same build. Divergence used to be invisible: the probe
+		// answered {ok, mode} and nothing else, so a node stuck on an old
+		// binary looked identical to an up-to-date one while behaving
+		// differently on every source.
 		writeJSON(w, http.StatusOK, map[string]any{
-			"ok":   true,
-			"mode": cfg.Cluster.Mode,
+			"ok":      true,
+			"mode":    cfg.Cluster.Mode,
+			"version": liveVersion(),
+			// build is the real identity: every build carries the same version
+			// string, so only the binary hash tells two of them apart.
+			"build": selfBuildShort(),
 		})
 	}
 }

@@ -581,6 +581,7 @@ func (c *mikaiChecker) indexSerial(w http.ResponseWriter, req *http.Request, rjs
 			getsTVAppendSeasonHTML(&sb, map[string]any{
 				"method": "link",
 				"url":    link,
+				"s":      sn, // season number for capi's season scan (data-json is all it parses)
 			}, strconv.Itoa(sn), false)
 		}
 		if rjson {

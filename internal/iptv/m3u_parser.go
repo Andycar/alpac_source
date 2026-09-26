@@ -19,14 +19,19 @@ import (
 // Never loads the entire file into memory — supports 100K+ channel playlists.
 func ParseM3U(r io.Reader, callback func(Channel)) (M3UHeader, error) {
 	scanner := bufio.NewScanner(r)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024) // up to 1MB lines
+	// До 4MB на строку: панели, склеивающие base64-логотипы в один #EXTINF,
+	// пробивали прежний лимит в 1MB — и scanner.Err() убивал ВЕСЬ плейлист.
+	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 
 	var header M3UHeader
 	var pending *extinf // parsed #EXTINF waiting for URL line
 	num := 0
+	idSeen := make(map[string]int) // identity → счётчик дублей для channelID
 
 	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
+		// BOM у некоторых панелей стоит перед #EXTM3U — без среза заголовок не
+		// распознавался и терялся url-tvg (EPG).
+		line := strings.TrimSpace(strings.TrimPrefix(scanner.Text(), "\ufeff"))
 		if line == "" {
 			continue
 		}
@@ -82,8 +87,10 @@ func ParseM3U(r io.Reader, callback func(Channel)) (M3UHeader, error) {
 		}
 
 		num++
+		identity := pending.tvgID + "|" + pending.name + "|" + pending.group
+		idSeen[identity]++
 		ch := Channel{
-			ID:        channelID(url, pending.name),
+			ID:        channelID(identity, idSeen[identity]),
 			Name:      pending.name,
 			CleanName: cleanChannelName(pending.name),
 			URL:       url,
@@ -262,11 +269,19 @@ func extractJSONValue(s, key string) string {
 //  Channel name helpers
 // ---------------------------------------------------------------------------
 
-var reQualityTag = regexp.MustCompile(`(?i)\s*[\(\[]*\s*(4K|UHD|2160[pi]?|FHD|1080[pi]?|HD|720[pi]?|SD|480[pi]?|360[pi]?|LQ|HQ)\s*[\)\]]*\s*`)
+// reQualityTag требует ГРАНИЦУ слова вокруг тега: старый паттерн с
+// необязательными обёртками матчил «360» ВНУТРИ «360°», превращая канал в «°».
+// 576p/288p и прочие «нестандартные» высоты встречаются у региональных каналов
+// не реже 720p — без них в отображаемом имени оставался хвост «(576p)».
+var reQualityTag = regexp.MustCompile(`(?i)(^|\s)[\(\[]?(4K|UHD|2160[pi]?|FHD|1080[pi]?|HD|720[pi]?|SD|576[pi]?|480[pi]?|360[pi]?|288[pi]?|240[pi]?|144[pi]?|LQ|HQ)[\)\]]?(\s|$)`)
 
 func cleanChannelName(name string) string {
-	clean := reQualityTag.ReplaceAllString(name, " ")
-	return strings.TrimSpace(clean)
+	// [Not 24/7] / [Geo-blocked] у iptv-org-списков — статус, не имя
+	clean := bracketTagRe.ReplaceAllString(name, " ")
+	// дважды: смежные теги («HD (720p)») — вторая проходка после схлопывания
+	clean = reQualityTag.ReplaceAllString(clean, " ")
+	clean = reQualityTag.ReplaceAllString(clean, " ")
+	return strings.Join(strings.Fields(clean), " ")
 }
 
 func detectQuality(name string) string {
@@ -284,8 +299,13 @@ func detectQuality(name string) string {
 	return ""
 }
 
-// channelID generates a deterministic ID for a channel.
-func channelID(url, name string) string {
-	h := md5.Sum([]byte(url + "|" + name))
+// channelID generates a deterministic ID for a channel — СТАБИЛЬНЫЙ при
+// ротации токенов в URL. Раньше считался от url|name: Xtream-панели меняют
+// токен в URL при каждом перечитывании плейлиста, все ID «уезжали», и
+// избранное/недавние/zap клиентов били в несуществующие каналы (404). Теперь
+// ключ — идентичность канала (tvg-id, имя, группа) плюс порядковый номер
+// дубликата, чтобы зеркала с одинаковым именем остались разными каналами.
+func channelID(identity string, occurrence int) string {
+	h := md5.Sum([]byte(identity + "|" + strconv.Itoa(occurrence)))
 	return hex.EncodeToString(h[:8]) // 16-char hex
 }

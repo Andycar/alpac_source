@@ -433,6 +433,23 @@ func kitDeleteBindHandler(store *kit.Store, cfg config.Config) http.HandlerFunc 
 	}
 }
 
+// balancerAccess отвечает на два вопроса про один балансер: пустят ли к нему
+// ГРУППУ вызывающего и, если нет, откроет ли его премиум.
+//
+// Список балансеров в мини-аппе не фильтровался по группе, хотя поиск
+// (lite_events) фильтрует: пользователь на «Start» видел Rezka и KinoPub,
+// включал их и не понимал, почему источник молчит. Разделение на «нельзя мне,
+// но можно в премиуме» и «нельзя никому» нужно клиенту, чтобы первое подписать
+// «доступно в Премиуме», а второе не показывать вовсе — про него нечего сказать.
+//
+// Группы нет (сторонний вызов без токена) — считаем, что можно всё: молча
+// спрятать источники хуже, чем показать лишние.
+func balancerAccess(userGroup, premiumGroup *tgauth.UserGroup, name string) (allowed, premiumOnly bool) {
+	allowed = userGroup == nil || userGroup.BalancerAllowed(name)
+	premiumOnly = !allowed && premiumGroup != nil && premiumGroup.BalancerAllowed(name)
+	return allowed, premiumOnly
+}
+
 // kitBalancersHandler returns the grouped list of all known balancers with global enable status.
 // GET /api/kit/balancers
 func kitBalancersHandler(store *kit.Store, cfg config.Config) http.HandlerFunc {
@@ -460,6 +477,26 @@ func kitBalancersHandler(store *kit.Store, cfg config.Config) http.HandlerFunc {
 			Quality       string `json:"quality,omitempty"`
 			GlobalEnabled bool   `json:"globalEnabled"`
 			UserBound     bool   `json:"userBound,omitempty"`
+			// Allowed — пускает ли ГРУППА пользователя к этому балансеру. Список
+			// балансеров тут не фильтровался по группе, хотя поиск (lite_events)
+			// фильтрует: пользователь на «Start» видел Rezka и KinoPub, включал их
+			// и не понимал, почему источник молчит.
+			Allowed bool `json:"allowed"`
+			// PremiumOnly — мне нельзя, а в премиум-группе можно. Именно этот случай
+			// стоит подписать «Premium»: он говорит, что делать. Если балансер
+			// закрыт вообще всем, подписывать нечем — он просто недоступен.
+			PremiumOnly bool `json:"premiumOnly,omitempty"`
+		}
+
+		// Группа вызывающего и премиум-группа: по ним считаются allowed/premiumOnly.
+		userGroup := resolveUserGroupForKit(r, tgID)
+		var premiumGroup *tgauth.UserGroup
+		if groupStoreRef != nil {
+			if pid := currentPremiumGroupID(); pid != "" {
+				if g, ok := groupStoreRef.Get(pid); ok {
+					premiumGroup = &g
+				}
+			}
 		}
 
 		groups := make([]groupInfo, 0, len(balancerGroupOrder))
@@ -501,13 +538,17 @@ func kitBalancersHandler(store *kit.Store, cfg config.Config) http.HandlerFunc {
 				}
 			}
 
+			allowed, premiumOnly := balancerAccess(userGroup, premiumGroup, name)
+
 			balancers = append(balancers, balancerInfo{
 				Key:           key,
-				Name:          name,
+				Name:          BalancerDisplayName(name),
 				Group:         group,
 				Quality:       quality,
 				GlobalEnabled: globalEnabled,
 				UserBound:     userBound,
+				Allowed:       allowed,
+				PremiumOnly:   premiumOnly,
 			})
 		}
 

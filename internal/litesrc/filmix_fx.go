@@ -262,8 +262,22 @@ func (f *filmixChecker) fxVerifyAlive(ctx context.Context, hash, access string) 
 		f.fxMu.Unlock()
 		return
 	case resp.StatusCode >= 500, resp.StatusCode == http.StatusTooManyRequests:
-		return // временная беда апстрима, не отказ авторизации
+		// Сессию НЕ хороним — это беда апстрима, а не отказ авторизации. Но и молчать
+		// нельзя: раньше здесь стоял голый return, и лимит со стороны филмикса был для
+		// нас невидим — источник «падал», а в логах не было ни строки, и разговор
+		// упирался в догадки. Считаем и пишем.
+		f.fxMu.Lock()
+		f.fxUpstreamBusy++
+		n := f.fxUpstreamBusy
+		f.fxMu.Unlock()
+		log.Warn().Int("status", resp.StatusCode).Int("подряд", n).
+			Msg("filmix: апстрим ограничивает запросы (429/5xx)")
+		return
 	}
+	// Дошли сюда — апстрим ответил осмысленно, серия ограничений кончилась.
+	f.fxMu.Lock()
+	f.fxUpstreamBusy = 0
+	f.fxMu.Unlock()
 
 	// Явный отказ (401/403 или 200 без профиля). Даже ему верим не с первого раза: одиночный сбой
 	// не должен стоить слота устройства.
@@ -714,7 +728,7 @@ func (f *filmixChecker) writeFXMovie(
 			progOK = true
 		} else {
 			for i := range streams {
-				streams[i]["url"] = streamProxyURL(req, streams[i]["url"], "filmix", links)
+				streams[i]["url"] = streamProxyURLWithHeaders(req, streams[i]["url"], "filmix", links, filmixStreamHeaders())
 			}
 		}
 
@@ -954,7 +968,7 @@ func (f *filmixChecker) writeFXSerial(
 			progOK = true
 		} else {
 			for i := range streams {
-				streams[i]["url"] = streamProxyURL(req, streams[i]["url"], "filmix", links)
+				streams[i]["url"] = streamProxyURLWithHeaders(req, streams[i]["url"], "filmix", links, filmixStreamHeaders())
 			}
 		}
 

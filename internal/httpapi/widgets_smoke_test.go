@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"io"
+	"os"
 	"strings"
 	"testing"
 )
@@ -38,9 +39,23 @@ func TestBuildSamsungWGTSmoke(t *testing.T) {
 			}
 		}
 	}
-	for _, want := range []string{"config.xml", "index.html", "icon.png", "logo_appname_fg.png"} {
+	// Шаблон — наш лаунчер + Tizen-конфиг ALPAC (пересобран 2026-09-10 из web/packaging).
+	// Раньше здесь ждали logo_appname_fg.png от лампаковского плейсхолдера, и тест
+	// молчаливо охранял устаревший виджет.
+	for _, want := range []string{"config.xml", "index.html", "icon.png"} {
 		if !found[want] {
 			t.Errorf("missing from wgt: %s", want)
+		}
+	}
+	for _, f := range zr.File {
+		if f.Name != "config.xml" {
+			continue
+		}
+		rc, _ := f.Open()
+		b, _ := io.ReadAll(rc)
+		rc.Close()
+		if !strings.Contains(string(b), `application id="ALPACtv001.ALPAC"`) {
+			t.Errorf("config.xml не наш (нет ALPACtv001.ALPAC) — шаблон откатился к плейсхолдеру?")
 		}
 	}
 }
@@ -89,7 +104,19 @@ func TestBuildWebOSIPKSmoke(t *testing.T) {
 		t.Fatalf("gzip: %v", err)
 	}
 	tr := tar.NewReader(gz)
-	wantPath := "./usr/palm/applications/com.lampac.app/index.html"
+	// id приложения берём из самого шаблона: он менялся (com.lampac.app → cc.alcopa.tv),
+	// и зашитый путь ломал тест при каждом обновлении оболочки.
+	appinfo, err := os.ReadFile(src + "/appinfo.json")
+	if err != nil {
+		t.Fatalf("appinfo.json: %v", err)
+	}
+	var ai struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(appinfo, &ai); err != nil || ai.ID == "" {
+		t.Fatalf("appinfo.json без id: %v", err)
+	}
+	wantPath := "./usr/palm/applications/" + ai.ID + "/index.html"
 	var sawIndex bool
 	for {
 		h, err := tr.Next()

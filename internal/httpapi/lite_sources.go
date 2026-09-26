@@ -1,6 +1,8 @@
 package httpapi
 
 import (
+	"lampac-go/internal/cluster"
+	"lampac-go/internal/proxyapi"
 	"net/http"
 	"strings"
 
@@ -69,6 +71,9 @@ func liteSourceHandler(cfg config.Config, proxyLinks *proxylink.Manager, dynRout
 	lift := liftC.Handle(cfg, "lift", proxyLinks)
 	rutubemovie := litesrc.NewRutubeMovieChecker(cfg).Handle(cfg, proxyLinks)
 	anwap := litesrc.NewAnwapChecker(cfg).Handle(cfg, proxyLinks)
+	rudub := litesrc.NewRudubChecker(cfg).Handle(cfg, proxyLinks)
+	anidub := litesrc.NewAnidubChecker(cfg).Handle(cfg, proxyLinks)
+	smotrim := litesrc.NewSmotrimChecker(cfg).Handle(cfg, proxyLinks)
 	vkmovie := litesrc.NewVKMovieChecker(cfg).Handle(cfg, proxyLinks)
 	hdvb := litesrc.NewHDVBChecker(cfg).Handle(cfg, proxyLinks)
 	plvideo := litesrc.NewPlvideoChecker(cfg).Handle(cfg)
@@ -112,6 +117,7 @@ func liteSourceHandler(cfg config.Config, proxyLinks *proxylink.Manager, dynRout
 	gencit := litesrc.NewGencitChecker(cfg).Handle(cfg, proxyLinks)
 	femd := litesrc.NewFemdChecker(cfg).Handle(cfg, proxyLinks)
 	kinobadi := litesrc.NewKinobadiChecker(cfg).Handle(cfg, proxyLinks)
+	zagonka := litesrc.NewZagonkaChecker(cfg).Handle(cfg, proxyLinks)
 	vidsrc := litesrc.NewEngBaseChecker("vidsrc").Handle(cfg)
 	playembed := litesrc.NewEngBaseChecker("playembed").Handle(cfg)
 	autoembed := litesrc.NewEngBaseChecker("autoembed").Handle(cfg)
@@ -136,9 +142,12 @@ func liteSourceHandler(cfg config.Config, proxyLinks *proxylink.Manager, dynRout
 	// Process singleton — SakhTV's account is single-session upstream, so a
 	// per-rebuild checker would log in again and evict whoever is watching.
 	sakhtv := litesrc.SharedSakhTVChecker(cfg).Handle(cfg, proxyLinks)
+	scts := litesrc.SharedSCTSChecker(cfg).Handle(cfg, proxyLinks)
+	kbteam := litesrc.NewKBTeamChecker(cfg).Handle(cfg, proxyLinks)
+	krasview := litesrc.NewKrasviewChecker(cfg).Handle(cfg, proxyLinks)
 	ytChecker := litesrc.SharedYoutubeChecker(cfg) // process singleton — survives capiLiteSource rebuilds (keeps live mux state)
 	litesrc.SetGlobalYTChecker(ytChecker)          // expose for admin stats
-	youtube := ytChecker.Handle(cfg, proxyLinks)
+	youtube := youtubeWithNodeFallback(ytChecker.Handle(cfg, proxyLinks), cfg.YouTube.NodeFallback)
 	getsTVBind := litesrc.GetsTVBindHandler(cfg)
 
 	// Exact-match route table: O(1) lookup instead of 74 sequential if-statements.
@@ -204,6 +213,15 @@ func liteSourceHandler(cfg config.Config, proxyLinks *proxylink.Manager, dynRout
 		"anwap":                 anwap,
 		"anwap/play":            anwap,
 		"anwap/serial":          anwap,
+		"rudub":                 rudub,
+		"rudub/play":            rudub,
+		"rudub/serial":          rudub,
+		"anidub":                anidub,
+		"anidub/play":           anidub,
+		"anidub/serial":         anidub,
+		"smotrim":               smotrim,
+		"smotrim/play":          smotrim,
+		"smotrim/serial":        smotrim,
 		"vkmovie":               vkmovie,
 		"hdvb":                  hdvb,
 		"hdvb-search":           hdvb,
@@ -252,90 +270,96 @@ func liteSourceHandler(cfg config.Config, proxyLinks *proxylink.Manager, dynRout
 		"zetflixdb/manifest":      zetflixdb,
 		"zetflixdb/manifest.m3u8": zetflixdb,
 		"zetflixdb/manifest.mp4":  zetflixdb,
-		"uakino":                 uakino,
+		"uakino":                  uakino,
 		// Internal embed resolvers (upstream Tortuga/HdvbUA): reachable by URL,
 		// but deliberately NOT in localCorePlugins — they are not sources.
 		"tortuga":                uakino,
 		"hdvbua":                 uakino,
-		"cdnmovies":               cdnmovies,
-		"cdnvideohub":             cdnvideohub,
-		"cdnvideohub/video":       cdnvideohub,
-		"cdnvideohub/video.m3u8":  cdnvideohub,
-		"kubikvkube":              kubikvkube,
-		"kubikvkube/video":        kubikvkube,
-		"kubikvkube/video.m3u8":   kubikvkube,
-		"vibix":                   vibix,
-		"vibix/stream":            vibix,
-		"vibix/stream.m3u8":       vibix,
-		"turbo":                   turbo,
-		"zona":                    zona,
-		"zona-mobilink":           zona,
-		"zona-hdvb":               zona,
-		"zona-filmix":             zona,
-		"zona-takedwn":            zona,
-		"iframevideo":             iframevideo,
-		"iframevideo/video":       iframevideo,
-		"iframevideo/video.m3u8":  iframevideo,
-		"getstv":                  getstv,
-		"getstv/video.m3u8":       getstv,
-		"getstv-search":           getstv,
-		"mirage":                  mirage,
-		"mirage/video":            mirage,
-		"mirage/video.m3u8":       mirage,
-		"mirage-search":           mirage,
-		"mirage/stream":           mirage,
-		"mirage/stream.m3u8":      mirage,
-		"mirage/edge_hash":        mirage,
-		"aladdin":                 aladdin,
-		"aladdin/video":           aladdin,
-		"aladdin/video.m3u8":      aladdin,
-		"aladdin-search":          aladdin,
-		"aladdin/stream":          aladdin,
-		"aladdin/stream.m3u8":     aladdin,
-		"bamboo":                  bamboo,
-		"uafilm":                  uafilm,
-		"uafilm/video":            uafilm,
-		"uafilm/video.m3u8":       uafilm,
-		"unimay":                  unimay,
-		"starlight":               starlight,
-		"starlight/play":          starlight,
-		"klonfun":                 klonfun,
-		"uaflix":                  uaflix,
-		"animeon":                 animeon,
-		"animeon/play":            animeon,
-		"mikai":                   mikai,
-		"mikai/play":              mikai,
-		"leproduction":            leproduction,
-		"moonanime":               moonanime,
-		"moonanime/video":         moonanime,
-		"moonanime/video.m3u8":    moonanime,
-		"iptvonline":              iptvonline,
-		"vokino":                  vokino,
-		"vokinotk":                vokino,
-		"gencit":                  gencit,
-		"gencit/video":            gencit,
-		"femd":                    femd,
-		"kinobadi":                kinobadi,
-		"vidsrc":                  vidsrc,
-		"playembed":               playembed,
-		"videasy":                 videasy,
-		"autoembed":               autoembed,
-		"movpi":                   movpi,
-		"vidlink":                 vidlink,
-		"vidlink/video":           vidlink,
-		"vidlink/video.m3u8":      vidlink,
-		"videasy/video":           videasy,
-		"videasy/video.m3u8":      videasy,
-		"hydraflix":               hydraflix,
-		"hydraflix/video":         hydraflix,
-		"hydraflix/video.m3u8":    hydraflix,
-		"smashystream":            smashystream,
-		"rgshows":                 rgshows,
-		"twoembed":                twoembed,
-		"twoembed/video":          twoembed,
-		"twoembed/video.m3u8":     twoembed,
-		"sakhtv":                  sakhtv,
-		"youtube":                 youtube,
+		"cdnmovies":              cdnmovies,
+		"cdnvideohub":            cdnvideohub,
+		"cdnvideohub/video":      cdnvideohub,
+		"cdnvideohub/video.m3u8": cdnvideohub,
+		"kubikvkube":             kubikvkube,
+		"kubikvkube/video":       kubikvkube,
+		"kubikvkube/video.m3u8":  kubikvkube,
+		"vibix":                  vibix,
+		"vibix/stream":           vibix,
+		"vibix/stream.m3u8":      vibix,
+		"turbo":                  turbo,
+		"zona":                   zona,
+		"zona-mobilink":          zona,
+		"zona-hdvb":              zona,
+		"zona-filmix":            zona,
+		"zona-takedwn":           zona,
+		"iframevideo":            iframevideo,
+		"iframevideo/video":      iframevideo,
+		"iframevideo/video.m3u8": iframevideo,
+		"getstv":                 getstv,
+		"getstv/video.m3u8":      getstv,
+		"getstv-search":          getstv,
+		"mirage":                 mirage,
+		"mirage/video":           mirage,
+		"mirage/video.m3u8":      mirage,
+		"mirage-search":          mirage,
+		"mirage/stream":          mirage,
+		"mirage/stream.m3u8":     mirage,
+		"mirage/edge_hash":       mirage,
+		"aladdin":                aladdin,
+		"aladdin/video":          aladdin,
+		"aladdin/video.m3u8":     aladdin,
+		"aladdin-search":         aladdin,
+		"aladdin/stream":         aladdin,
+		"aladdin/stream.m3u8":    aladdin,
+		"bamboo":                 bamboo,
+		"uafilm":                 uafilm,
+		"uafilm/video":           uafilm,
+		"uafilm/video.m3u8":      uafilm,
+		"unimay":                 unimay,
+		"starlight":              starlight,
+		"starlight/play":         starlight,
+		"klonfun":                klonfun,
+		"uaflix":                 uaflix,
+		"animeon":                animeon,
+		"animeon/play":           animeon,
+		"mikai":                  mikai,
+		"mikai/play":             mikai,
+		"leproduction":           leproduction,
+		"moonanime":              moonanime,
+		"moonanime/video":        moonanime,
+		"moonanime/video.m3u8":   moonanime,
+		"iptvonline":             iptvonline,
+		"vokino":                 vokino,
+		"vokinotk":               vokino,
+		"gencit":                 gencit,
+		"gencit/video":           gencit,
+		"femd":                   femd,
+		"kinobadi":               kinobadi,
+		"zagonka":                zagonka,
+		"zagonka/serial":         zagonka,
+		"zagonka/play":           zagonka,
+		"vidsrc":                 vidsrc,
+		"playembed":              playembed,
+		"videasy":                videasy,
+		"autoembed":              autoembed,
+		"movpi":                  movpi,
+		"vidlink":                vidlink,
+		"vidlink/video":          vidlink,
+		"vidlink/video.m3u8":     vidlink,
+		"videasy/video":          videasy,
+		"videasy/video.m3u8":     videasy,
+		"hydraflix":              hydraflix,
+		"hydraflix/video":        hydraflix,
+		"hydraflix/video.m3u8":   hydraflix,
+		"smashystream":           smashystream,
+		"rgshows":                rgshows,
+		"twoembed":               twoembed,
+		"twoembed/video":         twoembed,
+		"twoembed/video.m3u8":    twoembed,
+		"sakhtv":                 sakhtv,
+		"scts":                   scts,
+		"kbteam":                 kbteam,
+		"krasview":               krasview,
+		"youtube":                youtube,
 		// Special routes
 		"getstv/bind":     getsTVBind,
 		"iptvonline/bind": iptvonline,
@@ -354,9 +378,13 @@ func liteSourceHandler(cfg config.Config, proxyLinks *proxylink.Manager, dynRout
 	ytDashH := http.HandlerFunc(ytChecker.HandleDashMPD)
 	ytImgH := http.HandlerFunc(litesrc.YtImgProxyHandler)
 	ytMuxH := http.HandlerFunc(ytChecker.HandleMux)
-	ytMuxMasterH := http.HandlerFunc(ytChecker.HandleMuxMaster)
+	// С менеджером ссылок: он нужен, чтобы пересобрать мастер после перезапуска.
+	ytMuxMasterH := ytChecker.MuxMasterHandler(proxyLinks)
 	trailerH := litesrc.TrailerHandler(ytChecker, proxyLinks)
 	routes["trailer"] = trailerH
+	// Поиск трейлера для тайтлов без видео в TMDB — для веба, который ходит в
+	// TMDB мимо нашего прокси (Android/Lampa получают то же через сам прокси).
+	routes["trailer/find"] = litesrc.TrailerFindHandler(litesrc.SharedTrailerFinder(cfg))
 	routes["youtube/vot"] = litesrc.YtVotHandler(cfg, proxyLinks)
 	routes["youtube/feed"] = ytFeedH
 	routes["youtube/dash.mpd"] = ytDashH
@@ -430,6 +458,14 @@ func liteSourceHandler(cfg config.Config, proxyLinks *proxylink.Manager, dynRout
 			return
 		}
 
+		// Отключённые зрителем ноды — в запрос до развилки: ниже он может уехать
+		// на ноду, и та соберёт ссылку уже сама, своего хранилища настроек не имея.
+		stampEdgeSkip(r)
+		// Закреплённая нода — туда же и по той же причине. Порядок важен: запрет
+		// проставляется первым, и если человек закрепил ноду, которую же и отключил,
+		// хранилище такого противоречия просто не хранит (см. edgeprefs).
+		stampEdgePin(r)
+
 		// Cluster forwarding: for non-checksearch requests, primary may forward
 		// to a backend node with fewer active connections.
 		//
@@ -442,8 +478,15 @@ func liteSourceHandler(cfg config.Config, proxyLinks *proxylink.Manager, dynRout
 		cp, cf := liveClusterPool(), liveClusterFwd()
 		if !isCS && !liteMainNodeOnly(raw) && cp != nil && cf != nil {
 			// PickFor honours per-balancer routing rules first, then strategy.
-			node, localForced := cp.PickFor(raw)
+			// Запрет зрителя учитывается и здесь: у источников с правилом «edge» ссылку
+			// отдаёт тот, кто добыл, поэтому выбор добытчика — это и выбор отдающего.
+			node, localForced := cp.PickForSkipKey(raw, proxyapi.EdgeHintFrom(r), cluster.StickyKey(r.URL.Query()), proxyapi.EdgeSkipSet(r))
 			if node != nil {
+				// Источник с добором: пустой ответ выбранной ноды — не окончательный.
+				if h, ok := routes[raw]; ok && liteFailoverBalancer(raw) {
+					serveLiteWithFailover(w, r, raw, h, cp, cf, node)
+					return
+				}
 				if cf.Forward(w, r, node) {
 					return
 				}
@@ -520,6 +563,17 @@ func liteSourceHandler(cfg config.Config, proxyLinks *proxylink.Manager, dynRout
 
 		// O(1) exact-match lookup for built-in Go balancers.
 		if h, ok := routes[raw]; ok {
+			if liteFailoverBalancer(raw) {
+				// checksearch у AhueRezka смотрит на каталог, а не на здоровье
+				// потоков main: поток при нажатии доберёт нода.
+				if strings.HasPrefix(raw, "ahuerezka") {
+					litesrc.SetAhueRezkaFailover(cp != nil && cf != nil)
+				}
+				if !isCS && cp != nil && cf != nil {
+					serveLiteWithFailover(w, r, raw, h, cp, cf, nil)
+					return
+				}
+			}
 			h.ServeHTTP(w, r)
 			return
 		}
@@ -571,6 +625,24 @@ func liteMainNodeOnly(raw string) bool {
 	// so the local handler never ran). Keep them on the receiving node.
 	case "alloha", "mirage", "aladdin":
 		return true
+	}
+	return false
+}
+
+// liteSkipNodeFanout — не спрашивать ноды «есть ли у тебя этот источник» при
+// проверке карточки. Бессмысленно для всего, что нода обслуживать не будет:
+// закреплённого за main и источников с явным правилом «local»/«nodes». Для
+// AhueRezka опрос бил вдвойне — каждый показ карточки на main спрашивал воркер
+// ещё с девяти адресов, и воркер за объём банил их (прод 21.09.2026).
+func liteSkipNodeFanout(balancer string) bool {
+	if liteMainNodeOnly(balancer) {
+		return true
+	}
+	if cp := liveClusterPool(); cp != nil {
+		switch cp.RuleTarget(balancer) {
+		case "local", "nodes":
+			return true
+		}
 	}
 	return false
 }

@@ -23,6 +23,10 @@ func RegisterRoutes(router chi.Router, cfg config.Config, deps Deps) *Transcodin
 	router.Get("/ffprobe", ffprobeHandler(cfg))
 	router.Get("/transcoding.js", genericPluginJSHandler("transcoding.js", "", cfg))
 	router.Get("/transcoding/js/{token}", genericPluginJSHandler("transcoding.js", "", cfg))
+	// TS-balancer pick oracle for a remote transcode box (HMAC-signed, see
+	// transcoding_tspick.go). Lives outside the Enable gate: the MAIN server
+	// answers it even when it only mints box URLs and never transcodes itself.
+	router.Get("/transcoding/ts-pick", transcodingTSPickHandler(cfg))
 
 	if !cfg.Transcoding.Enable {
 		return nil

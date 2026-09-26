@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	stdjson "encoding/json"
 	"fmt"
+	"html"
 	"io"
 	"lampac-go/internal/config"
 	"lampac-go/internal/httpclient"
@@ -41,9 +42,10 @@ var (
 )
 
 type vibixChecker struct {
-	client *http.Client // for vibix.org publisher API
-	host   string
-	token  string
+	client     *http.Client // for vibix.org publisher API
+	host       string
+	token      string
+	iframeMode bool // hand iframe-capable clients the vibix player embed page (revenue+stats)
 }
 
 type vibixVideo struct {
@@ -84,9 +86,10 @@ func NewVibixChecker(cfg config.Config) *vibixChecker {
 	// vibix through a residential SOCKS5 would break the sign (IP mismatch).
 
 	return &vibixChecker{
-		client: httpclient.NewForBalancer("vibix", 12*time.Second),
-		host:   host,
-		token:  strings.TrimSpace(cfg.Online.Vibix.Token),
+		client:     httpclient.NewForBalancer("vibix", 12*time.Second),
+		host:       host,
+		token:      strings.TrimSpace(cfg.Online.Vibix.Token),
+		iframeMode: cfg.Online.Vibix.IframeMode,
 	}
 }
 
@@ -243,9 +246,10 @@ func (v *vibixChecker) apiVideoStatus(req *http.Request, imdbID string, kinopois
 // ---------------------------------------------------------------------------
 
 type vibixAPIMeta struct {
-	Type    string
-	Quality string
-	Voices  []string
+	Type      string
+	Quality   string
+	Voices    []string
+	EmbedCode string // <ins> attributes carrying our publisher id (direct-iframe playback)
 }
 
 // apiMeta fetches a title's type, quality and voice list from the publisher API
@@ -289,6 +293,7 @@ func (v *vibixChecker) apiMeta(req *http.Request, imdbID string, kinopoiskID int
 	var raw struct {
 		Type       string `json:"type"`
 		Quality    string `json:"quality"`
+		EmbedCode  string `json:"embed_code"`
 		Voiceovers []struct {
 			Name string `json:"name"`
 		} `json:"voiceovers"`
@@ -309,7 +314,32 @@ func (v *vibixChecker) apiMeta(req *http.Request, imdbID string, kinopoiskID int
 		seen[strings.ToLower(name)] = struct{}{}
 		voices = append(voices, name)
 	}
-	return vibixAPIMeta{Type: strings.ToLower(strings.TrimSpace(raw.Type)), Quality: raw.Quality, Voices: voices}, true
+	return vibixAPIMeta{
+		Type:      strings.ToLower(strings.TrimSpace(raw.Type)),
+		Quality:   raw.Quality,
+		Voices:    voices,
+		EmbedCode: strings.TrimSpace(raw.EmbedCode),
+	}, true
+}
+
+// vibixCardIsSerial mirrors capi's own card-kind test (capiCardIsSerial in
+// internal/httpapi/capi.go) so this source never answers in a shape capi will
+// throw away.
+//
+// vibix classifies titles itself, and it disagrees with the card often enough to
+// matter: measured on prod 2026-09-01, capi dropped 66 vibix answers in two
+// hours, every one of them "resp_type=movie card_serial=True" — the publisher
+// API called the title a film while the client had opened a series card. The
+// answer was well-formed and the stream would have played; capi discarded it on
+// the type guard, vibix vanished from the list, and the player moved on to the
+// next source. Trusting the CARD here, not the upstream's own idea of the
+// title, is what keeps the source in the running.
+func vibixCardIsSerial(q url.Values) bool {
+	switch strings.ToLower(strings.TrimSpace(q.Get("serial"))) {
+	case "1", "true":
+		return true
+	}
+	return strings.TrimSpace(q.Get("s")) != "" || strings.TrimSpace(q.Get("e")) != ""
 }
 
 // writeCapiMovie emits the deferred /capi movie response (one voice per entry,
@@ -317,6 +347,10 @@ func (v *vibixChecker) apiMeta(req *http.Request, imdbID string, kinopoiskID int
 // is a serial or the API had no usable metadata, so index() falls back to the
 // browser resolve.
 func (v *vibixChecker) writeCapiMovie(w http.ResponseWriter, req *http.Request, imdbID string, kinopoiskID int64, title, originalTitle string) bool {
+	// The CARD decides, not the upstream's classification — see vibixCardIsSerial.
+	if vibixCardIsSerial(req.URL.Query()) {
+		return false
+	}
 	meta, ok := v.apiMeta(req, imdbID, kinopoiskID)
 	if !ok || meta.Type == "serial" || len(meta.Voices) == 0 {
 		return false
@@ -345,6 +379,72 @@ func (v *vibixChecker) writeCapiMovie(w http.ResponseWriter, req *http.Request, 
 	return true
 }
 
+// ---------------------------------------------------------------------------
+// Direct-iframe playback: serve the vibix player embed page to the client so
+// vibix's player runs client-side under our publisher id (ads + view count →
+// revenue + /publisher/statistics). Gated behind config iframe_mode.
+// ---------------------------------------------------------------------------
+
+// vibixIframeScheme marks a capi quality URL as an embed-me player page rather
+// than an HLS stream (same contract as alloha): the marker travels ON the url so
+// it survives capi's flat {label→url} merge. Clients strip the scheme (→ https),
+// open the page in a webview/iframe overlay, and never feed it to Shaka/native.
+const vibixIframeScheme = "iframe://"
+
+// vibixCapiIframeURL wraps an embed page URL in the iframe:// scheme for capi.
+func vibixCapiIframeURL(embedURL string) string {
+	return vibixIframeScheme + strings.TrimPrefix(strings.TrimPrefix(embedURL, "https://"), "http://")
+}
+
+// writeIframeMovie emits the direct-iframe response for a MOVIE: it reads the
+// title's embed_code (the <ins> attributes carrying our publisher id) from the
+// fast publisher API and hands back a /vibix_embed/ page URL the client embeds.
+// Returns false (caller falls back to server-resolve) when there's no token, the
+// title is a serial, or the API had no usable embed_code.
+func (v *vibixChecker) writeIframeMovie(w http.ResponseWriter, req *http.Request, capi bool, imdbID string, kinopoiskID int64, title, originalTitle string) bool {
+	// The CARD decides, not the upstream's classification — see vibixCardIsSerial.
+	if vibixCardIsSerial(req.URL.Query()) {
+		return false
+	}
+	meta, ok := v.apiMeta(req, imdbID, kinopoiskID)
+	if !ok || meta.Type == "serial" || vibixSanitizeEmbedCode(meta.EmbedCode) == "" {
+		return false
+	}
+
+	name := getsTVJoinName(title, originalTitle)
+	if strings.TrimSpace(name) == "" {
+		name = "Vibix"
+	}
+	embedURL := vibixEmbedURL(meta.EmbedCode, name, req)
+
+	if capi {
+		// No `title` on the row — capi's wrong-film guard skips title-less rows and
+		// the voice name comes from name/translate.
+		writeJSON(w, http.StatusOK, map[string]any{
+			"type": "movie",
+			"data": []map[string]any{{
+				"name":      "Vibix",
+				"translate": "Vibix",
+				"quality":   map[string]string{"auto": vibixCapiIframeURL(embedURL)},
+			}},
+		})
+		return true
+	}
+
+	// Lampa (rjson): method:"iframe" tells the player to embed the page.
+	writeJSON(w, http.StatusOK, map[string]any{
+		"type": "movie",
+		"data": []map[string]any{{
+			"method": "iframe",
+			"url":    embedURL,
+			"iframe": embedURL,
+			"name":   name,
+			"title":  name,
+		}},
+	})
+	return true
+}
+
 // vibixQualityLabels maps the publisher API `quality` string to descending
 // quality labels to advertise. The exact per-voice set is only known after the
 // browser resolve; the stream endpoint picks the closest available.
@@ -370,6 +470,12 @@ func vibixQualityLabels(quality string) []string {
 // one voice. Every label points at the same resolve endpoint; ?q= carries the
 // picked label so the stream handler returns that quality (or the closest one).
 func vibixDeferredQuality(host, imdbID string, kinopoiskID int64, voice string, labels []string) map[string]string {
+	return vibixDeferredQualityAt(host, imdbID, kinopoiskID, voice, labels, 0, 0)
+}
+
+// vibixDeferredQualityAt is the same deferred playback URL with an optional
+// season/episode, so a serial row points at the episode the caller asked for.
+func vibixDeferredQualityAt(host, imdbID string, kinopoiskID int64, voice string, labels []string, s, e int) map[string]string {
 	base := host + "/lite/vibix/stream.m3u8?"
 	if kinopoiskID > 0 {
 		base += "kinopoisk_id=" + strconv.FormatInt(kinopoiskID, 10)
@@ -377,11 +483,61 @@ func vibixDeferredQuality(host, imdbID string, kinopoiskID int64, voice string, 
 		base += "imdb_id=" + url.QueryEscape(imdbID)
 	}
 	base += "&voice=" + url.QueryEscape(voice)
+	if s > 0 && e > 0 {
+		base += "&s=" + strconv.Itoa(s) + "&e=" + strconv.Itoa(e)
+	}
 	byq := make(map[string]string, len(labels))
 	for _, l := range labels {
 		byq[l] = base + "&q=" + url.QueryEscape(l)
 	}
 	return byq
+}
+
+// writeCapiSerial answers a /capi drill for a SERIAL episode straight from the
+// publisher API — voices and quality — with the browser resolve deferred to
+// playback (/lite/vibix/stream.m3u8), exactly as writeCapiMovie does for films.
+//
+// Why: serials are 57% of the traffic here and used to have no API path at all,
+// so every drill — including the calendar's new-translation cron, which only
+// wants voice NAMES — drove a headless-browser resolve. Measured 2026-09-01:
+// 415 successful resolves and 244 failures a day, 46.5 minutes of browser time
+// in the failures alone.
+//
+// Needs a concrete season+episode (same contract as alloha's serial path): the
+// row carries s/e so capi's voice merge keeps episodes apart.
+func (v *vibixChecker) writeCapiSerial(w http.ResponseWriter, req *http.Request, imdbID string, kinopoiskID int64, title, originalTitle string, s, e int) bool {
+	if s <= 0 || e <= 0 {
+		return false
+	}
+	meta, ok := v.apiMeta(req, imdbID, kinopoiskID)
+	if !ok || meta.Type != "serial" || len(meta.Voices) == 0 {
+		return false
+	}
+	host := hostFromRequest(req)
+	labels := vibixQualityLabels(meta.Quality)
+	baseTitle := getsTVJoinName(title, originalTitle)
+	if strings.TrimSpace(baseTitle) == "" {
+		baseTitle = "Vibix"
+	}
+	rows := make([]map[string]any, 0, len(meta.Voices))
+	for _, voice := range meta.Voices {
+		byq := vibixDeferredQualityAt(host, imdbID, kinopoiskID, voice, labels, s, e)
+		if len(byq) == 0 {
+			continue
+		}
+		rows = append(rows, map[string]any{
+			"translate": voice,
+			"quality":   byq,
+			"title":     fmt.Sprintf("%s / %d сезон %d серия (%s)", baseTitle, s, e, voice),
+			"s":         s,
+			"e":         e,
+		})
+	}
+	if len(rows) == 0 {
+		return false
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"type": "serial", "data": rows})
+	return true
 }
 
 // stream resolves the coldfilm playlist (browser, cached) and serves the m3u8
@@ -442,11 +598,27 @@ func vibixPickFile(playlist []vibixSeason, voice string, s, e int) string {
 				if num != e {
 					continue
 				}
-				f := strings.TrimSpace(ep.File)
-				if f == "" && len(ep.Folder) > 0 {
-					f = strings.TrimSpace(ep.Folder[0].File)
+				if f := strings.TrimSpace(ep.File); f != "" {
+					return f
 				}
-				return f
+				// An episode may carry a voice folder. Taking Folder[0]
+				// unconditionally (as this did) meant every voice we advertised for a
+				// serial played the SAME track — the caller's choice was silently
+				// dropped. Match the requested voice first, and only fall back to the
+				// first entry when it is absent or unnamed.
+				if voice != "" {
+					for _, vo := range ep.Folder {
+						if strings.EqualFold(strings.TrimSpace(vo.Title), strings.TrimSpace(voice)) {
+							if f := strings.TrimSpace(vo.File); f != "" {
+								return f
+							}
+						}
+					}
+				}
+				if len(ep.Folder) > 0 {
+					return strings.TrimSpace(ep.Folder[0].File)
+				}
+				return ""
 			}
 		}
 		return ""
@@ -491,6 +663,37 @@ func (v *vibixChecker) index(w http.ResponseWriter, req *http.Request, proxyLink
 		s = -1
 	}
 
+	// Direct-iframe (movies only): when iframe_mode is on, hand iframe-capable
+	// clients the vibix player embed page instead of the server-proxied stream, so
+	// vibix's player runs client-side under OUR publisher id — its ads render, the
+	// view is counted and /publisher/statistics + revenue register. capi advertises
+	// the webview capability with iframe=1; Lampa clients consume method:"iframe".
+	// Serials embed the whole title behind vibix's own episode picker (which the
+	// client season UI can't drive), so they stay on the server-resolve path.
+	{
+		capiFlag := capiResolveRequest(req)
+		wantIframe := (capiFlag && parseBoolParam(q.Get("iframe"))) || (!capiFlag && rjson)
+		taken := false
+		if v.iframeMode && wantIframe {
+			taken = v.writeIframeMovie(w, req, capiFlag, imdbID, kinopoiskID, title, originalTitle)
+		}
+		// Why this is logged: the direct-iframe path looks enabled from the config
+		// alone, yet in production it fires for a minority of drills. Measured
+		// 2026-09-01: 76% of capi drills reach vibix with NO iframe param even
+		// though clients set it on 97% of /capi/streams — the calendar's
+		// new-translation cron (calendar_voices.go) builds its own synthetic
+		// request and never carries it. Keep the inputs visible so the next
+		// "iframe mode is on but nothing embeds" question is one grep, not a day.
+		log.Debug().Bool("iframe_mode", v.iframeMode).Bool("capi", capiFlag).
+			Str("iframe_param", q.Get("iframe")).Bool("rjson", rjson).
+			Bool("want_iframe", wantIframe).Bool("taken", taken).
+			Str("imdb", imdbID).Int64("kp", kinopoiskID).
+			Msg("vibix: iframe decision")
+		if taken {
+			return
+		}
+	}
+
 	// /capi aggregation drill: for MOVIES, return the voices + qualities from the
 	// fast publisher API and defer the browser resolve to playback
 	// (/lite/vibix/stream.m3u8). This keeps the drill within capi's soft deadline
@@ -500,6 +703,11 @@ func (v *vibixChecker) index(w http.ResponseWriter, req *http.Request, proxyLink
 	if capiResolveRequest(req) {
 		if v.writeCapiMovie(w, req, imdbID, kinopoiskID, title, originalTitle) {
 			return
+		}
+		if e, eOK := getsTVQueryInt(q.Get("e")); eOK {
+			if v.writeCapiSerial(w, req, imdbID, kinopoiskID, title, originalTitle, s, e) {
+				return
+			}
 		}
 	}
 
@@ -799,8 +1007,25 @@ func vibixOriginFromIframeURL(iframeURL string) string {
 }
 
 // ---------------------------------------------------------------------------
-// vibix iframe embed: serve HTML page with Kinescope player in iframe
+// vibix iframe embed: serve an HTML page hosting vibix's own player.
+//
+// The page carries the rendex SDK + the publisher API's <ins> embed_code (which
+// encodes OUR publisher id). The client loads this page in a webview/iframe; the
+// SDK builds the vibix/Kinescope player, which runs its ads and counts the view
+// against our publisher account — so /publisher/statistics + revenue register.
+// rendex validates the embed's serving domain against the publisher account, so
+// this only monetizes when THIS server's public host is registered and active in
+// the vibix publisher dashboard.
 // ---------------------------------------------------------------------------
+
+// vibixRendexSDK is the rendex loader the publisher <ins> widget needs to build
+// the player (same SDK the coldfilm resolve path drives, here under our id).
+const vibixRendexSDK = "https://graphicslab.io/sdk/v2/rendex-sdk.min.js"
+
+// vibixEmbedAttrRe extracts the known data-* attributes from the publisher API
+// embed_code so we can rebuild a sanitized <ins> tag (never inject the raw API
+// string into HTML).
+var vibixEmbedAttrRe = regexp.MustCompile(`data-(publisher-id|type|id)="([A-Za-z0-9_-]+)"`)
 
 var (
 	vibixEmbedCache      sync.Map // key → *vibixEmbedEntry
@@ -811,9 +1036,28 @@ var (
 )
 
 type vibixEmbedEntry struct {
-	iframeURL string
+	embedCode string // sanitized data-* attributes for the <ins> widget
 	title     string
 	createdAt time.Time
+}
+
+// vibixSanitizeEmbedCode pulls publisher-id / type / id out of the API embed_code
+// and re-emits them in a fixed order (values are restricted to [A-Za-z0-9_-]), so
+// the string is safe to inject into the <ins> tag. Returns "" if the required
+// publisher-id or id is missing.
+func vibixSanitizeEmbedCode(embedCode string) string {
+	found := make(map[string]string, 3)
+	for _, m := range vibixEmbedAttrRe.FindAllStringSubmatch(embedCode, -1) {
+		found[m[1]] = m[2]
+	}
+	if found["publisher-id"] == "" || found["id"] == "" {
+		return ""
+	}
+	typ := found["type"]
+	if typ == "" {
+		typ = "movie"
+	}
+	return fmt.Sprintf(`data-publisher-id="%s" data-type="%s" data-id="%s"`, found["publisher-id"], typ, found["id"])
 }
 
 // vibixStartJanitor periodically sweeps expired entries from both vibix caches.
@@ -842,20 +1086,27 @@ func vibixStartJanitor() {
 	})
 }
 
-// vibixEmbedURL caches the iframe URL and returns a local /vibix_embed/{key} URL.
-func vibixEmbedURL(iframeURL, title string, req *http.Request) string {
+// vibixEmbedURL caches the sanitized embed_code and returns a local
+// /vibix_embed/{key} page URL for the client to embed. Returns "" when the
+// embed_code has no usable publisher/id attributes.
+func vibixEmbedURL(embedCode, title string, req *http.Request) string {
+	sanitized := vibixSanitizeEmbedCode(embedCode)
+	if sanitized == "" {
+		return ""
+	}
 	vibixStartJanitor()
 	key := vibixRandomHex(16)
 	vibixEmbedCache.Store(key, &vibixEmbedEntry{
-		iframeURL: iframeURL,
+		embedCode: sanitized,
 		title:     title,
 		createdAt: time.Now(),
 	})
 	return hostFromRequest(req) + "/vibix_embed/" + key
 }
 
-// VibixEmbedHandler serves a full-screen HTML page with Kinescope iframe player.
-// The user's browser/WebView loads this page, the iframe handles TLS natively.
+// VibixEmbedHandler serves the full-screen vibix player page: the rendex SDK plus
+// the <ins> widget carrying our publisher id. The client's webview loads it and
+// vibix's player runs (and monetizes) client-side.
 func VibixEmbedHandler(w http.ResponseWriter, req *http.Request) {
 	key := strings.TrimPrefix(req.URL.Path, "/vibix_embed/")
 	key = strings.TrimSuffix(key, "/")
@@ -869,9 +1120,14 @@ func VibixEmbedHandler(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	entry := val.(*vibixEmbedEntry)
-	if time.Since(entry.createdAt) > 4*time.Hour {
+	if time.Since(entry.createdAt) > vibixEmbedCacheTTL {
 		vibixEmbedCache.Delete(key)
 		http.Error(w, "expired", http.StatusGone)
+		return
+	}
+	ins := vibixSanitizeEmbedCode(entry.embedCode)
+	if ins == "" {
+		http.Error(w, "bad embed", http.StatusInternalServerError)
 		return
 	}
 
@@ -879,18 +1135,19 @@ func VibixEmbedHandler(w http.ResponseWriter, req *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprintf(w, `<!DOCTYPE html>
-<html><head>
+<html lang="ru"><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
 <title>%s</title>
+<script src="%s"></script>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 html,body{width:100%%;height:100%%;overflow:hidden;background:#000}
-iframe{width:100%%;height:100%%;border:none}
+ins,iframe{display:block;width:100%%;height:100%%;border:none}
 </style>
 </head><body>
-<iframe src="%s" allow="autoplay;fullscreen;encrypted-media" allowfullscreen></iframe>
-</body></html>`, entry.title, entry.iframeURL)
+<ins %s></ins>
+</body></html>`, html.EscapeString(entry.title), vibixRendexSDK, ins)
 }
 
 // ---------------------------------------------------------------------------

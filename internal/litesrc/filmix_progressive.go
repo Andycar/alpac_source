@@ -35,6 +35,15 @@ const (
 	filmixStub720Ad   = 729935706 // 56-минутный рекламный ролик вместо 720p
 )
 
+// filmixNoHashDirRe — разделы CDN, чей HLS-манифест не содержит `?hash=` в сегментах (2026-08-22:
+// UHD_1313 — 940 сегментов, hash ни у одного). Плеер идёт по манифесту буквально и ловит 403.
+//
+// ★Такие рипы отдаём ПРОГРЕССИВОМ, а не через прокси: у прогрессива манифеста нет вовсе, значит
+// нечему терять подпись, и зритель качает файл прямо с CDN — трафик мимо сервера. Проверено на
+// «Supergirl» (UHD_1313, 2160p): первое обращение с постороннего IP → 206, video/mp4,
+// 21 997 176 115 Б. Список синхронизирован с httpapi/stream_proxy.go.
+var filmixNoHashDirRe = regexp.MustCompile(`(?i)/UHD_1313/`)
+
 // filmixToProgressive конвертирует HLS-ссылку в прогрессивную. "" — если форма не та.
 func filmixToProgressive(hlsURL string) string {
 	m := filmixHLSToProgRe.FindStringSubmatch(strings.TrimSpace(hlsURL))
@@ -84,8 +93,15 @@ func (f *filmixChecker) progressiveEnabled() bool {
 // сегментов, перемотка обычным Range, нет per-segment TTFB. Так же поступает и чужой плагин,
 // который отдаёт `/s/` во всех озвучках.
 func (f *filmixChecker) progressiveStreams(ctx context.Context, streams []map[string]string) ([]map[string]string, bool) {
-	if !f.progressiveEnabled() || len(streams) == 0 {
+	if len(streams) == 0 {
 		return streams, false
+	}
+	// Прогрессив включается либо глобально, либо принудительно для дефектных разделов — им
+	// HLS-путь всё равно закрыт (сегменты без hash), а прокси съел бы весь 4K-трафик.
+	if !f.progressiveEnabled() {
+		if f.fxUser == "" || f.fxPasswd == "" || !filmixNoHashDirRe.MatchString(streams[0]["url"]) {
+			return streams, false
+		}
 	}
 	out := make([]map[string]string, 0, len(streams))
 	for _, s := range streams {

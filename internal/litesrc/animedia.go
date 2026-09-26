@@ -179,15 +179,18 @@ func (a *animediaChecker) index(w http.ResponseWriter, req *http.Request, links 
 		return
 	}
 
-	// Auto-redirect if single result and not similar mode
+	// Single unambiguous hit: serve the episodes directly instead of bouncing the
+	// caller through a redirect.
+	//
+	// A 302 here worked only for callers that speak HTTP. The capi drill invokes
+	// lite handlers IN-PROCESS and cannot follow a Location header, so it saw the
+	// redirect body ("<a href=…>Found</a>") as a malformed answer and dropped the
+	// source — 56 such failures an hour on production, and animedia looked broken
+	// while its search was in fact working. Calling episodes() is exactly where
+	// the redirect pointed, one hop earlier: HTTP clients get the content instead
+	// of a redirect they would have followed anyway.
 	if !similar && len(items) == 1 {
-		host := hostFromRequest(req)
-		redirect := host + "/lite/animedia?title=" + url.QueryEscape(title) +
-			"&news=" + url.QueryEscape(items[0].uri)
-		if rjson {
-			redirect += "&rjson=true"
-		}
-		http.Redirect(w, req, redirect, http.StatusFound)
+		a.episodes(w, req, rjson, title, items[0].uri, links)
 		return
 	}
 

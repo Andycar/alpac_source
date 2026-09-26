@@ -1,6 +1,7 @@
 package iptv
 
 import (
+	"bytes"
 	"crypto/md5"
 	"encoding/hex"
 	"encoding/json"
@@ -16,8 +17,15 @@ import (
 	"sync/atomic"
 	"time"
 
+	"lampac-go/internal/httpclient"
+
 	"github.com/rs/zerolog/log"
 )
+
+// iptvBalancer — имя балансера, под которым IPTV зарегистрирован в прокси-реестре
+// (httpclient). Совпадает с plugin в /proxy/-ссылках каналов, поэтому одна
+// запись конфига управляет и исходящими запросами, и отдачей потока.
+const iptvBalancer = "iptv"
 
 // ---------------------------------------------------------------------------
 //  Store — per-user IPTV playlist persistence
@@ -29,21 +37,37 @@ import (
 //	{repoRoot}/database/iptv/playlists/{md5(tgID)}_{playlistID}.json
 //	{repoRoot}/database/iptv/users/{md5(tgID)}.json
 type Store struct {
-	dir           string
-	maxPlaylists  int
-	defaultProxy  string
-	globalURLs    []string
-	mergeGlobal   bool // present all global playlists as one deduplicated list (id="all")
-	mu            sync.RWMutex
-	cache         map[string]*PlaylistCache // playlistCacheKey → cache
-	userPlaylists map[string][]string       // tgHash → []playlistID
-	httpClient    *http.Client
+	dir          string
+	maxPlaylists int
+	defaultProxy string
+	globalURLs   []string
+	mergeGlobal  bool // present all global playlists as one deduplicated list (id="all")
+	// registry — свой реестр каналов («Мои каналы», id="own"): стабильные id,
+	// несколько источников на канал, автофейловер. nil когда выключен.
+	registry        *Registry
+	registryProxy   string // proxy mode для стримов реестра: "none" | "all"
+	registryAutoAdd bool   // незнакомые донорские каналы становятся новыми каналами
+	registryOnly    bool   // прятать глобальные плейлисты от клиентов — только реестр
+	// preferOfficial — предпочитать поток с домена вещателя панельному, даже
+	// если панельный выше качеством (см. official.go).
+	preferOfficial bool
+	official       *officialHostMatcher
+	mu             sync.RWMutex
+	cache          map[string]*PlaylistCache // playlistCacheKey → cache
+	userPlaylists  map[string][]string       // tgHash → []playlistID
+	httpClient     *http.Client
 
 	// health-check (opt-in liveness probing of global streams)
-	healthOn     bool
-	health       *healthState
-	healthConc   int
-	healthMax    int
+	healthOn   bool
+	health     *healthState
+	healthConc int
+	healthMax  int
+	// healthCursor — с какого места начинать отбор проб. Живёт только в
+	// горутине health-check. Нужен, когда источников больше бюджета: без
+	// сдвига цикл каждый раз меряет ПЕРВЫЕ healthMax, а хвост не получает
+	// вердикта никогда (прод: 2146 источников при cap 1500 — 646 не
+	// проверялись вовсе, и фейловер не знал, живы они или мертвы).
+	healthCursor int
 	healthClient *http.Client
 	// healthDeep walks an HLS channel to its first segment instead of reading
 	// two bytes off the manifest. A dead channel usually still serves its
@@ -53,6 +77,10 @@ type Store struct {
 	// FROZEN channel (200s forever, picture is a still frame). Off by default:
 	// it adds a per-channel wait, which does not scale to thousands of them.
 	healthStale bool
+	// freezeAfter — насколько старой должна быть прошлая подпись окна, чтобы её
+	// неизменность считалась заморозкой (0 → freezeMinAge). Поле существует
+	// ради тестов: ждать десять минут они не могут.
+	freezeAfter time.Duration
 
 	// mergedCache memoizes mergedLocked()'s output for a short TTL. Rebuilding the
 	// full deduplicated global channel list on every GetChannels/GetGroups call was
@@ -68,6 +96,18 @@ type StoreConfig struct {
 	DefaultProxy    string
 	GlobalPlaylists []string
 	MergeGlobal     bool // unify global playlists into one deduplicated "Все каналы" list
+
+	// Собственный реестр каналов (см. registry.go).
+	Registry        bool   // включить реестр («Мои каналы»)
+	RegistryName    string // отображаемое имя плейлиста реестра
+	RegistryProxy   string // "none" | "all"; пусто → DefaultProxy
+	RegistryAutoAdd bool   // авто-добавление незнакомых донорских каналов при ingest
+	RegistryOnly    bool   // клиентам виден только реестр, глобальные списки скрыты
+
+	// PreferOfficial ставит поток вещателя выше панельного (даже более
+	// качественного). OfficialHosts дополняет встроенный список доменов.
+	PreferOfficial bool
+	OfficialHosts  []string
 }
 
 // NewStore creates a new IPTV store.
@@ -91,13 +131,29 @@ func NewStore(repoRoot string, cfg StoreConfig) *Store {
 		mergeGlobal:   cfg.MergeGlobal,
 		cache:         make(map[string]*PlaylistCache),
 		userPlaylists: make(map[string][]string),
-		httpClient: &http.Client{
-			Timeout: 60 * time.Second,
-		},
+		// Через прокси-реестр балансера "iptv": одна запись
+		// [[proxycore.entries]] balancers=["iptv"] уводит за прокси и скачивание
+		// плейлистов, и health-пробы, и (в epg_engine) XMLTV — тем же путём, что
+		// уже ходят сами стримы через /proxy/. Dynamic-вариант ре-резолвит
+		// прокси на КАЖДОМ запросе: store живёт до перезапуска, а пул прокси
+		// пересоздаётся hot-reload'ом конфига.
+		httpClient:   httpclient.NewForBalancerDynamic(iptvBalancer, 60*time.Second),
 		healthConc:   8,
 		healthMax:    2000,
 		health:       &healthState{dead: make(map[string]struct{})},
-		healthClient: &http.Client{Timeout: 10 * time.Second},
+		healthClient: httpclient.NewForBalancerDynamic(iptvBalancer, 10*time.Second),
+	}
+
+	s.official = newOfficialMatcher(cfg.OfficialHosts)
+	if cfg.Registry {
+		s.preferOfficial = cfg.PreferOfficial
+		s.registry = LoadRegistry(dir, cfg.RegistryName)
+		s.registryProxy = cfg.RegistryProxy
+		if s.registryProxy == "" {
+			s.registryProxy = cfg.DefaultProxy
+		}
+		s.registryAutoAdd = cfg.RegistryAutoAdd
+		s.registryOnly = cfg.RegistryOnly
 	}
 
 	s.loadFromDisk()
@@ -116,7 +172,14 @@ func (s *Store) ListPlaylists(tgID int64) []Playlist {
 
 	var result []Playlist
 
-	if s.mergeGlobal && len(s.globalURLs) > 0 {
+	// Свой реестр — первым: это «лицо» сервера, глобальные списки лишь доноры.
+	if s.registry != nil && s.registry.Len() > 0 {
+		result = append(result, s.registryPlaylist())
+	}
+
+	if s.registry != nil && s.registryOnly {
+		// Глобальные плейлисты скрыты — только реестр и личные списки.
+	} else if s.mergeGlobal && len(s.globalURLs) > 0 {
 		// All global lists (e.g. several m3u.su categories) presented as ONE deduplicated playlist.
 		result = append(result, Playlist{
 			ID:           MergedGlobalID,
@@ -182,10 +245,19 @@ func (s *Store) AddPlaylist(tgID int64, pl Playlist) error {
 	}
 
 	s.userPlaylists[hash] = append(ids, pl.ID)
+	// Метаданные плейлиста сохраняем СРАЗУ, до скачивания. Иначе упавший
+	// первый refresh (протухшая ссылка, мёртвая панель) не оставлял о плейлисте
+	// ничего, кроме id в индексе: ListPlaylists отдаёт только то, у чего есть
+	// кэш, и плейлист пропадал из списка молча — пользователь не мог его ни
+	// обновить, ни удалить, а слот из max_playlists он занимал.
+	key := hash + "_" + pl.ID
+	stub := &PlaylistCache{Playlist: pl, ParsedAt: time.Now()}
+	s.cache[key] = stub
 	s.mu.Unlock()
 
 	// Save user index.
 	s.saveUserIndex(hash)
+	s.saveCacheFile(key, stub)
 
 	// Parse playlist in background.
 	go s.refreshPlaylist(hash, pl)
@@ -235,6 +307,11 @@ func (s *Store) RefreshPlaylist(tgID int64, playlistID string) error {
 	s.mu.RUnlock()
 
 	if !ok {
+		// «Обновить» на реестре = перечитать доноров (ingest сработает сам).
+		if s.registry != nil && playlistID == RegistryPlaylistID {
+			go s.RefreshGlobal()
+			return nil
+		}
 		// Check global.
 		for _, url := range s.globalURLs {
 			gid := playlistIDFromURL(url)
@@ -256,7 +333,9 @@ func (s *Store) RefreshPlaylist(tgID int64, playlistID string) error {
 // GetChannels returns channels for a playlist with optional filtering and pagination.
 func (s *Store) GetChannels(tgID int64, playlistID, group, search string, page, limit int) ([]Channel, int) {
 	var channels []Channel
-	if s.mergeGlobal && playlistID == MergedGlobalID {
+	if s.registry != nil && playlistID == RegistryPlaylistID {
+		channels = s.registryChannels()
+	} else if s.mergeGlobal && playlistID == MergedGlobalID {
 		s.mu.RLock()
 		channels = s.mergedLocked()
 		s.mu.RUnlock()
@@ -278,7 +357,11 @@ func (s *Store) GetChannels(tgID int64, playlistID, group, search string, page, 
 	var filtered []Channel
 	searchLower := strings.ToLower(search)
 	for _, ch := range channels {
-		if group != "" && ch.Group != group {
+		// Один параметр бьёт по всем трём осям НАМЕРЕННО. Раньше «Спорт»
+		// означало Group=="Спорт", то есть только каналы БЕЗ страны: русский
+		// Матч ТВ (Group="Русские", Genre="Спорт") в свой же жанр не попадал.
+		// Клиенту при этом не нужно знать, страну он выбрал или жанр.
+		if group != "" && ch.Group != group && ch.Country != group && ch.Genre != group {
 			continue
 		}
 		if search != "" && !strings.Contains(strings.ToLower(ch.Name), searchLower) {
@@ -305,10 +388,29 @@ func (s *Store) GetChannels(tgID int64, playlistID, group, search string, page, 
 	return filtered[start:end], total
 }
 
-// GetGroups returns group summary for a playlist.
+// Группировочные измерения для GetGroupsBy.
+const (
+	GroupByLegacy  = ""        // единое поле Group — как было до разделения
+	GroupByCountry = "country" // только страны
+	GroupByGenre   = "genre"   // только жанры
+)
+
+// GetGroups returns group summary for a playlist (legacy single dimension).
 func (s *Store) GetGroups(tgID int64, playlistID string) []GroupInfo {
+	return s.GetGroupsBy(tgID, playlistID, GroupByLegacy)
+}
+
+// GetGroupsBy returns the group summary along ONE taxonomy axis. Страны и
+// жанры больше не делят один список: спросив "genre", клиент получает только
+// жанры и не увидит среди них «Итальянские».
+//
+// Каналы без значения по запрошенной оси просто не попадают в ответ — в списке
+// жанров нет графы «без жанра», потому что это не жанр.
+func (s *Store) GetGroupsBy(tgID int64, playlistID, by string) []GroupInfo {
 	var channels []Channel
-	if s.mergeGlobal && playlistID == MergedGlobalID {
+	if s.registry != nil && playlistID == RegistryPlaylistID {
+		channels = s.registryChannels()
+	} else if s.mergeGlobal && playlistID == MergedGlobalID {
 		s.mu.RLock()
 		channels = s.mergedLocked()
 		s.mu.RUnlock()
@@ -326,11 +428,27 @@ func (s *Store) GetGroups(tgID int64, playlistID string) []GroupInfo {
 		channels = c.Channels
 	}
 
+	return s.groupsFrom(channels, by)
+}
+
+// groupsFrom tallies channels along one taxonomy axis.
+func (s *Store) groupsFrom(channels []Channel, by string) []GroupInfo {
 	groupMap := make(map[string]*GroupInfo)
 	for _, ch := range channels {
-		g := ch.Group
+		var g string
+		switch by {
+		case GroupByCountry:
+			g = ch.Country
+		case GroupByGenre:
+			g = ch.Genre
+		default:
+			g = ch.Group
+			if g == "" {
+				g = "Ungrouped"
+			}
+		}
 		if g == "" {
-			g = "Ungrouped"
+			continue // по этой оси канал не классифицирован — молчим, а не выдумываем
 		}
 		if gi, ok := groupMap[g]; ok {
 			gi.Count++
@@ -351,6 +469,11 @@ func (s *Store) GetGroups(tgID int64, playlistID string) []GroupInfo {
 
 // GetChannel returns a single channel by ID from any of the user's playlists.
 func (s *Store) GetChannel(tgID int64, channelID string) (*Channel, *Playlist) {
+	// Канал реестра: id со стабильным префиксом, URL — лучший живой источник.
+	if s.registry != nil && IsRegistryChannelID(channelID) {
+		return s.GetRegistryChannel(channelID)
+	}
+
 	hash := tgHash(tgID)
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -401,6 +524,11 @@ func (s *Store) Stats() (users, playlists int) {
 // вида get.php?…&type=m3u_plus) — обычные IPTV-плееры проходят, потому что шлют плеерный UA.
 const defaultFetchUA = "VLC/3.0.20 LibVLC/3.0.20"
 
+// emptyParseKeepDays — сколько прошлый разбор плейлиста переживает ответ «200
+// без единого канала». Ровно столько же реестр держит исчезнувший auto-источник
+// (regSourceKeepDays), так что окна складываются, а не спорят.
+const emptyParseKeepDays = 7
+
 func strOr(v, def string) string {
 	if strings.TrimSpace(v) != "" {
 		return v
@@ -429,19 +557,62 @@ func (s *Store) refreshPlaylist(ownerHash string, pl Playlist) {
 		return
 	}
 
+	// Скачиваем плейлист целиком ДО парсинга: раньше ParseM3U читал прямо из
+	// resp.Body, и 60-секундный таймаут клиента покрывал скачивание И разбор —
+	// огромный плейлист с медленной панели обрывался на середине и целиком
+	// выбрасывался. Кап 64MB — защита от бесконечного ответа.
+	data, rerr := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
+	if rerr != nil && len(data) == 0 {
+		log.Error().Err(rerr).Str("id", pl.ID).Msg("iptv: failed to download playlist body")
+		return
+	}
+
 	var channels []Channel
 	groupSet := make(map[string]struct{})
 
-	header, err := ParseM3U(resp.Body, func(ch Channel) {
+	header, err := ParseM3U(bytes.NewReader(data), func(ch Channel) {
 		ch.PlaylistID = pl.ID
 		channels = append(channels, ch)
 		if ch.Group != "" {
 			groupSet[ch.Group] = struct{}{}
 		}
 	})
+	if rerr != nil && err == nil {
+		err = rerr
+	}
 	if err != nil {
-		log.Error().Err(err).Str("id", pl.ID).Msg("iptv: parse error")
-		return
+		// Спасаем распарсенное: одна битая строка (или обрыв в хвосте) — не
+		// повод выкидывать весь плейлист. VLC дочитывает сколько может — теперь
+		// и мы. Пустой результат по-прежнему не затирает прошлый кэш.
+		if len(channels) == 0 {
+			log.Error().Err(err).Str("id", pl.ID).Msg("iptv: parse error")
+			return
+		}
+		log.Warn().Err(err).Str("id", pl.ID).Int("salvaged", len(channels)).
+			Msg("iptv: playlist parsed partially — keeping salvaged channels")
+	}
+
+	// 200 и ни одного канала — это почти никогда не «плейлист опустел». Так
+	// выглядит страница техработ, отданная с кодом 200, редирект на HTML и
+	// панель, сообщающая «подписка кончилась». Затерев таким ответом прошлый
+	// разбор, мы одним махом выкашиваем источники ВСЕХ каналов донора: реестр
+	// пересобирает auto из кэшей, и пустой кэш означает «донор больше ничего не
+	// даёт». Прод 19.09.2026: m3u.su ответил 503-страницей, кэш стал нулевым, и
+	// 235 источников исчезли молча. Держим прошлый разбор emptyParseKeepDays —
+	// донору хватает пережить сбой, а по-настоящему умерший всё равно отпускает
+	// источники, просто на неделю позже.
+	if len(channels) == 0 {
+		s.mu.RLock()
+		prev := s.cache[ownerHash+"_"+pl.ID]
+		s.mu.RUnlock()
+		if prev != nil && len(prev.Channels) > 0 &&
+			time.Since(prev.ParsedAt) < emptyParseKeepDays*24*time.Hour {
+			log.Error().Str("id", pl.ID).Str("url", pl.URL).
+				Int("kept", len(prev.Channels)).
+				Time("parsed_at", prev.ParsedAt).
+				Msg("iptv: плейлист отдал 200 без единого канала — оставляем прошлый разбор")
+			return
+		}
 	}
 
 	// EPG-адреса: ручные (заданы при добавлении) главнее url-tvg из заголовка M3U.
@@ -473,6 +644,12 @@ func (s *Store) refreshPlaylist(ownerHash string, pl Playlist) {
 	s.mu.Unlock()
 
 	s.saveCacheFile(key, cache)
+
+	// Свежие донорские каналы — сразу в реестр: источники обновляются той же
+	// периодикой, что и сами плейлисты (протухшие Xtream-токены и т.п.).
+	if ownerHash == "global" && s.registry != nil {
+		s.IngestRegistry(false)
+	}
 
 	log.Info().Str("id", pl.ID).Int("channels", len(channels)).Int("groups", len(groups)).Msg("iptv: playlist refreshed")
 }
@@ -572,6 +749,30 @@ func (s *Store) RefreshGlobal() {
 	s.invalidateMerged() // global caches changed → drop the memoized merged list
 }
 
+// RefreshAll re-fetches EVERY cached playlist (global + user) from upstream.
+// Xtream-панели ротируют токены внутри URL каналов: без периодического
+// перечитывания все ссылки протухают за часы — «в других плеерах работает»,
+// потому что те перечитывают m3u при каждом запуске. Последовательно, чтобы
+// не бомбить панели пачкой одновременных скачиваний.
+func (s *Store) RefreshAll() {
+	type job struct {
+		owner string
+		pl    Playlist
+	}
+	s.mu.RLock()
+	jobs := make([]job, 0, len(s.cache))
+	for key, c := range s.cache {
+		owner := strings.TrimSuffix(key, "_"+c.Playlist.ID)
+		jobs = append(jobs, job{owner: owner, pl: c.Playlist})
+	}
+	s.mu.RUnlock()
+	for _, j := range jobs {
+		s.refreshPlaylist(j.owner, j.pl)
+	}
+	s.invalidateMerged()
+	log.Info().Int("playlists", len(jobs)).Msg("iptv: periodic refresh done")
+}
+
 // SetGlobalPlaylists replaces the global playlist URL list (and merge mode) at
 // runtime — called from the config-reload path so that edits to
 // [iptv] global_playlists / merge_global take effect without a full server
@@ -636,7 +837,9 @@ func playlistIDFromURL(url string) string {
 
 // FetchM3U downloads and parses an M3U from a URL, returning channels.
 func FetchM3U(url string) (M3UHeader, []Channel, error) {
-	resp, err := http.Get(url)
+	// Через тот же прокси-балансер, что и остальные исходящие IPTV-запросы —
+	// голый http.Get ходил бы мимо прокси и мимо таймаута.
+	resp, err := httpclient.NewForBalancerDynamic(iptvBalancer, 60*time.Second).Get(url)
 	if err != nil {
 		return M3UHeader{}, nil, err
 	}
@@ -652,4 +855,42 @@ func FetchM3U(url string) (M3UHeader, []Channel, error) {
 		channels = append(channels, ch)
 	})
 	return header, channels, err
+}
+
+// SetPlaylistProxyMode переключает режим прокси у УЖЕ добавленного плейлиста.
+//
+// До этого режим можно было задать только при добавлении, а клиенты его вообще
+// не передавали — поле оставалось пустым, и AddPlaylist подставлял серверный
+// default_proxy ("all"). Получалось, что личный плейлист пользователя всегда
+// шёл через наш сервер, и отключить это было нечем: настройки не существовало
+// ни в одном клиенте.
+//
+// mode: "all" — гнать через сервер, "none" — отдавать клиенту прямой адрес.
+// Глобальные плейлисты и реестр не трогаем: их адреса наружу не отдаются
+// вообще (утечка одного raw-URL восстанавливает украденный каталог).
+func (s *Store) SetPlaylistProxyMode(tgID int64, playlistID, mode string) error {
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	if mode != "all" && mode != "none" {
+		return fmt.Errorf("iptv: bad proxy mode %q (ожидается all или none)", mode)
+	}
+	hash := tgHash(tgID)
+	key := hash + "_" + playlistID
+
+	s.mu.Lock()
+	c, ok := s.cache[key]
+	if !ok {
+		s.mu.Unlock()
+		return fmt.Errorf("iptv: playlist %q not found", playlistID)
+	}
+	if c.Playlist.IsGlobal {
+		s.mu.Unlock()
+		return fmt.Errorf("iptv: глобальный плейлист режимом прокси не управляется")
+	}
+	c.Playlist.ProxyMode = mode
+	c.Playlist.UpdatedAt = time.Now().Unix()
+	snapshot := *c
+	s.mu.Unlock()
+
+	s.saveCacheFile(key, &snapshot)
+	return nil
 }

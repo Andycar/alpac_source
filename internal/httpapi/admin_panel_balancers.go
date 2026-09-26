@@ -19,7 +19,7 @@ import (
 
 var knownBalancers = []string{
 	"Rezka", "Rhsprem", "AhueRezka", "Collaps", "Collaps-dash", "Kinotochka",
-	"RutubeMovie", "Anwap", "VkMovie", "Plvideo",
+	"RutubeMovie", "Anwap", "VkMovie", "Plvideo", "RuDub", "AniDUB", "Smotrim",
 	"CDNvideohub", "Kubikvkube", "Redheadsound", "iRemux", "Zetflix", "ZetflixDB", "VideoDB", "CDNmovies",
 	"VDBmovies", "FanCDN", "Kinobase", "VideoCDN", "Lumex", "VoKino", "Zona",
 	"IframeVideo", "HDVB", "Vibix", "Videoseed", "KinoPub", "Alloha",
@@ -35,8 +35,10 @@ var knownBalancers = []string{
 	// этого их не было ни в пер-юзерной видимости, ни в healthcheck, ни в
 	// телеметрии, а в whitelist-режиме кита они пропадали из выдачи.
 	"Lift", "Kinovod", "Turbo", "SakhTV", "FEMD", "Gencit", "Kinobadi",
-	"UaKino",
+	"UaKino", "Zagonka",
 	"FlixCDN", "TwoEmbed", "Uafilm", "Youtube",
+	// Нативные порты бывших JS-модулей (27.08.2026).
+	"SCTS", "KBTeam", "Krasview",
 }
 
 // balancerPluginKey maps PascalCase config names to the actual lowercase
@@ -65,6 +67,9 @@ func PluginKeyFor(name string) string {
 
 var balancerStatusTags = map[string]string{
 	"Anwap":        "working",
+	"RuDub":        "working",
+	"Smotrim":      "working",
+	"AniDUB":       "working",
 	"Kinotochka":   "working",
 	"AhueRezka":    "working",
 	"Collaps":      "working",
@@ -111,10 +116,27 @@ var balancerStatusTags = map[string]string{
 
 type balancerFullInfo struct {
 	Name      string         `json:"name"`
+	Display   string         `json:"display,omitempty"` // human label when it differs from the config key (PidTor → AlcoTor)
 	Fields    map[string]any `json:"fields"`
 	StatusTag string         `json:"status_tag,omitempty"`
 	Group     string         `json:"group,omitempty"`
 	Quality   string         `json:"quality,omitempty"`
+}
+
+// balancerDisplayNames overrides the human-facing label of a known balancer
+// whose internal/config key must stay as is (sections, routes, kit maps,
+// .NET current.conf all key on the original spelling). Lampa's /lite/events
+// uses pluginPrettyNames (lowercase keys) for the same purpose.
+var balancerDisplayNames = map[string]string{
+	"PidTor": "AlcoTor",
+}
+
+// BalancerDisplayName returns the label to show for a knownBalancers entry.
+func BalancerDisplayName(name string) string {
+	if d, ok := balancerDisplayNames[name]; ok {
+		return d
+	}
+	return name
 }
 
 // balancerGroupMap categorises each known balancer into a UI group.
@@ -133,7 +155,13 @@ var balancerGroupMap = map[string]string{
 	"Kubikvkube": "ru",
 	"Lift":       "ru", "Kinovod": "ru", "Turbo": "ru", "SakhTV": "ru",
 	"FEMD": "ru", "Kinobadi": "ru", "FlixCDN": "ru",
+	"Zagonka": "ru",
+	// Нативные порты бывших JS-модулей: SCTS — каталог Sakhalin Cable TV
+	// (рядом с SakhTV), KBTeam — kb-team.club (матчинг по kinopoisk_id,
+	// ZeroCDN RU/CIS), Krasview — сеть зеркал smartkino/sersoap (RU-only egress).
+	"SCTS": "ru", "KBTeam": "ru", "Krasview": "ru",
 	// Аниме
+	"AniDUB":    "anime",
 	"MoonAnime": "anime", "AnilibriaOnline": "anime", "AniLiberty": "anime",
 	"Animebesst": "anime", "AniMedia": "anime", "Animevost": "anime",
 	"AnimeGo": "anime", "AnimeLib": "anime",
@@ -144,7 +172,11 @@ var balancerGroupMap = map[string]string{
 	"Uafilm": "ua", "Gencit": "ua", "UaKino": "ua",
 	// Видео / ТВ
 	"RutubeMovie": "video", "Anwap": "ru", "VkMovie": "video", "Plvideo": "video",
-	"GetsTV": "video", "IptvOnline": "video", "VeoVeo": "video",
+	// RuDub — своя озвучка, только сериалы.
+	"RuDub": "ru",
+	// «Смотрим» — открытый архив ВГТРК: русское кино, сериалы и программы.
+	"Smotrim": "ru",
+	"GetsTV":  "video", "IptvOnline": "video", "VeoVeo": "video",
 	"Youtube": "video",
 	// Английские
 	"Hydraflix": "en", "Vidsrc": "en", "VidLink": "en",
@@ -241,6 +273,9 @@ func tgAdminBalancersHandler(store *tgauth.Store, adminStore *tgauth.AdminIDStor
 				}
 				q := pluginQualityBadgeGet(strings.ToLower(name))
 				bi := balancerFullInfo{Name: name, StatusTag: balancerStatusTags[name], Group: grp, Quality: q}
+				if d := BalancerDisplayName(name); d != name {
+					bi.Display = d
+				}
 				section, ok := root[name].(map[string]any)
 				if ok {
 					// Copy the full section
@@ -683,4 +718,19 @@ func syncNoStreamProxy(online map[string]any, pluginKey string, disabled bool) {
 		result[i] = s
 	}
 	online["no_stream_proxy"] = result
+}
+
+// allBalancerKeys — все ключи балансеров, которые сервер знает: каталог
+// админки (knownBalancers) плюс локальные реализации. Снимок этого списка
+// kit кладёт рядом с пользовательским выбором видимости, чтобы источник,
+// появившийся ПОЗЖЕ, не считался «выключенным» (см. kit/catalog.go).
+func allBalancerKeys() []string {
+	keys := make([]string, 0, len(knownBalancers)+len(localCorePlugins))
+	for _, name := range knownBalancers {
+		keys = append(keys, PluginKeyFor(name))
+	}
+	for name := range localCorePlugins {
+		keys = append(keys, name)
+	}
+	return keys
 }

@@ -25,10 +25,17 @@ var tsBalancerPoolRef *torrbalancer.Pool
 // transcodesvc.TSPoolBackendFor over httpapi's OWN pool handle (the two are the
 // same object in production) so pidtor and the transcoder agree on the backend.
 func tsPoolBackendFor(infohash string) *torrbalancer.Backend {
+	return tsPoolBackendForAllow(infohash, nil)
+}
+
+// tsPoolBackendForAllow is tsPoolBackendFor restricted to backends for which
+// allow(id) is true (nil = all) — the failover hook: after a backend failed
+// the caller re-picks with that ID excluded.
+func tsPoolBackendForAllow(infohash string, allow func(backendID string) bool) *torrbalancer.Backend {
 	if torrsIsInProcess() || tsBalancerPoolRef == nil || !tsBalancerPoolRef.HasEnabledBackends() {
 		return nil
 	}
-	return tsBalancerPoolRef.PickForHash(strings.ToLower(strings.TrimSpace(infohash)), nil)
+	return tsBalancerPoolRef.PickForHash(strings.ToLower(strings.TrimSpace(infohash)), allow)
 }
 
 // tsZombieHandler reacts to a stream circuit-breaker trip (see
@@ -105,6 +112,24 @@ func tsZombieHandler(pool *torrbalancer.Pool) func(*torrbalancer.Backend, bool) 
 					}
 				}
 			}()
+		}
+	}
+}
+
+// tsChronicHandler reacts to a backend crossing the chronic-wedge threshold
+// (~20 минут torrents-API мёртв подряд, /shutdown и SSH не помогли): автолечение
+// для него уже остановлено пулом, осталось позвать человека. Не чаще раза в час.
+func tsChronicHandler(pool *torrbalancer.Pool) func(*torrbalancer.Backend, int64) {
+	return func(b *torrbalancer.Backend, streak int64) {
+		host, _ := b.Target()
+		name := b.Name
+		if name == "" {
+			name = host
+		}
+		if bot := liveTGBot(); bot != nil {
+			bot.NotifyAdminsNow(fmt.Sprintf(
+				"🛑 <b>TorrServer «%s»</b>\n<code>%s</code>\nХронический клин: torrents-API мёртв ~%d минут подряд, рестарты (/shutdown, SSH) не помогли.\nАвтолечение остановлено, бэкенд в карантине до 30 мин за раз. Нужен ручной разбор: проверьте машину (RAM/OOM, диск) или выключите её в «TS Балансере» до починки.",
+				name, host, streak/2))
 		}
 	}
 }

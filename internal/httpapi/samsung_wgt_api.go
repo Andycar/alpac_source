@@ -28,7 +28,7 @@ func samsungWGTHandler(cfg config.Config) http.HandlerFunc {
 		cachePath := widgetsCacheFile(cfg, cacheName)
 
 		if data, err := os.ReadFile(cachePath); err == nil {
-			writeWidgetDownload(w, "lampac.wgt", data)
+			writeWidgetDownload(w, "alpac.wgt", data)
 			return
 		}
 
@@ -42,7 +42,7 @@ func samsungWGTHandler(cfg config.Config) http.HandlerFunc {
 		defer widgetBuildMu.Unlock()
 
 		if data, err := os.ReadFile(cachePath); err == nil {
-			writeWidgetDownload(w, "lampac.wgt", data)
+			writeWidgetDownload(w, "alpac.wgt", data)
 			return
 		}
 
@@ -53,7 +53,7 @@ func samsungWGTHandler(cfg config.Config) http.HandlerFunc {
 		}
 		_ = os.WriteFile(cachePath, data, 0o644)
 
-		writeWidgetDownload(w, "lampac.wgt", data)
+		writeWidgetDownload(w, "alpac.wgt", data)
 	}
 }
 

@@ -308,6 +308,15 @@ func incidentReceiveHandler(cfg config.Config, buf *logbuf.Buffer, bot *tgauth.B
 			return
 		}
 		ip := clientIP(r)
+		// Лимит на устройство: один webOS отдал 96 инцидентов из 1000 — автоотчёты плеера по
+		// каждой просадке, все с одного uid. Дальше первых нескольких в час они не несут ничего
+		// нового, а админам в Telegram сыплются по одному. Ключ — uid (префикс токена), без него
+		// — адрес. Ответ 200 с пометкой, чтобы клиент не копил очередь и не ретраил.
+		if !incidentDeviceLimiter.allow(incidentUID(r), ip, time.Now()) {
+			log.Info().Str("ip", ip).Str("reason", clampStr(p.Reason, 24)).Msg("incident: лимит на устройство — отчёт не сохранён")
+			writeJSON(w, http.StatusOK, map[string]any{"id": "", "limited": true})
+			return
+		}
 		id := incidentID()
 		userTG := incidentResolveUserTG(r, store)
 		in := Incident{
@@ -338,6 +347,46 @@ func incidentReceiveHandler(cfg config.Config, buf *logbuf.Buffer, bot *tgauth.B
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"id": id})
 	}
+}
+
+// incidentPerDeviceHour — сколько инцидентов в час принимаем с одного устройства.
+const incidentPerDeviceHour = 6
+
+// deviceLimiter — скользящий час по ключу устройства.
+type deviceLimiter struct {
+	mu   sync.Mutex
+	seen map[string][]time.Time
+}
+
+var incidentDeviceLimiter = &deviceLimiter{seen: map[string][]time.Time{}}
+
+func (l *deviceLimiter) allow(uid, ip string, now time.Time) bool {
+	key := "u:" + uid
+	if uid == "" {
+		key = "ip:" + ip
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	cut := now.Add(-time.Hour)
+	ts := l.seen[key][:0:0]
+	for _, t := range l.seen[key] {
+		if t.After(cut) {
+			ts = append(ts, t)
+		}
+	}
+	if len(ts) >= incidentPerDeviceHour {
+		l.seen[key] = ts
+		return false
+	}
+	l.seen[key] = append(ts, now)
+	if len(l.seen) > 4096 { // не копим ключи вечно
+		for k, v := range l.seen {
+			if len(v) == 0 || !v[len(v)-1].After(cut) {
+				delete(l.seen, k)
+			}
+		}
+	}
+	return true
 }
 
 func incidentID() string {

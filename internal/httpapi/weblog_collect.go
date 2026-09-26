@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"lampac-go/internal/config"
+	"lampac-go/internal/tgauth"
 
 	"github.com/rs/zerolog/log"
 )
@@ -144,7 +145,7 @@ func (l *weblogLimiter) allow(ip string, n int) int {
 	return allowed
 }
 
-func weblogCollectHandler(cfg config.Config) http.HandlerFunc {
+func weblogCollectHandler(cfg config.Config, bot *tgauth.Bot) http.HandlerFunc {
 	limiter := newWeblogLimiter()
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !cfg.Web.WeblogCollect {

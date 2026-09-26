@@ -84,7 +84,6 @@ func registerPluginJSRoutes(router chi.Router, cfg config.Config) {
 	router.Get("/webplayer/health/watchparty", watchparty.WatchpartyHealthHandler)
 	router.Head("/webplayer/health/watchparty", watchparty.WatchpartyHealthHandler)
 
-	generic("cdn_direct.js")
 	generic("anti-dmca.js")
 	generic("auth_gate_plugin.js")
 	generic("backup_sync_key.js")

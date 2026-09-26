@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+
+	"lampac-go/internal/auth"
 )
 
 // ---------------------------------------------------------------------------
@@ -49,6 +51,18 @@ type nwsConn struct {
 	ip        string
 	host      string
 	userAgent string
+	// owner — кто это, по мнению authMiddleware («tg:123», «pw:…»). Пусто, если
+	// соединение пришло без куки и токена (кросс-доменная Лампа так и ходит).
+	//
+	// Канал синхронизации здесь адресуется ЗАЯВЛЕННЫМ uid: клиент говорит
+	// «я такой-то», и сервер верит на слово. Пока uid уникален, это работает,
+	// но замер 20.09.2026 нашёл 88 значений, поделённых 329 аккаунтами (один —
+	// на 70), то есть их события летели друг к другу. Плюс список устройств
+	// отдавался ещё и соседям ПО IP, а за мобильным NAT это посторонние люди.
+	// Поэтому доставка отсекается, когда обе стороны известны и это РАЗНЫЕ
+	// владельцы. Неопознанные соединения ведут себя как раньше — иначе сломалась
+	// бы синхронизация у тех, у кого куку теряет WebView.
+	owner string
 
 	sendMu     sync.Mutex
 	lastActive atomic.Int64 // UnixNano
@@ -102,12 +116,17 @@ func (h *nwsHub) HandleNWS(w http.ResponseWriter, r *http.Request) {
 		connID = generateConnID()
 	}
 
+	owner := ""
+	if u, ok := auth.UserFromContext(r.Context()); ok && u != nil {
+		owner = u.ID
+	}
 	conn := &nwsConn{
 		id:        connID,
 		ws:        ws,
 		ip:        requestIP(r),
 		host:      hostFromRequest(r),
 		userAgent: r.UserAgent(),
+		owner:     owner,
 		done:      make(chan struct{}),
 	}
 	conn.touch()
@@ -256,7 +275,7 @@ func (h *nwsHub) invoke(conn *nwsConn, method string, args []stdjson.RawMessage)
 			return
 		}
 
-		h.sendEventToConnection(targetID, uid, name, data)
+		h.sendEventToConnection(conn, targetID, uid, name, data)
 
 	// ------ Keepalive ------
 
@@ -323,6 +342,16 @@ func (h *nwsHub) SendLog(message, plugin string) {
 	}
 }
 
+// samePeer решает, можно ли доставлять между двумя соединениями. Разрешаем,
+// пока не доказано обратное: если хотя бы одна сторона не опознана, ведём себя
+// как раньше. Запрещаем только когда обе известны и это разные аккаунты.
+func samePeer(a, b *nwsConn) bool {
+	if a == nil || b == nil || a.owner == "" || b.owner == "" {
+		return true
+	}
+	return a.owner == b.owner
+}
+
 // ---------------------------------------------------------------------------
 //  SendEvents — broadcast to all connections with matching uid (except sender).
 //  Public wrapper so other handlers (bookmark, storage, timecode) can push
@@ -351,8 +380,9 @@ func (h *nwsHub) sendEvents(senderID, uid, name, data string) {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 
+	sender := h.connections[senderID] // может отсутствовать: рассылка со стороны сервера
 	for _, cid := range targets {
-		if c, ok := h.connections[cid]; ok {
+		if c, ok := h.connections[cid]; ok && samePeer(sender, c) {
 			h.send(c, "event", uid, name, data)
 		}
 	}
@@ -447,11 +477,13 @@ func (h *nwsHub) SendEventToUIDs(uids []string, name string, data string) int {
 }
 
 // sendEventToConnection — send event to one specific connection.
-func (h *nwsHub) sendEventToConnection(targetID, uid, name, data string) {
+func (h *nwsHub) sendEventToConnection(sender *nwsConn, targetID, uid, name, data string) {
 	h.mu.RLock()
 	c, ok := h.connections[targetID]
 	h.mu.RUnlock()
-	if ok {
+	// Адресная отправка по connectionId, который клиент узнаёт из списка
+	// устройств: без проверки владельца это была прямая труба к чужому клиенту.
+	if ok && samePeer(sender, c) {
 		h.send(c, "event", uid, name, data)
 	}
 }
@@ -472,7 +504,7 @@ func (h *nwsHub) sendDevicesList(sender *nwsConn, uid string) {
 		if cid == sender.id {
 			continue
 		}
-		if c, ok := h.connections[cid]; ok {
+		if c, ok := h.connections[cid]; ok && samePeer(sender, c) {
 			if u == uid || c.ip == sender.ip {
 				devices = append(devices, deviceInfo{
 					UID:          u,

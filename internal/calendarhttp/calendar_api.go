@@ -8,6 +8,7 @@ import (
 
 	"lampac-go/internal/calendar"
 	"lampac-go/internal/config"
+	"lampac-go/internal/auth"
 	"lampac-go/internal/tgauth"
 )
 
@@ -40,9 +41,9 @@ func calendarTgID(r *http.Request, store *tgauth.Store) int64 {
 		return 0
 	}
 
-	// 1. Try lampac_token cookie (web users with TG auth).
-	if cookie, err := r.Cookie("lampac_token"); err == nil && cookie.Value != "" {
-		if at, ok := store.Lookup(cookie.Value); ok && at.TelegramID != 0 {
+	// 1. Токен из любого источника, включая HttpOnly-якорь и заголовки.
+	if tok := auth.ExtractToken(r); tok != "" {
+		if at, ok := store.Lookup(tok); ok && at.TelegramID != 0 {
 			return at.TelegramID
 		}
 	}

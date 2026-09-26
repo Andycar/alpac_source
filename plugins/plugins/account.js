@@ -43,7 +43,7 @@
   // Token discovery
   //
   // When Lampa runs cross-origin (host on lampa.mx, our backend on
-  // alpac.cc), the browser refuses to send our Set-Cookie back on XHR
+  // edge-b.example.net), the browser refuses to send our Set-Cookie back on XHR
   // unless EVERY one of: withCredentials=true, CORS allow-credentials
   // header, exact Access-Control-Allow-Origin match, SameSite=None and
   // Secure is satisfied. In practice forks-of-Lampa break one of these,
@@ -91,6 +91,19 @@
       }
     } catch (e) {}
     return '';
+  }
+
+  // Чем клиент себя называет: токен, если он ещё есть, и uid устройства —
+  // он переживает потерю куки, а сервер умеет восстановить по нему сессию.
+  function deviceQuery() {
+    var parts = [];
+    try { var tok = bestKnownToken(); if (tok) parts.push('token=' + encodeURIComponent(tok)); } catch (e) {}
+    try {
+      var uid = Lampa.Storage.get('lampac_unic_id', '') || '';
+      if (!uid) { try { uid = localStorage.getItem('lampac_uid_backup') || ''; } catch (e) {} }
+      if (uid) parts.push('uid=' + encodeURIComponent(uid));
+    } catch (e) {}
+    return parts.length ? '?' + parts.join('&') : '';
   }
 
   // ---------------------------------------------------------------------
@@ -286,8 +299,10 @@
     // Explicit ?token= mirrors loadUserInfo: on external Lampa hosts the
     // cookie never travels cross-site and whoami resolves the query token
     // server-side.
-    var q = '';
-    try { var tok = bestKnownToken(); if (tok) q = '?token=' + encodeURIComponent(tok); } catch (e) {}
+    // uid идёт ВСЕГДА, токен — если нашёлся. После перезапуска токена может
+    // не быть вовсе (WebView теряет куку, а на части коробок и localStorage),
+    // и тогда единственное, чем клиент может себя назвать, — это uid.
+    var q = deviceQuery();
     getJSON('/api/auth/whoami' + q, function (err, data) {
       if (!err && data) lastWhoami = data;
       if (typeof done === 'function') done();
@@ -305,8 +320,7 @@
     return who + ' · якорь восстановления устройств';
   }
   function loadUserInfo(done) {
-    var q = '';
-    try { var tok = bestKnownToken(); if (tok) q = '?token=' + encodeURIComponent(tok); } catch (e) {}
+    var q = deviceQuery();
     getJSON('/api/user/info' + q, function (err, data) {
       if (!err && data) lastUserInfo = data;
       if (typeof done === 'function') done();

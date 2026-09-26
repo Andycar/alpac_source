@@ -38,11 +38,24 @@ class LInput extends LitElement {
   }
   _onInput(e) {
     this.value = e.target.value;
+    // Native `input` events are composed:true — they escape the shadow root
+    // on their own, so an outer `@input=${e => ... e.detail.value}` handler
+    // fired TWICE per keystroke: once for our CustomEvent (detail = {value})
+    // and once for the raw one that follows it (detail = 0, a UIEvent
+    // counter). The raw one arrives LAST, so every such handler ended up
+    // storing `undefined` — invisible until a page re-renders on input, at
+    // which point `.value=${state || ''}` wipes the field and typing appears
+    // to do nothing at all. Stop the native event here so exactly one event
+    // leaves this component, with the detail its consumers expect.
+    e.stopPropagation();
     this.dispatchEvent(new CustomEvent('input', {
       detail: { value: this.value }, bubbles: true, composed: true,
     }));
   }
   _onChange(e) {
+    // `change` is composed:false so it never crossed the boundary on its
+    // own, but stop it anyway: one event out, one shape, no surprises.
+    e.stopPropagation();
     this.dispatchEvent(new CustomEvent('change', {
       detail: { value: e.target.value }, bubbles: true, composed: true,
     }));

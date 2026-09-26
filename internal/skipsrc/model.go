@@ -2,8 +2,8 @@
 // databases and reconciles their disagreements into one answer.
 //
 // Why an aggregator at all: a single source covers a fraction of titles, so any
-// one of them alone leaves most episodes without a skip button. Six of them
-// together cover a lot — but they contradict each other, and the contradictions
+// one of them alone leaves most episodes without a skip button. Together they
+// cover a lot — but they contradict each other, and the contradictions
 // are not symmetric (see CoordBase below), so simply taking "the first non-empty
 // answer" produces skips that fire in the middle of a scene.
 //
@@ -51,11 +51,10 @@ const (
 // Time trust ranks the coordinate systems. Our curated entries win over anything
 // public; a source that was given the runtime wins over one that was not.
 const (
-	TrustCurated      = 400
-	TrustAnime        = 250 // Aniskip on anime: files are usually the broadcast cut, so its absolute times fit
+	TrustCurated       = 400
+	TrustAnime         = 250 // Aniskip on anime: files are usually the broadcast cut, so its absolute times fit
 	TrustDurationAware = 200
-	TrustSkipMe       = 190 // duration-aware, but observed to drift
-	TrustAbsolute     = 100
+	TrustAbsolute      = 100
 )
 
 // Segment is one skippable region, in seconds, tagged with where its numbers
@@ -67,9 +66,9 @@ type Segment struct {
 	Base      CoordBase `json:"-"`
 	Trust     int       `json:"-"`
 	Source    string    `json:"source,omitempty"`
-	Signal    float64   `json:"-"`          // 0..1 source-reported confidence
-	Confirmed bool      `json:"confirmed"`  // backed by >= MinVotes independent sources
-	Votes     int       `json:"votes"`      // how many sources agreed
+	Signal    float64   `json:"-"`         // 0..1 source-reported confidence
+	Confirmed bool      `json:"confirmed"` // backed by >= MinVotes independent sources
+	Votes     int       `json:"votes"`     // how many sources agreed
 }
 
 // normCategory maps a source's own wording onto Category.

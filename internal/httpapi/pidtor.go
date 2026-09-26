@@ -3,11 +3,13 @@ package httpapi
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"lampac-go/internal/config"
 	"lampac-go/internal/httpclient"
 	"lampac-go/internal/proxylink"
+	"lampac-go/internal/torrbalancer"
 	"lampac-go/internal/transcodesvc"
 	"maps"
 	"net/http"
@@ -219,7 +221,11 @@ func pidtorBuildStreamURL(tsHost, link string, tsid int, fn string) string {
 
 func newPidTorHandler(cfg config.Config, links *proxylink.Manager) http.HandlerFunc {
 	client := httpclient.New(10 * time.Second)
-	tsClient := httpclient.New(30 * time.Second)
+	// TorrServer API calls (add/get/rem). 20s: MatriX "add" blocks until the
+	// torrent metadata arrives (seconds for a seeded release), while a wedged
+	// backend hangs forever — the cap is what lets pidtorWithTS fail over to
+	// the next pool backend before the player gives up.
+	tsClient := httpclient.New(20 * time.Second)
 
 	return func(w http.ResponseWriter, r *http.Request) {
 		init := cfg.Online.PidTor
@@ -351,6 +357,9 @@ func pidtorFetchEntries(r *http.Request, cfg config.Config, client *http.Client,
 		if err != nil {
 			return nil
 		}
+		// Same browser UA the /api/v2.0 jacred proxy sends — jacred.stream sits
+		// behind Cloudflare and 403s tool-looking agents.
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
 		resp, err := client.Do(req)
 		if err != nil {
 			log.Warn().Err(err).Str("api", apiLabel).Str("host", base).Msg("pidtor: indexer request failed")
@@ -391,31 +400,64 @@ func pidtorFetchEntries(r *http.Request, cfg config.Config, client *http.Client,
 }
 
 // pidtorJacredChain is the historical "first non-empty answer wins" cascade:
-// local jacred (when up) → RedAPI → external JacRed.
+// local jacred (when up) → RedAPI → external JacRed. The second parser
+// ([parser] jacred_host2, the one the torrent browser already merges in) is
+// queried IN PARALLEL and its rows are merged into whatever the cascade
+// found — so a rate-limited primary (prod 2026-08-23: jac.red answered 429
+// to half the searches the minute pidtor was switched on) no longer blanks
+// the source. A jacred_host identical to RedAPI is not asked twice.
 func pidtorJacredChain(r *http.Request, cfg config.Config, init config.PidTorSource,
 	query func(apiLabel, base, apikey string) []pidtorEntry) []pidtorEntry {
+
+	var secondCh chan []pidtorEntry
+	if host2 := strings.TrimRight(strings.TrimSpace(cfg.Parser.JacRedHost2), "/"); host2 != "" &&
+		!pidtorSameIndexer(host2, init.RedAPI) && !pidtorSameIndexer(host2, cfg.Parser.JacRedHost) {
+		secondCh = make(chan []pidtorEntry, 1)
+		go func() { secondCh <- query("jacred2", host2, strings.TrimSpace(cfg.Parser.JacRedKey2)) }()
+	}
+	// merge drains the second parser (every return path goes through it) and
+	// appends its rows behind the primary's — primary wins on duplicate btih.
+	merge := func(primary []pidtorEntry) []pidtorEntry {
+		if secondCh == nil {
+			return primary
+		}
+		return pidtorMergeEntries(primary, <-secondCh)
+	}
 
 	// --- Local jacred first (0.5) --- an empty answer falls through: the
 	// local base may still be bootstrapping/parsing its first trackers.
 	if mgr := liveJacredMgr(); cfg.Parser.JacRedLocal && mgr != nil && mgr.Healthy() {
 		if entries := query("jacred-local", mgr.BaseURL(), strings.TrimSpace(cfg.Parser.JacRedKey)); len(entries) > 0 {
-			return entries
+			return merge(entries)
 		}
 	}
 
 	// --- RedAPI ---
 	if init.RedAPI != "" {
 		if entries := query("redapi", init.RedAPI, init.APIKey); len(entries) > 0 {
-			return entries
+			return merge(entries)
 		}
 	}
 
-	// --- External JacRed fallback ---
+	// --- External JacRed fallback (skipped when it IS the RedAPI host) ---
 	jacHost := strings.TrimSpace(cfg.Parser.JacRedHost)
-	if jacHost == "" {
-		return nil
+	if jacHost == "" || pidtorSameIndexer(jacHost, init.RedAPI) {
+		return merge(nil)
 	}
-	return query("jacred", jacHost, strings.TrimSpace(cfg.Parser.JacRedKey))
+	return merge(query("jacred", jacHost, strings.TrimSpace(cfg.Parser.JacRedKey)))
+}
+
+// pidtorSameIndexer reports whether two indexer base URLs point at the same
+// host (scheme/trailing-slash/case insensitive) — asking it twice only burns
+// its rate limit.
+func pidtorSameIndexer(a, b string) bool {
+	norm := func(s string) string {
+		s = strings.ToLower(strings.TrimSpace(s))
+		s = strings.TrimPrefix(strings.TrimPrefix(s, "https://"), "http://")
+		return strings.TrimRight(s, "/")
+	}
+	na, nb := norm(a), norm(b)
+	return na != "" && na == nb
 }
 
 // pidtorRutrackerEntries kicks off the native search and returns a channel with
@@ -501,7 +543,7 @@ func pidtorIndex(w http.ResponseWriter, r *http.Request, cfg config.Config, clie
 	host := hostFromRequest(r)
 	// Route playback through the transcoder (so capi/alpac accepts PidTor and incompatible codecs
 	// play anywhere). Only when both the source opt-in and the transcoding service are on.
-	transcode := init.Transcode && cfg.Transcoding.Enable
+	transcode := pidtorTranscodeFor(r, cfg)
 
 	// Cache key
 	memKey := fmt.Sprintf("pidtor:%s:%s:%s", title, originalTitle, year)
@@ -520,7 +562,16 @@ func pidtorIndex(w http.ResponseWriter, r *http.Request, cfg config.Config, clie
 	}
 
 	if len(entries) == 0 {
-		writeHTML(w, http.StatusOK, "")
+		// Canonical empty lite answer: {} for rjson (capi parses it as a valid
+		// "no content" → probeEmpty), "" for HTML. A bare "" under rjson made
+		// capi count every empty card as a SOURCE FAILURE — five in a row and
+		// the checksearch circuit breaker hid pidtor from everyone for 30s
+		// (prod 2026-08-23, the minute pidtor was re-enabled).
+		if rjson {
+			writeJSON(w, http.StatusOK, map[string]any{})
+		} else {
+			writeHTML(w, http.StatusOK, "")
+		}
 		return
 	}
 
@@ -563,7 +614,7 @@ func pidtorSerial(w http.ResponseWriter, r *http.Request, cfg config.Config, tsC
 	rjson := parseBoolParam(q.Get("rjson"))
 
 	host := hostFromRequest(r)
-	transcode := cfg.Online.PidTor.Transcode && cfg.Transcoding.Enable
+	transcode := pidtorTranscodeFor(r, cfg)
 
 	// Build tracker QS from query params
 	trQS := pidtorExtractTRFromQuery(r.URL.RawQuery)
@@ -571,11 +622,13 @@ func pidtorSerial(w http.ResponseWriter, r *http.Request, cfg config.Config, tsC
 	memKey := fmt.Sprintf("pidtor:serial:%s", hash)
 	files, ok := pidtorSerialCacheGet(memKey)
 	if !ok {
-		tsHost, tsHeaders := pidtorGetTorrServer(cfg, "", hash)
 		magnet := fmt.Sprintf("magnet:?xt=urn:btih:%s&%s", hash, trQS)
 
-		var err error
-		files, err = pidtorTSGetFiles(r.Context(), tsClient, tsHost, tsHeaders, magnet, hash)
+		_, err := pidtorWithTS(r.Context(), cfg, q.Get("account_email"), hash, func(t pidtorTSTarget) error {
+			var ferr error
+			files, ferr = pidtorTSGetFiles(r.Context(), tsClient, t.host, t.headers, magnet, hash)
+			return ferr
+		})
 		if err != nil {
 			log.Warn().Err(err).Str("hash", hash).Msg("pidtor: TorrServer get files failed")
 			w.WriteHeader(http.StatusServiceUnavailable)
@@ -664,16 +717,22 @@ func pidtorStream(w http.ResponseWriter, r *http.Request, cfg config.Config, tsC
 
 	// Determine TorrServer host and auth
 	if (len(init.Torrs) == 0) && (len(init.AuthTorrs) == 0) {
-		// Local TorrServer / TS-balancer pool (sticky by infohash)
-		tsHost, tsHeaders := pidtorGetTorrServer(cfg, accountEmail, hash)
-
-		// Add magnet and get hash
-		tsHash, err := pidtorTSAddMagnet(r.Context(), tsClient, tsHost, tsHeaders, magnet)
+		// Local TorrServer / TS-balancer pool (sticky by infohash). Add the
+		// magnet; a pool backend that fails at the transport level is
+		// quarantined and the add is retried ONCE on the next backend.
+		var tsHash string
+		t, err := pidtorWithTS(r.Context(), cfg, accountEmail, hash, func(t pidtorTSTarget) error {
+			var aerr error
+			tsHash, aerr = pidtorTSAddMagnet(r.Context(), tsClient, t.host, t.headers, magnet)
+			return aerr
+		})
 		if err != nil {
-			log.Warn().Err(err).Msg("pidtor: TorrServer add magnet failed")
+			log.Warn().Err(err).Str("hash", hash).Msg("pidtor: TorrServer add magnet failed")
 			w.WriteHeader(http.StatusServiceUnavailable)
 			return
 		}
+		tsHost, tsHeaders := t.host, t.headers
+		pidtorTrackOwn(tsHost, tsHash)
 
 		go pidtorEnforceMaxActive(tsClient, tsHost, tsHash, tsHeaders, maxActive)
 
@@ -714,6 +773,7 @@ func pidtorStream(w http.ResponseWriter, r *http.Request, cfg config.Config, tsC
 			w.WriteHeader(http.StatusServiceUnavailable)
 			return
 		}
+		pidtorTrackOwn(ts.Host, tsHash)
 
 		go pidtorEnforceMaxActive(tsClient, ts.Host, tsHash, headers, maxActive)
 
@@ -740,6 +800,7 @@ func pidtorStream(w http.ResponseWriter, r *http.Request, cfg config.Config, tsC
 			w.WriteHeader(http.StatusServiceUnavailable)
 			return
 		}
+		pidtorTrackOwn(tsHost, tsHash)
 
 		go pidtorEnforceMaxActive(tsClient, tsHost, tsHash, headers, maxActive)
 
@@ -764,6 +825,7 @@ func pidtorStream(w http.ResponseWriter, r *http.Request, cfg config.Config, tsC
 	// the btih hash. enforceMaxActive doesn't need this since we don't know
 	// our own hash deterministically — best-effort with empty keep.
 	if m := reMagnetHash.FindStringSubmatch(magnet); len(m) == 2 {
+		pidtorTrackOwn(tsHost, m[1])
 		go pidtorEnforceMaxActive(tsClient, tsHost, m[1], nil, maxActive)
 		pidtorScheduleRemove(tsClient, tsHost, m[1], nil, autoRemove)
 	}
@@ -1062,6 +1124,22 @@ func pidtorSortEntries(entries []pidtorEntry, sortMode string) {
 //  Template writers
 // ---------------------------------------------------------------------------
 
+// pidtorTranscodeFor decides whether THIS request gets the transcode wrapper.
+// A /capi drill always does when [online.pidtor] transcode is on (capi only
+// accepts media-looking URLs — see pidtorClientStreamURL). A plain Lampa
+// request gets it only with transcode_lampa: prod 2026-08-23 — Lampa web's
+// hls.js (10s manifest timeout, one XHR for start+redirect) gave up on the
+// box's cold-torrent start (~10-20s) and, lacking a caps= hint, HEVC went
+// through a full sw re-encode; the direct resolve URL (→ /proxy mkv) is what
+// Lampa players, TVs first of all, handle best.
+func pidtorTranscodeFor(r *http.Request, cfg config.Config) bool {
+	init := cfg.Online.PidTor
+	if !init.Transcode || !cfg.Transcoding.Enable {
+		return false
+	}
+	return capiResolveRequest(r) || init.TranscodeLampa
+}
+
 // pidtorClientStreamURL wraps a per-torrent resolve URL (/lite/pidtor/s...) for the client/capi.
 // With transcode on it returns a /transcoding/start.m3u8?src=... URL: this both ends in .m3u8 (so
 // capi's stream filter accepts PidTor — the bare resolve URL is otherwise dropped, hiding PidTor from
@@ -1240,6 +1318,23 @@ func pidtorWriteSeasonVoices(w http.ResponseWriter, entries []pidtorEntry, host,
 // stream → remove of one torrent all land on ONE server — and pidtor load
 // finally spreads across the pool instead of piling onto the static host.
 func pidtorGetTorrServer(cfg config.Config, accountEmail, hash string) (string, map[string]string) {
+	t, _ := pidtorPickTS(cfg, accountEmail, hash, nil)
+	return t.host, t.headers
+}
+
+// pidtorTSTarget is one resolved TorrServer endpoint for a pidtor infohash.
+// backend is set only for TS-balancer pool picks (the failover/quarantine
+// handle); static config / torrs lists / in-process leave it nil.
+type pidtorTSTarget struct {
+	host    string
+	headers map[string]string
+	backend *torrbalancer.Backend
+}
+
+// pidtorPickTS resolves the TorrServer for hash. exclude lists pool backend
+// IDs already tried (failover); ok=false means the pool is active but every
+// allowed backend is excluded — there is nowhere left to retry.
+func pidtorPickTS(cfg config.Config, accountEmail, hash string, exclude map[string]bool) (pidtorTSTarget, bool) {
 	init := cfg.Online.PidTor
 	ts := cfg.TorrServer
 
@@ -1248,7 +1343,7 @@ func pidtorGetTorrServer(cfg config.Config, accountEmail, hash string) (string, 
 		t := init.AuthTorrs[0]
 		login := strings.ReplaceAll(t.Login, "{account_email}", accountEmail)
 		headers := pidtorBuildAuthHeaders(login, t.Password, t.Headers)
-		return t.Host, headers
+		return pidtorTSTarget{host: t.Host, headers: headers}, true
 	}
 
 	if len(init.Torrs) > 0 {
@@ -1256,24 +1351,31 @@ func pidtorGetTorrServer(cfg config.Config, accountEmail, hash string) (string, 
 		if init.BaseAuth != nil && init.BaseAuth.Enable {
 			login := strings.ReplaceAll(init.BaseAuth.Login, "{account_email}", accountEmail)
 			headers := pidtorBuildAuthHeaders(login, init.BaseAuth.Password, init.BaseAuth.Headers)
-			return host, headers
+			return pidtorTSTarget{host: host, headers: headers}, true
 		}
-		return host, nil
+		return pidtorTSTarget{host: host}, true
 	}
 
 	// TS-balancer pool (nil when in-process / pool empty / disabled).
-	if b := tsPoolBackendFor(hash); b != nil {
+	var allow func(string) bool
+	if len(exclude) > 0 {
+		allow = func(id string) bool { return !exclude[id] }
+	}
+	if b := tsPoolBackendForAllow(hash, allow); b != nil {
 		host, authHdr := b.Target()
 		headers := map[string]string{}
 		if authHdr != "" {
 			headers["Authorization"] = authHdr
 		}
-		return strings.TrimRight(host, "/"), headers
+		return pidtorTSTarget{host: strings.TrimRight(host, "/"), headers: headers, backend: b}, true
+	} else if len(exclude) > 0 && tsPoolBackendFor(hash) != nil {
+		// Pool is active, but the excluded set covers every eligible backend.
+		return pidtorTSTarget{}, false
 	}
 
 	// In-process torrs: routes are on lampac-go itself at /ts/*.
 	if torrsIsInProcess() {
-		return "http://127.0.0.1" + cfg.Server.Addr + "/ts", map[string]string{"X-Lampac-Go": "1"}
+		return pidtorTSTarget{host: "http://127.0.0.1" + cfg.Server.Addr + "/ts", headers: map[string]string{"X-Lampac-Go": "1"}}, true
 	}
 
 	// External TorrServer
@@ -1283,10 +1385,59 @@ func pidtorGetTorrServer(cfg config.Config, accountEmail, hash string) (string, 
 	}
 
 	if ts.Password != "" {
-		return tsURL, pidtorBuildAuthHeaders(ts.Login, ts.Password, nil)
+		return pidtorTSTarget{host: tsURL, headers: pidtorBuildAuthHeaders(ts.Login, ts.Password, nil)}, true
 	}
 
-	return tsURL, nil
+	return pidtorTSTarget{host: tsURL}, true
+}
+
+// pidtorIsTransportErr tells a backend that did not answer (dial/reset/
+// timeout — every http.Client.Do failure is a *url.Error) from one that
+// answered something we could not use (401, odd JSON): only the former is a
+// reason to quarantine it and fail over, exactly as the /ts proxy does.
+func pidtorIsTransportErr(err error) bool {
+	var ue *url.Error
+	return errors.As(err, &ue)
+}
+
+// pidtorWithTS runs op against the sticky TorrServer for hash. When the pick
+// is a TS-balancer pool backend and op fails at the transport level (in
+// practice a half-wedged TorrServer: /echo alive, /torrents hanging), the
+// backend is quarantined — same handling as the /ts proxy's
+// torrentsAPIWithFailover — and op is retried ONCE on the next HRW backend,
+// so a sick server doesn't kill the viewer's "открываем…". A viewer who
+// went away (context canceled) is not the backend's fault. Returns the
+// target op succeeded on.
+func pidtorWithTS(ctx context.Context, cfg config.Config, accountEmail, hash string,
+	op func(t pidtorTSTarget) error) (pidtorTSTarget, error) {
+
+	tried := map[string]bool{}
+	var lastErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		t, ok := pidtorPickTS(cfg, accountEmail, hash, tried)
+		if !ok {
+			break
+		}
+		err := op(t)
+		if err == nil {
+			return t, nil
+		}
+		lastErr = err
+		if t.backend == nil || ctx.Err() != nil || !pidtorIsTransportErr(err) {
+			break
+		}
+		tried[t.backend.ID] = true
+		if pool := tsBalancerPoolRef; pool != nil {
+			pool.MarkFailed(t.backend)
+			pool.QuarantineWedged(t.backend, "pidtor: torrents API не ответил: "+err.Error())
+		}
+		log.Warn().Err(err).Str("backend", t.host).Str("hash", hash).
+			Msg("pidtor: TorrServer backend failed — quarantined, retrying on another pool backend")
+	}
+	if lastErr == nil {
+		lastErr = errors.New("no TorrServer backend available")
+	}
+	return pidtorTSTarget{}, lastErr
 }
 
 func pidtorBuildAuthHeaders(login, password string, extra map[string]string) map[string]string {
@@ -1498,6 +1649,7 @@ func pidtorScheduleRemove(client *http.Client, tsHost, tsHash string, headers ma
 		pidtorPendingMu.Unlock()
 
 		pidtorRemoveTorrent(client, tsHost, tsHash, hdrCopy)
+		pidtorUntrackOwn(tsHost, tsHash)
 		log.Debug().Str("hash", tsHash).Msg("pidtor: auto-removed torrent after timeout")
 	})
 	pidtorPendingMu.Unlock()
@@ -1552,13 +1704,88 @@ func pidtorListTorrents(client *http.Client, tsHost string, headers map[string]s
 // no more than maxActive torrents remain after the new one is added. Skips the
 // torrent currently being added (keepHash). Best-effort; logs and returns on
 // any error so playback isn't blocked by cleanup glitches.
+// pidtorOwn remembers which torrents pidtor itself added on which TorrServer
+// host, so max_active_torrents only ever evicts pidtor's OWN torrents. The
+// TorrServer is shared (TS-balancer pool, the web/Android torrent browser,
+// the transcode box all add torrents there) — prod 2026-08-23: every pidtor
+// play dropped the two oldest torrents on the backend, whoever was watching
+// them. Entries expire after pidtorOwnTTL (auto-remove fires long before).
+var pidtorOwn = struct {
+	sync.Mutex
+	m map[string]map[string]time.Time // host → hash → added
+}{m: map[string]map[string]time.Time{}}
+
+const pidtorOwnTTL = 24 * time.Hour
+
+func pidtorOwnKey(tsHost, hash string) (string, string) {
+	return strings.TrimRight(strings.TrimSpace(tsHost), "/"), strings.ToLower(strings.TrimSpace(hash))
+}
+
+// pidtorTrackOwn records that pidtor added hash on tsHost.
+func pidtorTrackOwn(tsHost, hash string) {
+	host, h := pidtorOwnKey(tsHost, hash)
+	if host == "" || h == "" {
+		return
+	}
+	now := time.Now()
+	pidtorOwn.Lock()
+	defer pidtorOwn.Unlock()
+	hm := pidtorOwn.m[host]
+	if hm == nil {
+		hm = map[string]time.Time{}
+		pidtorOwn.m[host] = hm
+	}
+	hm[h] = now
+	// Opportunistic expiry so the map stays bounded.
+	for k, t := range hm {
+		if now.Sub(t) > pidtorOwnTTL {
+			delete(hm, k)
+		}
+	}
+}
+
+// pidtorUntrackOwn forgets hash on tsHost (after a remove).
+func pidtorUntrackOwn(tsHost, hash string) {
+	host, h := pidtorOwnKey(tsHost, hash)
+	pidtorOwn.Lock()
+	if hm := pidtorOwn.m[host]; hm != nil {
+		delete(hm, h)
+		if len(hm) == 0 {
+			delete(pidtorOwn.m, host)
+		}
+	}
+	pidtorOwn.Unlock()
+}
+
+// pidtorIsOwn reports whether pidtor added hash on tsHost (and it hasn't expired).
+func pidtorIsOwn(tsHost, hash string) bool {
+	host, h := pidtorOwnKey(tsHost, hash)
+	pidtorOwn.Lock()
+	defer pidtorOwn.Unlock()
+	if hm := pidtorOwn.m[host]; hm != nil {
+		if t, ok := hm[h]; ok && time.Since(t) <= pidtorOwnTTL {
+			return true
+		}
+	}
+	return false
+}
+
+// pidtorEnforceMaxActive keeps at most maxActive of pidtor's OWN torrents on
+// tsHost (keepHash always survives): oldest-first eviction among the hashes
+// pidtor added itself — never a torrent somebody else put on the shared server.
 func pidtorEnforceMaxActive(client *http.Client, tsHost, keepHash string, headers map[string]string, maxActive int) {
 	if maxActive <= 0 {
 		return
 	}
-	entries, err := pidtorListTorrents(client, tsHost, headers)
-	if err != nil || len(entries) == 0 {
+	all, err := pidtorListTorrents(client, tsHost, headers)
+	if err != nil || len(all) == 0 {
 		return
+	}
+	entries := make([]pidtorTSEntry, 0, len(all))
+	for _, e := range all {
+		if pidtorIsOwn(tsHost, e.Hash) {
+			entries = append(entries, e)
+		}
 	}
 	keep := strings.ToLower(strings.TrimSpace(keepHash))
 	// Count torrents excluding keepHash, drop oldest until count <= maxActive-1.
@@ -1590,6 +1817,7 @@ func pidtorEnforceMaxActive(client *http.Client, tsHost, keepHash string, header
 	}
 	for _, r := range toRemove {
 		pidtorRemoveTorrent(client, tsHost, r.hash, headers)
-		log.Debug().Str("host", tsHost).Str("hash", r.hash).Int("max", maxActive).Msg("pidtor: dropped oldest torrent (max_active_torrents)")
+		pidtorUntrackOwn(tsHost, r.hash)
+		log.Debug().Str("host", tsHost).Str("hash", r.hash).Int("max", maxActive).Msg("pidtor: dropped oldest own torrent (max_active_torrents)")
 	}
 }

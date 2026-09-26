@@ -38,13 +38,29 @@ func md5Hash(s string) [16]byte {
 type YoutubeChecker struct {
 	ytdlpPath      string
 	ffmpegPath     string
-	cookiePath     string // master cookies.txt — read-only for us, never handed to yt-dlp
-	cookieWorkPath string // disposable copy actually passed to --cookies (see ensureCookieWork)
-	jsRuntime      string // "node", "deno", or "" (auto)
-	pluginDirs     string // comma-separated dirs for yt-dlp --plugin-dirs (pip plugin locations)
-	proxyAddr      string // SOCKS5 proxy address for yt-dlp extraction (AntiDPI or VLESS)
-	vlessProxyAddr string // VLESS SOCKS5 proxy for CDN stream fallback (encrypted tunnel bypasses DPI)
-	fetchPotNever  bool   // [youtube] fetch_pot="never" — запретить bgutil PO Token (см. config)
+	cookiePath     string  // master cookies.txt — read-only for us, never handed to yt-dlp
+	cookieWorkPath string  // disposable copy actually passed to --cookies (see ensureCookieWork)
+	jsRuntime      string  // "node", "deno", or "" (auto)
+	pluginDirs     string  // comma-separated dirs for yt-dlp --plugin-dirs (pip plugin locations)
+	proxyAddr      string  // SOCKS5 proxy address for yt-dlp extraction (AntiDPI or VLESS)
+	vlessProxyAddr string  // VLESS SOCKS5 proxy for CDN stream fallback (encrypted tunnel bypasses DPI)
+	fetchPotNever  bool    // [youtube] fetch_pot="never" — запретить bgutil PO Token (см. config)
+	hlsMinDuration float64 // [youtube] hls_min_duration — с какой длительности отдавать HLS вместо склейки; <0 — никогда
+	// potReady — POT-провайдер реально доступен yt-dlp: найден через pip
+	// (pluginDirs) ЛИБО лежит в каталоге, куда yt-dlp смотрит сам. Раньше эту
+	// роль играл непустой pluginDirs, из-за чего глобально установленный
+	// провайдер оставался невостребованным.
+	potReady bool
+	// sabrURL — база sabr-сервиса ([youtube] sabr_url, обычно http://127.0.0.1:4417).
+	// Пусто = выключено, работает только прежний путь через googlevideo-ссылки.
+	sabrURL string
+	// parChunks — сколько диапазонов качать одновременно ([youtube] parallel_chunks).
+	parChunks int
+	// maxAutoHeight — потолок КАЧЕСТВА ПО УМОЛЧАНИЮ ([youtube] max_auto_height).
+	maxAutoHeight int
+	// SponsorBlock: пропуск спонсорских вставок ([youtube] sponsorblock*).
+	sbEnable     bool
+	sbCategories []string
 	// Авто-фейловер YouTube-выхода: [youtube] proxy = "a:1,b:2,c:3" — список SOCKS5
 	// кандидатов. ytProxyActive хранит текущий живой (atomic — читается на hot-path
 	// экстракции/скачивания), health-горутина пере-выбирает его, когда выход умирает
@@ -53,9 +69,12 @@ type YoutubeChecker struct {
 	ytProxyCandidates []string
 	ytProxyActive     atomic.Pointer[string]
 	extractFail       atomic.Int32 // подряд «all strategies failed» → триггер ротации выхода
-	proxyRotating     atomic.Bool  // один rotate за раз
-	repoRoot          string
-	ytdlpMu           sync.Mutex
+	// flatClientIdx — индекс в ytFlatClients для поиска/трендов/плейлистов.
+	// Липкий: сломанный клиент стоит одного провального вызова на процесс.
+	flatClientIdx atomic.Int32
+	proxyRotating atomic.Bool // один rotate за раз
+	repoRoot      string
+	ytdlpMu       sync.Mutex
 	// ytdlpSem caps concurrent yt-dlp invocations across all VIDs. Without
 	// it, opening "Subscriptions" in Lampa (12 trailers × N strategies)
 	// floods YouTube with parallel requests and triggers anti-bot/429.
@@ -74,10 +93,14 @@ type YoutubeChecker struct {
 	muxCache   map[string]*ytMuxEntry // cacheKey (videoURL\x00audioURL) → mux entry
 	muxKeys    map[string]string      // hash key → cacheKey
 	muxVideoID map[string]string      // hash key → videoID (for POT-flap URL re-mint mid-download)
-	muxVCodecs map[string]string      // hash key → video codec (avc1, vp09, av01)
-	muxProxy   map[string]bool        // hash key → true if URL extracted via proxy (ffmpeg needs proxy too)
-	muxTransA  map[string]bool        // hash key → true if audio must be transcoded to AAC for HLS/TS
-	muxFMP4    map[string]bool        // hash key → true for VP9/AV1 (fMP4 segments)
+	// muxKeyAt records when each hash key was registered. The registry deliberately OUTLIVES the
+	// mux directory so an expired mux can be restarted instead of 404ing (see muxCleanupOnce), so
+	// it needs its own, much longer bound — that is what pruneMuxKeys uses.
+	muxKeyAt   map[string]time.Time
+	muxVCodecs map[string]string // hash key → video codec (avc1, vp09, av01)
+	muxProxy   map[string]bool   // hash key → true if URL extracted via proxy (ffmpeg needs proxy too)
+	muxTransA  map[string]bool   // hash key → true if audio must be transcoded to AAC for HLS/TS
+	muxFMP4    map[string]bool   // hash key → true for VP9/AV1 (fMP4 segments)
 
 	// Master playlist storage: maps masterKey → list of HLS variants.
 	// Used by /lite/youtube/mux/master.m3u8 to return a multi-bitrate master,
@@ -126,6 +149,20 @@ type ytMuxEntry struct {
 	// ffmpeg then exits 0 on pipe EOF, so without this flag a cut-off mux is
 	// indistinguishable from a completed one.
 	truncated atomic.Bool
+	// attempts counts how many times this key has been (re)muxed after a failure, and failedAt
+	// records when the last attempt died — together they bound the retry.
+	attempts int
+	failedAt time.Time
+}
+
+// finished reports whether the mux job has stopped running.
+func (e *ytMuxEntry) finished() bool {
+	select {
+	case <-e.Done:
+		return true
+	default:
+		return false
+	}
 }
 
 // ytMasterEntry holds the list of HLS variants for a master playlist.
@@ -142,13 +179,27 @@ type ytMasterVariant struct {
 	Bandwidth  int    // bits/sec for EXT-X-STREAM-INF
 	Codecs     string // "avc1.640028,mp4a.40.2" — informational; ok to leave empty
 	VariantURL string // full URL to /lite/youtube/mux/index.m3u8?key=...
+	// AudioURL — отдельная аудиодорожка для варианта БЕЗ звука (режим HLS-only:
+	// YouTube отдаёт там video-only плейлист, а звук — вторым плейлистом). Мастер
+	// связывает их группой EXT-X-MEDIA, и плеер получает одну ссылку с обеими
+	// дорожками. Отдавать звук отдельным полем ответа оказалось недостаточно —
+	// клиент его не подхватывал, зритель смотрел немое видео.
+	AudioURL string
+	// VideoRange — «PQ»/«HLG» для HDR-вариантов, пусто или «SDR» для обычных.
+	VideoRange string
 }
 
 const (
-	ytMuxTTL        = 30 * time.Minute // reduced from 4h to limit /tmp disk usage
-	ytMuxMaxSize    = 10               // reduced from 20 to limit /tmp disk usage
-	ytMuxMaxTimeout = 14 * time.Hour   // kill ffmpeg if it runs longer than this (allows 12h+ videos)
-	ytMaxDuration   = 43200            // refuse to mux videos longer than 12 hours (seconds)
+	ytMuxTTL = 30 * time.Minute // reduced from 4h to limit /tmp disk usage
+	// ytMuxMaxSize — потолок ОДНОВРЕМЕННЫХ mux-задач. Упирается не в процессор,
+	// а в /tmp: одна задача с 4K-видео весит до 2.5 ГБ, так что 14 задач это уже
+	// ~35 ГБ в худшем случае. Поднято с 10 после 86 отказов «mux limit reached»
+	// за сутки; выше не идём, пока лимит не станет считаться по объёму, а не по
+	// числу задач.
+	ytMuxMaxSize     = 14
+	ytMuxMaxTimeout  = 14 * time.Hour // kill ffmpeg if it runs longer than this (allows 12h+ videos)
+	ytMaxDuration    = 43200          // refuse to mux videos longer than 12 hours (seconds)
+	ytHLSMinDuration = 90.0           // с этой длительности (сек) длинный ролик идёт HLS-лестницей, не склейкой
 	// ytMuxMaxDirBytes stops a mux whose /tmp dir grows past this. ytMaxDuration
 	// guards VODs by duration, but LIVESTREAMS report no duration and slip through:
 	// with -hls_list_size 0 they append segments for the whole 14h timeout (prod saw
@@ -258,7 +309,34 @@ type ytFormatCache struct {
 	Formats   []ytFormat
 	Duration  float64
 	Expires   time.Time
-	UsedProxy bool // true if formats were extracted via SOCKS5 proxy
+	UsedProxy bool      // true if formats were extracted via SOCKS5 proxy
+	Born      time.Time // когда запись создана — по ней ограничиваем частоту refresh
+}
+
+// hlsOnlyFormats — по этому набору форматов buildQualityMap отдаст зрителю ГОЛЫЙ
+// HLS, то есть ссылки на manifest.googlevideo.com. Условие повторяет ДВА решения
+// buildQualityMap, и оба обязательны:
+//
+//  1. хоть один АУДИО-формат пришёл по m3u8 (клиент iOS/tv) — тогда там же, выше,
+//     из списка выбрасываются ВСЕ https-форматы разом, и прогрессивное видео в
+//     ответе уже не спасает;
+//  2. среди видео не осталось ни одного прогрессивного.
+//
+// Считать признак по всему списку («есть хоть один https») было бы ошибкой: у
+// ролика из инцидента 01.09 прогрессивные форматы В СПИСКЕ БЫЛИ, но одно HLS-аудио
+// увело выдачу в HLS-режим — проверка не сработала бы ни разу.
+func hlsOnlyFormats(formats []ytFormat) bool {
+	for _, f := range formats {
+		if f.isAudioOnly() && f.Protocol == "m3u8_native" && f.URL != "" {
+			return true
+		}
+	}
+	for _, f := range formats {
+		if f.Protocol == "https" && f.URL != "" && !f.isAudioOnly() {
+			return false
+		}
+	}
+	return true
 }
 
 // ytFormat represents a single stream from yt-dlp -j output.
@@ -275,10 +353,94 @@ type ytFormat struct {
 	VBR      float64 `json:"vbr"`
 	FileSize int64   `json:"filesize"`
 	Protocol string  `json:"protocol"`
+	// DynamicRange — «SDR», «HDR10», «HLG» и т.п. из yt-dlp. YouTube отдаёт HDR
+	// только в VP9 profile 2 и AV1 с 10 битами; avc1 всегда SDR.
+	DynamicRange string `json:"dynamic_range"`
 	// DASH byte ranges (yt-dlp adaptive YouTube formats) — needed to build a valid on-demand
 	// MPD SegmentBase so MSE players can index the fragmented MP4. Absent on progressive formats.
 	IndexRange *ytByteRange `json:"index_range"`
 	InitRange  *ytByteRange `json:"init_range"`
+
+	// Multi-language audio. YouTube ships dubbed tracks alongside the original,
+	// and yt-dlp exposes each as its own audio-only format. Measured on prod
+	// 2026-09-01, one MrBeast video carried 44 distinct tracks:
+	//   id=140-18 lang=ru pref=-1 note="Russian, medium"
+	//   id=140-21 lang=en pref=10 note="English original (default), medium"
+	// The original is the one yt-dlp scores at language_preference 10 and labels
+	// "original (default)"; every dub sits at -1.
+	Language           string `json:"language"`
+	LanguagePreference int    `json:"language_preference"`
+	FormatNote         string `json:"format_note"`
+}
+
+// isOriginalAudio reports whether this is the track the uploader actually
+// recorded, as opposed to one of YouTube's dubs.
+func (f ytFormat) isOriginalAudio() bool {
+	if f.LanguagePreference >= 10 {
+		return true
+	}
+	return strings.Contains(strings.ToLower(f.FormatNote), "original")
+}
+
+// isHDR reports whether the format carries a high dynamic range picture.
+//
+// Полагаться на один dynamic_range нельзя: у HLS-форматов (режим HLS-only) yt-dlp
+// его НЕ проставляет. Из-за этого HDR-поток не опознавался, а выбор внутри высоты
+// идёт по битрейту — у HDR он выше, и он молча выигрывал, уезжая к зрителю под
+// меткой обычного «2160p». В браузере без 10-битного декодера это чёрный экран.
+// Поэтому HDR определяется ещё и по строке кодека.
+func (f ytFormat) isHDR() bool {
+	// avc1 у YouTube всегда SDR, что бы ни говорили остальные поля.
+	if strings.HasPrefix(f.VCodec, "avc1") {
+		return false
+	}
+	dr := strings.ToUpper(strings.TrimSpace(f.DynamicRange))
+	if dr != "" && dr != "SDR" && dr != "NONE" {
+		return true
+	}
+	return hdrByCodec(f.VCodec)
+}
+
+// hdrByCodec распознаёт HDR по RFC 6381-строке кодека.
+//
+//	vp9.2 / vp09.02…  — VP9 profile 2 (10 бит). YouTube отдаёт этот профиль только
+//	                    под HDR, так что профиля достаточно.
+//	av01.P.LLT.DD.M.CCC.cp.tc.mc.F — у AV1 десять бит сами по себе HDR не означают, но
+//	                    поле передаточной характеристики означает: 16 = PQ, 18 = HLG.
+//	                    ВНИМАНИЕ на порядок полей (RFC 6381 §3.4): после CCC идут СНАЧАЛА
+//	                    цветовые примарии (cp), и только потом передаточная (tc). Здесь
+//	                    проверялся индекс 6 — то есть примарии: у HDR-потока там 09 (BT.2020),
+//	                    ни 16, ни 18 не бывает, поэтому ветка не срабатывала НИКОГДА и AV1 HDR
+//	                    опознавался только по dynamic_range от yt-dlp — которого в режиме
+//	                    HLS-only как раз и нет. Правильный индекс — 7.
+func hdrByCodec(vcodec string) bool {
+	c := strings.ToLower(strings.TrimSpace(vcodec))
+	if strings.HasPrefix(c, "vp9.2") || strings.HasPrefix(c, "vp09.02") {
+		return true
+	}
+	if strings.HasPrefix(c, "av01") {
+		p := strings.Split(c, ".")
+		if len(p) >= 8 {
+			switch p[7] {
+			case "16", "18":
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// videoRangeOf returns the HLS VIDEO-RANGE attribute value for a format.
+// Плееры по нему решают, включать ли HDR-конвейер; без него поток считается SDR
+// даже когда в CODECS стоит av01…10 с bt2020.
+func videoRangeOf(f ytFormat) string {
+	if !f.isHDR() {
+		return "SDR"
+	}
+	if strings.Contains(strings.ToUpper(f.DynamicRange), "HLG") {
+		return "HLG"
+	}
+	return "PQ" // HDR10 и HDR10+ передаются как PQ
 }
 
 // ytByteRange is a yt-dlp {start,end} byte range. yt-dlp has emitted these as JSON numbers in some
@@ -364,9 +526,18 @@ type ytDumpJSON struct {
 }
 
 const (
-	ytCacheTTL     = 4 * time.Hour
-	ytCacheMaxSize = 500
-	ytSearchLimit  = 10
+	ytCacheTTL = 4 * time.Hour
+	// ytDegradedCacheTTL — срок жизни ДЕГРАДИРОВАННОГО результата экстракции: в нём
+	// нет ни одного прогрессивного формата, только HLS (см. hlsOnlyFormats). Такой
+	// ответ означает, что основной CDN нас не пустил, и всё качество держится на
+	// ссылках manifest.googlevideo.com. Они мрут заметно раньше собственного expire:
+	// инцидент 01.09 — до срока оставалось 297 минут, а ссылка уже отдавала 404 при
+	// запросе С САМОГО сервера, чей IP в неё и вшит. Держать такой ответ 4 часа
+	// нельзя: пока он лежит в кеше, каждый повтор клиента получает те же мёртвые
+	// ссылки за 65 мс, и восстановиться ролик не может в принципе.
+	ytDegradedCacheTTL = 4 * time.Minute
+	ytCacheMaxSize     = 500
+	ytSearchLimit      = 10
 	// stratCooldownTTL — клиент не вернул форматов (DRM-эксперимент, POT-стена,
 	// ИЛИ выход дал сбой у всех клиентов сразу). Раньше было 15м — но проблема чаще
 	// в выходе, чем в самом клиенте, и 15-минутный блэкаут при живом ютубе бил больно
@@ -409,7 +580,36 @@ func SharedYoutubeChecker(cfg config.Config) *YoutubeChecker {
 	return ytCheckerInst
 }
 
+// ytLinkHost — публичный адрес, от которого нода строит ВСЕ свои YouTube-ссылки
+// (mux/master/proxy/feed). Форвардер main нарочно шлёт ноде X-Forwarded-Host
+// primary, чтобы /proxy-обёртки других источников вели на main (он сам решает,
+// кому отдавать). Но mux- и master-плейлисты YouTube живут в памяти добывшего
+// процесса, а /proxy-ссылки на googlevideo привязаны к его IP — main их отдать
+// не может. Поэтому нода с [cluster] edge_url подписывает ссылки своим адресом,
+// и зритель идёт на неё напрямую.
+var ytLinkHost string
+
+func ytHost(r *http.Request) string {
+	if ytLinkHost != "" {
+		return ytLinkHost
+	}
+	return hostFromRequest(r)
+}
+
+func ytStreamHost(r *http.Request) string {
+	if ytLinkHost != "" {
+		return ytLinkHost
+	}
+	return streamHostFromRequest(r)
+}
+
 func NewYoutubeChecker(cfg config.Config) *YoutubeChecker {
+	if cfg.Cluster.Enable && strings.EqualFold(strings.TrimSpace(cfg.Cluster.Mode), "node") {
+		if eu := strings.TrimRight(strings.TrimSpace(cfg.Cluster.EdgeURL), "/"); eu != "" {
+			ytLinkHost = eu
+			log.Info().Str("edge_url", eu).Msg("youtube: node mode — links signed with edge_url")
+		}
+	}
 	// Apply configurable extract timeout.
 	if cfg.YouTube.ExtractTimeout > 0 {
 		ytExecTimeout = time.Duration(cfg.YouTube.ExtractTimeout) * time.Second
@@ -421,6 +621,7 @@ func NewYoutubeChecker(cfg config.Config) *YoutubeChecker {
 		muxCache:      make(map[string]*ytMuxEntry),
 		muxKeys:       make(map[string]string),
 		muxVideoID:    make(map[string]string),
+		muxKeyAt:      make(map[string]time.Time),
 		muxVCodecs:    make(map[string]string),
 		muxProxy:      make(map[string]bool),
 		muxTransA:     make(map[string]bool),
@@ -496,6 +697,13 @@ func NewYoutubeChecker(cfg config.Config) *YoutubeChecker {
 	if y.pluginDirs != "" {
 		log.Info().Str("dirs", y.pluginDirs).Msg("youtube: yt-dlp plugin dirs detected")
 	}
+	y.potReady = y.pluginDirs != "" || potProviderInstalled()
+	if y.potReady {
+		log.Info().Bool("explicit_dirs", y.pluginDirs != "").
+			Msg("youtube: PO Token provider available")
+	} else {
+		log.Warn().Msg("youtube: PO Token provider NOT found — длинные видео будут резаться грейс-окном CDN")
+	}
 
 	// Proxy selection for yt-dlp/ffmpeg:
 	// [youtube] proxy = "auto" (default) | "none" | "antidpi" | "vless" | "<host:port>"
@@ -513,8 +721,23 @@ func NewYoutubeChecker(cfg config.Config) *YoutubeChecker {
 	// на любой Range) — жёсткий fetch_pot=never, спасавший 04.08, теперь сам ломает длинные
 	// видео. Дефолт «auto»: bgutil-плагин решает сам; проба ловит отравленные варианты.
 	y.fetchPotNever = strings.EqualFold(strings.TrimSpace(cfg.YouTube.FetchPot), "never")
+	y.hlsMinDuration = ytHLSMinDuration
+	if cfg.YouTube.HLSMinDuration != 0 {
+		y.hlsMinDuration = float64(cfg.YouTube.HLSMinDuration)
+	}
 	if y.fetchPotNever {
 		log.Info().Msg("youtube: PO Token disabled by config ([youtube] fetch_pot = \"never\")")
+	}
+	y.parChunks = cfg.YouTube.ParallelChunks
+	y.maxAutoHeight = cfg.YouTube.MaxAutoHeight
+	y.sbEnable = cfg.YouTube.SponsorBlockEnabled()
+	y.sbCategories = cfg.YouTube.SponsorBlockCategories
+	if y.sbEnable {
+		log.Info().Strs("категории", y.sponsorCategories()).Msg("youtube: SponsorBlock включён")
+	}
+	y.sabrURL = strings.TrimRight(strings.TrimSpace(cfg.YouTube.SabrURL), "/")
+	if y.sabrURL != "" {
+		log.Info().Str("sabr", y.sabrURL).Msg("youtube: видео качаем по SABR (обычные ссылки — только запасной путь)")
 	}
 	// Явный адрес или СПИСОК кандидатов через запятую ("a:1,b:2,c:3") — авто-фейловер.
 	var cands []string
@@ -867,6 +1090,57 @@ func detectYtdlpPluginDirs() string {
 	return ""
 }
 
+// ytdlpDefaultPluginPaths — места, куда yt-dlp заглядывает за плагинами САМ.
+// Плагин, установленный сюда (а не через pip), детектом выше не находится,
+// потому что тот опрашивает только pip. Раньше это молча выключало POT: путь
+// пустой → стратегия с POT не поднималась, хотя провайдер работал.
+func ytdlpDefaultPluginPaths() []string {
+	paths := []string{"/etc/yt-dlp/plugins", "/etc/yt-dlp-plugins"}
+	if home, _ := os.UserHomeDir(); home != "" {
+		paths = append(paths,
+			filepath.Join(home, ".config", "yt-dlp", "plugins"),
+			filepath.Join(home, ".yt-dlp", "plugins"),
+		)
+	}
+	return paths
+}
+
+// potProviderInstalled reports whether a PO Token provider is reachable by
+// yt-dlp WITHOUT an explicit --plugin-dirs. Отдельно от pluginDirs намеренно:
+// «провайдер есть» и «нужно передать путь» — разные вопросы, и путать их
+// нельзя. Передавать --plugin-dirs, когда плагин лежит в дефолтном каталоге,
+// даже вредно: флаг ЗАМЕНЯЕТ список каталогов, и yt-dlp перестаёт видеть то,
+// что нашёл бы сам.
+func potProviderInstalled() bool {
+	for _, base := range ytdlpDefaultPluginPaths() {
+		// Каталог плагинов бывает вложен ещё на уровень (yt_dlp_plugins/yt_dlp_plugins).
+		for _, probe := range []string{base, filepath.Join(base, "yt_dlp_plugins")} {
+			entries, err := os.ReadDir(probe)
+			if err != nil {
+				continue
+			}
+			for _, e := range entries {
+				if strings.Contains(strings.ToLower(e.Name()), "yt_dlp_plugins") ||
+					strings.Contains(strings.ToLower(e.Name()), "bgutil") {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// appendPluginDirs adds --plugin-dirs when the POT provider was found through
+// pip. Каталог из pip передаём ЯВНО (standalone-бинарь туда не смотрит), но
+// вместе с "default": флаг ЗАМЕНЯЕТ список каталогов, и без этого yt-dlp
+// перестал бы видеть плагины, установленные в свой стандартный путь.
+func (y *YoutubeChecker) appendPluginDirs(args []string) []string {
+	if y.fetchPotNever || y.pluginDirs == "" {
+		return args
+	}
+	return append(args, "--plugin-dirs", "default", "--plugin-dirs", y.pluginDirs)
+}
+
 func (y *YoutubeChecker) baseArgs() []string {
 	var args []string
 	// История POT — два разворота на 180°:
@@ -877,9 +1151,7 @@ func (y *YoutubeChecker) baseArgs() []string {
 	//   видео умирали на середине при зелёной 1-КБ пробе. С плагином URL качается целиком
 	//   (проверено ranged-тестами за окном). Отравленные комбинации отсекает двухфазная
 	//   probeStreamURL. Выключатель на случай следующего разворота: [youtube] fetch_pot="never".
-	if y.pluginDirs != "" && !y.fetchPotNever {
-		args = append(args, "--plugin-dirs", y.pluginDirs)
-	}
+	args = y.appendPluginDirs(args)
 	if y.jsRuntime != "" {
 		args = append(args, "--js-runtimes", y.jsRuntime)
 	}
@@ -889,12 +1161,81 @@ func (y *YoutubeChecker) baseArgs() []string {
 	return args
 }
 
-// cookieArgs returns yt-dlp CLI flags for search requests (uses TV client + proxy fallback).
+// ytFlatClients is the client chain for flat-playlist calls (search, trending,
+// channel pages). "tv" stays first because it gives the richest listing, but it
+// is also the one client that hard-requires a COMPLETE cookie jar: once the jar
+// degrades it answers «The page needs to be reloaded» for every request, and
+// with no fallback that took search and the whole trending feed down with it.
+// Measured on prod 2026-09-01, same three videos: tv 0/3, mweb 3/3,
+// tv_embedded 3/3 — while playback stayed healthy, because the streaming path
+// (runExtractDetailed) already picks its client dynamically.
+var ytFlatClients = []string{"tv", "mweb", "tv_embedded"}
+
+// cookieArgs returns yt-dlp CLI flags for search requests, using whichever
+// client last worked (see flatClient).
 func (y *YoutubeChecker) cookieArgs() []string {
+	return y.cookieArgsFor(y.flatClient())
+}
+
+func (y *YoutubeChecker) cookieArgsFor(client string) []string {
 	args := y.baseArgs()
-	// TV client gives the best format variety and doesn't need cookies.
-	args = append(args, "--extractor-args", "youtube:player_client=tv")
+	args = append(args, "--extractor-args", "youtube:player_client="+client)
 	return args
+}
+
+// flatClient is the currently preferred flat-playlist client. It is sticky: once
+// a client fails we move on and stay there, so a broken "tv" costs one failed
+// call per process rather than one per request.
+func (y *YoutubeChecker) flatClient() string {
+	i := int(y.flatClientIdx.Load())
+	if i < 0 || i >= len(ytFlatClients) {
+		return ytFlatClients[0]
+	}
+	return ytFlatClients[i]
+}
+
+// demoteFlatClient advances to the next candidate after `failed` lost a call.
+// It compares against the current value so concurrent failures of the same
+// client only advance once.
+func (y *YoutubeChecker) demoteFlatClient(failed string) {
+	for {
+		cur := y.flatClientIdx.Load()
+		if int(cur) >= len(ytFlatClients)-1 || ytFlatClients[cur] != failed {
+			return
+		}
+		if y.flatClientIdx.CompareAndSwap(cur, cur+1) {
+			log.Warn().Str("failed", failed).Str("switched_to", ytFlatClients[cur+1]).
+				Msg("youtube: flat-playlist client demoted")
+			return
+		}
+	}
+}
+
+// runFlatJSON runs a --dump-single-json yt-dlp call, walking the client chain
+// until one answers. base must NOT already carry --extractor-args.
+func (y *YoutubeChecker) runFlatJSON(ytdlpPath string, base []string, target string) ([]byte, error) {
+	var lastErr error
+	start := int(y.flatClientIdx.Load())
+	if start < 0 || start >= len(ytFlatClients) {
+		start = 0
+	}
+	for i := start; i < len(ytFlatClients); i++ {
+		client := ytFlatClients[i]
+		args := append(append([]string{}, base...), y.cookieArgsFor(client)...)
+		args = append(args, target)
+		cmd := exec.Command(ytdlpPath, args...)
+		cmd.Env = os.Environ()
+
+		y.ytdlpSem <- struct{}{}
+		out, err := runWithTimeout(cmd, ytExecTimeout)
+		<-y.ytdlpSem
+		if err == nil {
+			return out, nil
+		}
+		lastErr = err
+		y.demoteFlatClient(client)
+	}
+	return nil, lastErr
 }
 
 func (y *YoutubeChecker) Handle(cfg config.Config, links *proxylink.Manager) http.HandlerFunc {
@@ -964,14 +1305,7 @@ func (y *YoutubeChecker) ytSearchN(title string, limit int) ([]ytEntry, error) {
 		// IPv4 keeps extraction-IP and download-IP in the same family.
 		"-4",
 	}
-	args = append(args, y.cookieArgs()...)
-	args = append(args, fmt.Sprintf("ytsearch%d:%s", limit, searchQuery))
-	cmd := exec.Command(ytdlpPath, args...)
-	cmd.Env = os.Environ()
-
-	y.ytdlpSem <- struct{}{}
-	out, err := runWithTimeout(cmd, ytExecTimeout)
-	<-y.ytdlpSem
+	out, err := y.runFlatJSON(ytdlpPath, args, fmt.Sprintf("ytsearch%d:%s", limit, searchQuery))
 	if err != nil {
 		return nil, err
 	}
@@ -1009,14 +1343,7 @@ func (y *YoutubeChecker) ytPlaylistFull(targetURL string, limit int) (*ytSearchR
 		"-4", // keep extraction-IP family stable (see ytSearchN)
 		"--playlist-end", strconv.Itoa(limit),
 	}
-	args = append(args, y.cookieArgs()...)
-	args = append(args, targetURL)
-	cmd := exec.Command(ytdlpPath, args...)
-	cmd.Env = os.Environ()
-
-	y.ytdlpSem <- struct{}{}
-	out, err := runWithTimeout(cmd, ytExecTimeout)
-	<-y.ytdlpSem
+	out, err := y.runFlatJSON(ytdlpPath, args, targetURL)
 	if err != nil {
 		return nil, err
 	}
@@ -1130,12 +1457,47 @@ func (y *YoutubeChecker) HandleChannels(w http.ResponseWriter, r *http.Request) 
 		writeJSON(w, http.StatusOK, map[string]any{"channels": []any{}})
 		return
 	}
-	host := hostFromRequest(r)
+	host := ytHost(r)
 	out := make([]map[string]any, 0, len(chans))
 	for _, c := range chans {
 		out = append(out, map[string]any{"id": c.ChannelID, "title": c.Title, "thumb": ytImgProxyRawURL(host, c.Thumbnail)})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"channels": out})
+}
+
+// ytTrendingSources are tried in order until one yields entries.
+//
+// "https://www.youtube.com/feed/trending" led this list until YouTube retired
+// the page: as of 2026-09-01 it — and /feed/explore with it — redirects to the
+// home page, and yt-dlp reports «The channel/playlist does not exist and the URL
+// redirected to youtube.com home» on EVERY player client. That is why swapping
+// clients could not rescue the feed; the URL itself was gone. Verified the same
+// day from prod, same cookies, same flags: the Trending playlist returns 40
+// entries and @YouTube/videos another 40, while plain ytsearch kept working
+// throughout — which is what ruled the cookie jar out as the cause.
+//
+// Keep this a list. The endpoint that died was hardcoded, so its removal took
+// the whole «Главная» feed down instead of costing one candidate.
+var ytTrendingSources = []string{
+	"https://www.youtube.com/playlist?list=PLrEnWoR732-BHrPp_Pm8_VleD68f9s14-",
+	"https://www.youtube.com/@YouTube/videos",
+}
+
+// trendingEntries walks ytTrendingSources and returns the first non-empty
+// listing, so one dead URL costs a candidate rather than the feed.
+func (y *YoutubeChecker) trendingEntries(limit int) ([]ytEntry, error) {
+	var lastErr error
+	for _, src := range ytTrendingSources {
+		entries, err := y.ytPlaylistN(src, limit)
+		if err == nil && len(entries) > 0 {
+			return entries, nil
+		}
+		if err != nil {
+			lastErr = err
+			log.Debug().Err(err).Str("source", src).Msg("youtube: trending source failed, trying the next")
+		}
+	}
+	return nil, lastErr
 }
 
 // recommendVideos lists YouTube trending — the closest no-cookie equivalent of the youtube.com home
@@ -1150,7 +1512,7 @@ func (y *YoutubeChecker) recommendVideos(host string) []map[string]any {
 		return cached.Data
 	}
 
-	entries, err := y.ytPlaylistN("https://www.youtube.com/feed/trending", 40)
+	entries, err := y.trendingEntries(40)
 	if err != nil || len(entries) == 0 {
 		if err != nil {
 			log.Warn().Err(err).Msg("youtube: trending listing failed")
@@ -1168,7 +1530,7 @@ func (y *YoutubeChecker) recommendVideos(host string) []map[string]any {
 // handleRecommend returns the recommendations feed (trending) for the YouTube tab's «Главная».
 // GET /lite/youtube/recommend
 func (y *YoutubeChecker) HandleRecommend(w http.ResponseWriter, r *http.Request) {
-	results := y.recommendVideos(hostFromRequest(r))
+	results := y.recommendVideos(ytHost(r))
 	if mode := y.shortsModeForRequest(r); mode != "" && mode != "all" {
 		y.annotateShorts(r.Context(), results)
 		results = filterShorts(results, mode)
@@ -1184,7 +1546,7 @@ func (y *YoutubeChecker) HandleChannel(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "id required"})
 		return
 	}
-	results, meta := y.channelVideos(id, hostFromRequest(r))
+	results, meta := y.channelVideos(id, ytHost(r))
 	resp := map[string]any{"results": results}
 	if meta != nil {
 		resp["channel"] = meta
@@ -1231,7 +1593,7 @@ func (y *YoutubeChecker) index(w http.ResponseWriter, req *http.Request, links *
 		return
 	}
 
-	host := hostFromRequest(req)
+	host := ytHost(req)
 
 	// Spider-compatible "similar" response: cards for the search catalog
 	if similar {
@@ -1341,10 +1703,21 @@ func (y *YoutubeChecker) stream(w http.ResponseWriter, req *http.Request, videoI
 		title = videoID
 	}
 
+	// refresh=1 — плеер уткнулся в мёртвые ссылки (все качества дали 404) и просит
+	// пере-извлечь ролик. Без этого повтор попадал в тот же кеш за 65 мс и получал
+	// те же мёртвые ссылки: восстановиться было нечем, оставалось ждать TTL.
+	if parseBoolParam(q.Get("refresh")) {
+		if y.dropFormatsForRefresh(videoID) {
+			log.Warn().Str("videoID", videoID).Msg("youtube: клиент просит пере-извлечение — кеш форматов сброшен")
+		} else {
+			log.Debug().Str("videoID", videoID).Msg("youtube: refresh проигнорирован, запись кеша ещё свежая")
+		}
+	}
+
 	formats, duration, usedProxy, ok := y.getFormats(videoID)
 	if !ok || len(formats) == 0 {
 		log.Warn().Str("videoID", videoID).Bool("ok", ok).Msg("youtube: stream — no formats extracted (PO Token?)")
-		errMsg := "yt-dlp не смог извлечь форматы видео. Проверьте PO Token (pip install bgutil-ytdlp-pot-provider)"
+		errMsg := extractReasonFor(videoID)
 		if rjson {
 			writeJSON(w, http.StatusOK, map[string]any{"data": []any{}, "error": errMsg})
 		} else {
@@ -1365,15 +1738,25 @@ func (y *YoutubeChecker) stream(w http.ResponseWriter, req *http.Request, videoI
 		return
 	}
 
-	ytHeaders := map[string]string{
-		"Origin":     "https://www.youtube.com",
-		"Referer":    "https://www.youtube.com/",
-		"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-	}
+	ytHeaders := ytProxyHeaders()
+
+	// Multi-language audio: the picker pins a track with ?alang=<code>. Filtering
+	// the format set here — before the quality map is built — is all it takes:
+	// pickBestAudio then sees one language and everything downstream is unchanged.
+	// Absent or unknown alang leaves the set alone, so the default stays the
+	// uploader's original track.
+	audioTracks := ytAudioTracks(formats, ytSelfTrackURL(req))
+	wantLang := strings.TrimSpace(req.URL.Query().Get("alang"))
+	formats = ytFilterAudioLang(formats, wantLang)
 
 	// Build quality map: label → proxy URL.
 	// Prefer combined (video+audio) formats, fallback to video-only direct URLs.
 	qr := y.buildQualityMap(req, formats, links, ytHeaders, usedProxy)
+	// Страховка: наружу не должно уходить НИ ОДНОЙ прямой googlevideo-ссылки. У CDN
+	// нет Access-Control-Allow-Origin, поэтому браузер упрётся в CORS, что бы там ни
+	// лежало. Заворачиваем всё, что просочилось, и пишем в лог — по метке видно,
+	// какая ветка построения списка дала течь.
+	y.proxyLeakedQualities(&qr, req, links, ytHeaders)
 	if len(qr.Qualities) == 0 {
 		// Dump format details for debugging.
 		for i, f := range formats {
@@ -1401,7 +1784,7 @@ func (y *YoutubeChecker) stream(w http.ResponseWriter, req *http.Request, videoI
 	// real-time ffmpeg mux per quality (6+ parallel googlevideo downloads → wasted bandwidth, 403
 	// rate-limits, /tmp churn). The full `qualitys` map is still returned for the manual picker, which
 	// starts a mux on demand — one at a time.
-	bestLabel := ytBestLabelCapped(qr.Qualities, ytDefaultMuxHeight)
+	bestLabel := ytBestLabelCapped(qr.Qualities, y.autoHeightCap())
 
 	// Pre-start mux ONLY for the default quality in background.
 	// Other qualities start on demand when the user picks them.
@@ -1416,7 +1799,7 @@ func (y *YoutubeChecker) stream(w http.ResponseWriter, req *http.Request, videoI
 		qualitysOut[label] = u
 	}
 
-	host := hostFromRequest(req)
+	host := ytHost(req)
 
 	// DASH alternative for MSE players (web Shaka / webOS / Tizen): native YouTube video+audio served
 	// via /proxy (no real-time ffmpeg mux) → SEEKABLE + no "outran the muxer" freeze. Best quality for
@@ -1442,8 +1825,17 @@ func (y *YoutubeChecker) stream(w http.ResponseWriter, req *http.Request, videoI
 		if qr.AudioURL != "" {
 			row["audio"] = qr.AudioURL
 		}
+		// Selectable audio languages. Only present when the video actually has
+		// more than one, so a client can show the picker exactly when it matters.
+		if len(audioTracks) > 0 {
+			row["audio_tracks"] = audioTracks
+			row["audio_lang"] = ytActiveTrackLang(audioTracks, wantLang)
+		}
 		if dashURL != "" {
 			row["dash"] = dashURL
+		}
+		if sb := y.SponsorBlockFor(videoID, duration); len(sb) > 0 {
+			row["sponsorblock"] = sb
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"type": "movie",
@@ -1474,6 +1866,11 @@ func (y *YoutubeChecker) stream(w http.ResponseWriter, req *http.Request, videoI
 	if dashURL != "" {
 		resp["dash"] = dashURL
 	}
+	// Разметка SponsorBlock: клиент сам перематывает эти отрезки. Ответ не ждёт
+	// сети дольше своего таймаута, а отсутствие разметки — обычное дело.
+	if sb := y.SponsorBlockFor(videoID, duration); len(sb) > 0 {
+		resp["sponsorblock"] = sb
+	}
 
 	writeJSON(w, http.StatusOK, resp)
 }
@@ -1497,6 +1894,10 @@ type ytMuxPair struct {
 	Height     int    // for HLS RESOLUTION attribute
 	Width      int    // for HLS RESOLUTION attribute
 	Bandwidth  int    // video TBR + audio TBR in bits/sec, for HLS BANDWIDTH attribute
+	// VideoRange — «SDR», «PQ» или «HLG» для атрибута VIDEO-RANGE мастер-плейлиста.
+	// Без него плеер считает поток SDR, даже когда в CODECS стоит av01…10 с bt2020,
+	// и HDR-конвейер на телевизоре не включается.
+	VideoRange string
 	// DASH SegmentBase byte ranges ("start-end") for the video & audio streams — empty on progressive
 	// formats. Only pairs with all four set can produce a valid on-demand MPD (see buildBestDashURL).
 	VInitRange  string
@@ -1511,7 +1912,7 @@ type ytMuxPair struct {
 // for both combined and video-only formats. The audio track URL is returned
 // separately so the player can use it alongside video-only streams.
 func (y *YoutubeChecker) buildQualityMap(req *http.Request, formats []ytFormat, links *proxylink.Manager, headers map[string]string, usedProxy bool) ytQualityResult {
-	host := hostFromRequest(req)
+	host := ytHost(req)
 	muxVideoID := strings.TrimSpace(req.URL.Query().Get("videoID")) // for POT-flap re-mint
 
 	log.Debug().Int("total_formats", len(formats)).Msg("youtube: buildQualityMap start")
@@ -1521,13 +1922,7 @@ func (y *YoutubeChecker) buildQualityMap(req *http.Request, formats []ytFormat, 
 	// IP ban. DASH formats from the same response go through the banned CDN
 	// and return 403 when ffmpeg tries to mux. So if any HLS audio exists,
 	// drop every DASH (https protocol) format — HLS-only mode.
-	hasHLSAudio := false
-	for _, f := range formats {
-		if f.isAudioOnly() && f.Protocol == "m3u8_native" && f.URL != "" {
-			hasHLSAudio = true
-			break
-		}
-	}
+	hasHLSAudio := ytHasHLSAudio(formats)
 	if hasHLSAudio {
 		filtered := formats[:0:0]
 		for _, f := range formats {
@@ -1544,6 +1939,7 @@ func (y *YoutubeChecker) buildQualityMap(req *http.Request, formats []ytFormat, 
 	// where avc1 is unavailable (1440p, 2160p) — these use fMP4 HLS segments
 	// which hls.js/ExoPlayer support without transcoding.
 	videoByHeight := make(map[int]ytFormat)
+	hdrByHeight := make(map[int]ytFormat)
 	for _, f := range formats {
 		if !f.isVideoOnly() || f.URL == "" || !ytAcceptProtocol(f.Protocol) {
 			continue
@@ -1561,9 +1957,58 @@ func (y *YoutubeChecker) buildQualityMap(req *http.Request, formats []ytFormat, 
 		if h <= 0 {
 			continue
 		}
+		// HDR копим ОТДЕЛЬНО. В общей карте при равной высоте всегда выигрывает avc1
+		// (ради TS-совместимости), а он у YouTube только SDR — то есть HDR там
+		// гарантированно проигрывает и до зрителя не доходит.
+		// HDR копим из ЛЮБОГО протокола: прогрессивный уйдёт в склейку, а HLS —
+		// мастер-плейлистом через прокси, как и обычные качества в режиме HLS-only.
+		// Раньше здесь стояло ограничение на прогрессивные, и на 35 из 35 просмотров
+		// в HLS-режиме HDR-метка не появлялась вовсе.
+		if f.isHDR() && h >= ytHDRMinHeight {
+			if cur, seen := hdrByHeight[h]; !seen || hdrBetter(f, cur) {
+				hdrByHeight[h] = f
+			}
+		}
 		existing, ok := videoByHeight[h]
 		if !ok {
 			videoByHeight[h] = f
+			continue
+		}
+		// Прогрессивный формат важнее кодека: HLS-вариант той же высоты качается
+		// не по диапазонам, а значит мимо SABR и мимо ranged-докачки, и на длинном
+		// ролике обрывается. Берём m3u8, только если прогрессивного на эту высоту нет.
+		isProg, existIsProg := f.Protocol == "https", existing.Protocol == "https"
+		if isProg != existIsProg {
+			if isProg {
+				videoByHeight[h] = f
+			}
+			continue
+		}
+		// SDR важнее битрейта. Иначе на высоте, где avc1 нет, побеждает HDR-вариант
+		// (он всегда «жирнее») и уезжает к зрителю под обычной меткой — а браузер
+		// без 10-битного декодера показывает чёрный экран. HDR доступен отдельной
+		// меткой, и это осознанный выбор.
+		isSDR, existIsSDR := !f.isHDR(), !existing.isHDR()
+		if isSDR != existIsSDR {
+			if isSDR {
+				videoByHeight[h] = f
+			}
+			continue
+		}
+		// ★PO Token важнее кодека. Ссылка без pot= отдаётся CDN лишь тизерным окном
+		// (~17 МиБ ≈ 4 минуты 1080p), дальше 403 — и склейка умирает, а перевыписка
+		// просит тот же itag и получает ту же голую ссылку (28 кругов подряд на
+		// проде 2026-09-04, «видео упало на 4:18»). Голый avc1 приходит из
+		// подмешанного DASH клиента default, а токенизированный av01/vp9 той же
+		// высоты — из mweb; прежнее «всегда avc1» выбирало именно обрывающийся.
+		// Аудио этому правилу подчиняется давно (pickBestAudio) — теперь и видео.
+		// Стоит ПОСЛЕ SDR/HDR: токенизированный HDR не должен уезжать под обычной
+		// меткой к зрителю без 10-битного декодера.
+		hasPOT, existHasPOT := ytHasPOT(f.URL), ytHasPOT(existing.URL)
+		if hasPOT != existHasPOT {
+			if hasPOT {
+				videoByHeight[h] = f
+			}
 			continue
 		}
 		existIsAVC := strings.HasPrefix(existing.VCodec, "avc1")
@@ -1609,6 +2054,22 @@ func (y *YoutubeChecker) buildQualityMap(req *http.Request, formats []ytFormat, 
 	result := make(map[string]string)
 	muxPairs := make(map[string]ytMuxPair)
 
+	// Голый HLS отдаём плееру ТОЛЬКО когда прогрессивных форматов нет вовсе.
+	// Иначе часть качеств пришла бы склейкой (со звуком внутри), а часть —
+	// отдельной видеодорожкой, которой звук нужен снаружи: плеер получил бы либо
+	// тишину, либо двойное аудио. Есть прогрессивный — играем по нему, он ещё и
+	// качается параллельно.
+	hlsOnly := true
+	for _, m := range []map[int]ytFormat{videoByHeight, combinedByHeight} {
+		for _, f := range m {
+			if f.Protocol == "https" {
+				hlsOnly = false
+			}
+		}
+	}
+	// Звук нужен снаружи, только если отданная дорожка — video-only.
+	hlsNeedsAudio := false
+
 	// For each available height, add a quality entry.
 	// Merge both video-only and combined formats.
 	allHeights := make(map[int]bool)
@@ -1621,6 +2082,40 @@ func (y *YoutubeChecker) buildQualityMap(req *http.Request, formats []ytFormat, 
 
 	for h := range allHeights {
 		label := strconv.Itoa(h) + "p"
+
+		// HLS мимо ffmpeg, но ЧЕРЕЗ наш /proxy. Склеивать его нечем: этот билд
+		// ffmpeg на HLS-входе ПАДАЕТ (segmentation fault на смене узла CDN между
+		// сегментами; -http_persistent/-multiple_requests не спасают), а прежний
+		// путь через байтовый пайп скармливал ему текст плейлиста вместо видео.
+		// HLS плеер играет нативно — но сырую googlevideo-ссылку ему давать нельзя:
+		// у CDN нет Access-Control-Allow-Origin, и веб-клиент упирается в CORS
+		// («Ошибка CORS» на каждом index.m3u8, плеер стоит на 0:00). Прокси даёт
+		// ссылку на наш же домен и подставляет нужные заголовки.
+		//
+		// Напомню, зачем HLS вообще нужен: при бане нашего IP на основном CDN
+		// buildQualityMap выше переключается в режим HLS-only, и других форматов
+		// у ролика попросту не остаётся.
+		if f, videoOnly, ok := hlsFormatFor(h, videoByHeight, combinedByHeight); ok && !hlsOnly {
+			// У этой высоты только HLS, но у ролика есть и прогрессивные форматы.
+			// Отдавать её нельзя: склейка на m3u8 падает, а голый HLS вперемешку с
+			// mux-качествами даёт то тишину, то двойное аудио. Высоту пропускаем —
+			// зритель получит соседние, которые играют.
+			continue
+		} else if ok && hlsOnly {
+			vURL := y.proxyYTURL(f.URL, clientIP(req), links, headers, ytStreamHost(req))
+			if videoOnly && bestAudio.URL != "" {
+				// Видеодорожка без звука. Отдавать её вместе с адресом аудио отдельным
+				// полем ответа мало — клиент его не подхватывает, зритель смотрит немое
+				// видео. Поэтому собираем МАСТЕР-плейлист: он связывает видео и аудио
+				// группой EXT-X-MEDIA, и плеер получает одну ссылку с обеими дорожками.
+				aURL := y.proxyYTURL(bestAudio.URL, clientIP(req), links, headers, ytStreamHost(req))
+				result[label] = y.registerHLSMaster(host, muxVideoID, label, f, bestAudio, vURL, aURL)
+				hlsNeedsAudio = true
+				continue
+			}
+			result[label] = vURL
+			continue
+		}
 
 		if y.ffmpegPath != "" {
 			// When ffmpeg is available, ALL qualities go through HLS mux.
@@ -1653,14 +2148,7 @@ func (y *YoutubeChecker) buildQualityMap(req *http.Request, formats []ytFormat, 
 						AInitRange:  bestAudio.InitRange.rangeAttr(),
 						AIndexRange: bestAudio.IndexRange.rangeAttr(),
 					}
-					y.muxMu.Lock()
-					y.muxKeys[muxKey] = cacheKey
-					y.muxVideoID[muxKey] = muxVideoID
-					y.muxVCodecs[muxKey] = vf.VCodec
-					y.muxProxy[muxKey] = usedProxy
-					y.muxTransA[muxKey] = transAudio
-					y.muxFMP4[muxKey] = needFMP4
-					y.muxMu.Unlock()
+					y.registerMuxKey(muxKey, cacheKey, muxVideoID, vf.VCodec, usedProxy, transAudio, needFMP4)
 					continue
 				}
 			}
@@ -1684,13 +2172,7 @@ func (y *YoutubeChecker) buildQualityMap(req *http.Request, formats []ytFormat, 
 					Width:      cf.Width,
 					Bandwidth:  int(cf.TBR * 1000),
 				}
-				y.muxMu.Lock()
-				y.muxKeys[muxKey] = cacheKey
-				y.muxVideoID[muxKey] = muxVideoID
-				y.muxVCodecs[muxKey] = cf.VCodec
-				y.muxProxy[muxKey] = usedProxy
-				y.muxTransA[muxKey] = false
-				y.muxMu.Unlock()
+				y.registerMuxKey(muxKey, cacheKey, muxVideoID, cf.VCodec, usedProxy, false, false)
 				continue
 			}
 		}
@@ -1706,9 +2188,65 @@ func (y *YoutubeChecker) buildQualityMap(req *http.Request, formats []ytFormat, 
 		}
 	}
 
+	// HDR-качества добавляются отдельными метками, поверх обычных. Идут той же
+	// склейкой: замер 2026-08-31 показал, что -c copy в fMP4 сохраняет колориметрию
+	// без потерь (bt2020nc / smpte2084 / bt2020 / yuv420p10le до и после совпадают),
+	// поэтому перекодировать ничего не нужно.
+	if bestAudio.URL != "" {
+		for h, vf := range hdrByHeight {
+			label := strconv.Itoa(h) + "p" + ytHDRSuffix
+			if vf.Protocol != "https" {
+				// HLS-HDR. Склеивать его нечем (ffmpeg на плейлисте из пайпа падает),
+				// зато ровно так же, как обычные качества в этом режиме, он отдаётся
+				// мастер-плейлистом: видео и аудио связаны группой EXT-X-MEDIA, обе
+				// ссылки проксированы. Вне режима HLS-only не отдаём: смешивать голый
+				// HLS с mux-качествами уже пробовали — получается либо тишина, либо
+				// двойное аудио.
+				if !hlsOnly {
+					continue
+				}
+				vURL := y.proxyYTURL(vf.URL, clientIP(req), links, headers, ytStreamHost(req))
+				aURL := y.proxyYTURL(bestAudio.URL, clientIP(req), links, headers, ytStreamHost(req))
+				result[label] = y.registerHLSMaster(host, muxVideoID, label, vf, bestAudio, vURL, aURL)
+				hlsNeedsAudio = true
+				continue
+			}
+			if y.ffmpegPath == "" {
+				continue
+			}
+			cacheKey := vf.URL + "\x00" + bestAudio.URL
+			muxKey := fmt.Sprintf("%x", md5Hash(cacheKey))[:16]
+			result[label] = host + "/lite/youtube/mux/index.m3u8?key=" + muxKey
+			transAudio := !strings.Contains(bestAudio.ACodec, "aac") && !strings.Contains(bestAudio.ACodec, "mp4a")
+			// HDR бывает только в VP9.2/AV1, а они в TS не укладываются — всегда fMP4.
+			muxPairs[label] = ytMuxPair{
+				VideoURL:    vf.URL,
+				AudioURL:    bestAudio.URL,
+				VCodec:      vf.VCodec,
+				ACodec:      bestAudio.ACodec,
+				TransAudio:  transAudio,
+				FMP4:        true,
+				Height:      vf.Height,
+				Width:       vf.Width,
+				Bandwidth:   int((vf.TBR + bestAudio.ABR) * 1000),
+				VideoRange:  videoRangeOf(vf),
+				VInitRange:  vf.InitRange.rangeAttr(),
+				VIndexRange: vf.IndexRange.rangeAttr(),
+				AInitRange:  bestAudio.InitRange.rangeAttr(),
+				AIndexRange: bestAudio.IndexRange.rangeAttr(),
+			}
+			y.registerMuxKey(muxKey, cacheKey, muxVideoID, vf.VCodec, usedProxy, transAudio, true)
+		}
+	}
+
 	var audioProxyURL string
 	if bestAudio.URL != "" {
-		if y.ffmpegPath != "" {
+		if hlsNeedsAudio {
+			// Голый HLS идёт мимо склейки, поэтому звук отдаём ОТДЕЛЬНОЙ дорожкой —
+			// иначе зритель получает видео без звука. Через прокси: у googlevideo нет
+			// Access-Control-Allow-Origin, и веб-клиент упёрся бы в CORS.
+			audioProxyURL = y.proxyYTURL(bestAudio.URL, clientIP(req), links, headers, ytStreamHost(req))
+		} else if y.ffmpegPath != "" {
 			// With ffmpeg, audio is already muxed into HLS — no separate URL needed.
 			audioProxyURL = ""
 		} else {
@@ -1722,6 +2260,82 @@ func (y *YoutubeChecker) buildQualityMap(req *http.Request, formats []ytFormat, 
 		AudioURL:  audioProxyURL,
 		MuxPairs:  muxPairs,
 	}
+}
+
+// registerHLSMaster публикует мастер-плейлист на одно качество: вариант с видео плюс
+// связанная с ним аудиодорожка. Ключ включает высоту — у каждого качества свой мастер,
+// потому что качество здесь выбирает не плеер, а вызывающий код.
+func (y *YoutubeChecker) registerHLSMaster(host, videoID, label string, v, a ytFormat, vURL, aURL string) string {
+	bw := int((v.TBR + a.ABR) * 1000)
+	if bw <= 0 {
+		bw = v.Height * v.Height * 3
+		if bw < 200_000 {
+			bw = 200_000
+		}
+	}
+	key := fmt.Sprintf("%x", md5Hash("hlsmaster:"+videoID+":"+label))[:16]
+	y.muxMu.Lock()
+	y.masterCache[key] = ytMasterEntry{
+		Variants: []ytMasterVariant{{
+			Label:      label,
+			Height:     v.Height,
+			Width:      v.Width,
+			Bandwidth:  bw,
+			Codecs:     hlsCodecsString(v.VCodec, hlsAudioCodec(a), false),
+			VariantURL: vURL,
+			AudioURL:   aURL,
+			VideoRange: videoRangeOf(v),
+		}},
+		Expires: time.Now().Add(ytMuxTTL),
+	}
+	now := time.Now()
+	for k, e := range y.masterCache {
+		if now.After(e.Expires) {
+			delete(y.masterCache, k)
+		}
+	}
+	y.muxMu.Unlock()
+	// videoID в ссылке — чтобы мастер можно было ПЕРЕСОБРАТЬ, если его нет в
+	// памяти. Реестр живёт в процессе, поэтому любой перезапуск раньше отдавал
+	// зрителю 404 «master playlist not found» посреди просмотра, а клиент нёс этот
+	// мёртвый адрес в транскодер (замер на проде 2026-08-31).
+	return host + "/lite/youtube/mux/master.m3u8?key=" + key + "&v=" + url.QueryEscape(videoID)
+}
+
+// proxyLeakedQualities заворачивает в /proxy всё, что осталось прямой ссылкой на
+// googlevideo. Это именно страховка, а не основной путь: каждая такая находка —
+// ошибка в построении списка качеств, поэтому она попадает в лог с меткой.
+func (y *YoutubeChecker) proxyLeakedQualities(qr *ytQualityResult, req *http.Request,
+	links *proxylink.Manager, headers map[string]string) {
+	if links == nil {
+		return
+	}
+	host := ytStreamHost(req)
+	ip := clientIP(req)
+	for label, u := range qr.Qualities {
+		if !strings.Contains(u, "googlevideo.com") {
+			continue
+		}
+		log.Warn().Str("label", label).Msg("youtube: прямая googlevideo-ссылка в списке качеств — заворачиваю в прокси")
+		qr.Qualities[label] = y.proxyYTURL(u, ip, links, headers, host)
+	}
+	if strings.Contains(qr.AudioURL, "googlevideo.com") {
+		log.Warn().Msg("youtube: прямая googlevideo-ссылка в аудиодорожке — заворачиваю в прокси")
+		qr.AudioURL = y.proxyYTURL(qr.AudioURL, ip, links, headers, host)
+	}
+}
+
+// hlsFormatFor returns the HLS format chosen for a height, preferring the combined
+// one: у него уже есть звук, тогда как video-only HLS пришлось бы сводить с
+// отдельной аудиодорожкой — а сводить нечем, ffmpeg на HLS падает.
+func hlsFormatFor(h int, videoByHeight, combinedByHeight map[int]ytFormat) (f ytFormat, videoOnly, ok bool) {
+	if c, found := combinedByHeight[h]; found && c.Protocol == "m3u8_native" {
+		return c, false, true
+	}
+	if v, found := videoByHeight[h]; found && v.Protocol == "m3u8_native" {
+		return v, true, true
+	}
+	return ytFormat{}, false, false
 }
 
 // proxyYTURL wraps a raw YouTube stream URL through /proxy/ with required
@@ -1741,12 +2355,51 @@ func (y *YoutubeChecker) proxyYTURL(rawURL, reqIP string, links *proxylink.Manag
 // ytAcceptProtocol returns true for protocols we can handle.
 // "https" = direct download, "m3u8_native" = HLS stream (common with cookies/SABR).
 func ytAcceptProtocol(proto string) bool {
+	// m3u8 отбрасывать НЕЛЬЗЯ. Это не запасной вариант, а несущий: когда у ролика
+	// есть HLS-аудио от iOS-клиента, buildQualityMap намеренно выкидывает ВСЕ
+	// DASH-форматы и работает только по HLS — основной CDN на нашем IP забанен и
+	// отвечает 403, а manifest.googlevideo.com отдаёт. Отбраковка m3u8 (моя правка
+	// 2026-08-31) обнулила у таких роликов список качеств целиком: «Нет подходящих
+	// качеств для воспроизведения», 2284 отклонённых формата за 40 минут.
+	//
+	// Прогрессивный формат всё равно предпочтительнее при равной высоте (см.
+	// videoByHeight): по нему работает параллельная докачка, а по HLS — нет.
 	return proto == "https" || proto == "m3u8_native"
 }
 
 // ytBestLabel returns the best quality label from a map.
 func ytBestLabel(quals map[string]string) string {
 	return ytBestLabelCapped(quals, 0)
+}
+
+// ytHDRMinHeight — ниже этой высоты HDR-качества не показываем. YouTube отдаёт HDR
+// вплоть до 144p, и без порога список удваивался бы строчками вроде «144p HDR»,
+// которых никто не выберет.
+const ytHDRMinHeight = 1080
+
+// hdrBetter выбирает между двумя HDR-форматами одной высоты. AV1 предпочтительнее
+// VP9.2: при равном качестве он заметно легче по битрейту, а на приставках, где
+// HDR вообще есть, AV1 обычно тоже есть.
+func hdrBetter(a, b ytFormat) bool {
+	aAV1 := strings.HasPrefix(a.VCodec, "av01")
+	bAV1 := strings.HasPrefix(b.VCodec, "av01")
+	if aAV1 != bAV1 {
+		return aAV1
+	}
+	return a.TBR > b.TBR
+}
+
+// ytHDRSuffix помечает HDR-качества в списке. Отдельная метка, а НЕ замена SDR:
+// HDR у YouTube существует только в VP9.2/AV1 с 10 битами, а их декодирует не
+// всякая приставка — подменив 1080p на HDR-вариант, мы бы отняли рабочее видео у
+// части зрителей. Так выбор остаётся за ними.
+const ytHDRSuffix = " HDR"
+
+// ytLabelHeight извлекает высоту из метки качества, включая «2160p HDR».
+func ytLabelHeight(label string) int {
+	l := strings.TrimSuffix(label, ytHDRSuffix)
+	h, _ := strconv.Atoi(strings.TrimSuffix(l, "p"))
+	return h
 }
 
 // ytBestLabelCapped returns the highest available quality label whose height is ≤ maxHeight
@@ -1767,7 +2420,12 @@ func ytBestLabelCapped(quals map[string]string, maxHeight int) string {
 	// Fallback: any label present (covers non-standard labels not in ytQualityOrder).
 	best, bestH := "", -1
 	for q := range quals {
-		h, _ := strconv.Atoi(strings.TrimSuffix(q, "p"))
+		// HDR по умолчанию не включаем НИКОГДА: это осознанный выбор зрителя, а на
+		// приставке без 10-битного VP9/AV1 такой поток просто не проиграется.
+		if strings.HasSuffix(q, ytHDRSuffix) {
+			continue
+		}
+		h := ytLabelHeight(q)
 		if maxHeight > 0 && h > maxHeight {
 			continue
 		}
@@ -1779,15 +2437,55 @@ func ytBestLabelCapped(quals map[string]string, maxHeight int) string {
 		return best
 	}
 	// Everything is above the cap → fall back to the overall best so we never return "".
+	// HDR и здесь пропускаем: лучше отдать SDR выше потолка, чем поток, который
+	// приставка может вообще не декодировать.
 	for _, q := range ytQualityOrder {
 		if _, ok := quals[q]; ok {
 			return q
 		}
 	}
 	for q := range quals {
+		if !strings.HasSuffix(q, ytHDRSuffix) {
+			return q
+		}
+	}
+	// Кроме HDR не осталось ничего — тогда уж он, чем пустота.
+	for q := range quals {
 		return q
 	}
 	return ""
+}
+
+// formatsCacheTTL — сколько держать результат экстракции. Деградированный (без
+// прогрессивных форматов) живёт минуты, а не часы: см. ytDegradedCacheTTL.
+func formatsCacheTTL(formats []ytFormat) time.Duration {
+	if hlsOnlyFormats(formats) {
+		return ytDegradedCacheTTL
+	}
+	return ytCacheTTL
+}
+
+// ytRefreshMinAge — насколько старой должна быть запись кеша, чтобы клиент имел
+// право её сбросить. Плеер зовёт refresh из аварийного пути (все качества упали с
+// «манифест 404»), а этот путь легко зацикливается: без нижней границы каждый
+// повтор запускал бы новый yt-dlp и съел бы все слоты экстракции.
+const ytRefreshMinAge = 45 * time.Second
+
+// dropFormatsForRefresh выбрасывает закешированные форматы ролика, чтобы следующий
+// resolve сходил в yt-dlp заново. Возвращает false, если запись слишком свежая
+// (значит, кто-то уже пере-извлёк её только что) — тогда отдаём, что есть.
+func (y *YoutubeChecker) dropFormatsForRefresh(videoID string) bool {
+	y.mu.Lock()
+	defer y.mu.Unlock()
+	cached, ok := y.cache[videoID]
+	if !ok {
+		return false
+	}
+	if !cached.Born.IsZero() && time.Since(cached.Born) < ytRefreshMinAge {
+		return false
+	}
+	delete(y.cache, videoID)
+	return true
 }
 
 // getFormats returns cached or freshly-extracted formats and duration for a video.
@@ -1817,18 +2515,27 @@ func (y *YoutubeChecker) getFormats(videoID string) ([]ytFormat, float64, bool, 
 		y.cleanupCacheLocked()
 		y.cache[videoID] = &ytFormatCache{
 			Expires: time.Now().Add(2 * time.Minute),
+			Born:    time.Now(),
 		}
 		y.mu.Unlock()
 		return nil, 0, false, false
 	}
 
+	ttl := formatsCacheTTL(formats)
+	if ttl != ytCacheTTL {
+		log.Warn().Str("videoID", videoID).Int("formats", len(formats)).
+			Dur("ttl", ttl).Msg("youtube: экстракция без прогрессивных форматов — кешируем ненадолго")
+	}
+
+	now := time.Now()
 	y.mu.Lock()
 	y.cleanupCacheLocked()
 	y.cache[videoID] = &ytFormatCache{
 		Formats:   formats,
 		Duration:  duration,
-		Expires:   time.Now().Add(ytCacheTTL),
+		Expires:   now.Add(ttl),
 		UsedProxy: usedProxy,
+		Born:      now,
 	}
 	y.mu.Unlock()
 
@@ -1862,9 +2569,30 @@ func ytHasPOT(u string) bool {
 // 2026-08-03 the CDN 403'd mweb's POT audio while the same video's POT-less
 // android_vr audio downloaded fine), then highest ABR.
 func pickBestAudio(formats []ytFormat) ytFormat {
+	// Multi-language videos: keep ONLY the original track when the video has one.
+	//
+	// Without this the choice fell through to container/bitrate alone, and on a
+	// video with 44 tracks whichever dub happened to score best won — a Russian
+	// creator's video would play in English. The original is what the uploader
+	// recorded, so it is never a surprise; a dub always can be.
+	//
+	// Videos with a single language mark no format as original (both of Rick
+	// Astley's audio formats sit at language_preference -1), so the filter stays
+	// inert there and the old selection applies unchanged.
+	hasOriginal := false
+	for _, f := range formats {
+		if f.isAudioOnly() && f.URL != "" && f.isOriginalAudio() {
+			hasOriginal = true
+			break
+		}
+	}
+
 	var bestAudio ytFormat
 	for _, f := range formats {
 		if !f.isAudioOnly() || f.URL == "" || !ytAcceptProtocol(f.Protocol) {
+			continue
+		}
+		if hasOriginal && !f.isOriginalAudio() {
 			continue
 		}
 		// ext="mp4" appears on HLS audio-only formats (iOS client) — accept them too.
@@ -1898,6 +2626,35 @@ func pickBestAudio(formats []ytFormat) ytFormat {
 // fallback (format 18). A client reduced to one combined 360p (mweb behind
 // the GVS-POT wall, android under SABR) must not beat the default client's
 // full ladder.
+// ytHasHLSAudio — есть ли в выдаче HLS-аудиодорожка (itag 233/234 с
+// manifest.googlevideo.com). Её наличие переводит buildQualityMap в HLS-only
+// режим: все DASH-форматы выбрасываются, качества идут мастер-плейлистом.
+func ytHasHLSAudio(fmts []ytFormat) bool {
+	for _, f := range fmts {
+		if f.isAudioOnly() && f.Protocol == "m3u8_native" && f.URL != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// preferHLSForLong решает, подменять ли выдачу победителя (DASH) HLS-лестницей
+// default-клиента: только для ролика не короче minDur, только если у победителя
+// HLS-аудио нет, а у кандидата есть и аудио, и хоть одна видеодорожка HLS.
+// Возвращает кандидата целиком — https-форматы из него выкинет сам
+// buildQualityMap (HLS-only режим).
+func preferHLSForLong(best, hi []ytFormat, dur, minDur float64) ([]ytFormat, bool) {
+	if minDur < 0 || dur < minDur || ytHasHLSAudio(best) || !ytHasHLSAudio(hi) {
+		return nil, false
+	}
+	for _, f := range hi {
+		if f.isVideoOnly() && f.URL != "" && f.Protocol == "m3u8_native" {
+			return hi, true
+		}
+	}
+	return nil, false
+}
+
 func isStrongResult(fmts []ytFormat) bool {
 	for _, f := range fmts {
 		if f.isVideoOnly() && f.URL != "" && ytAcceptProtocol(f.Protocol) {
@@ -1911,12 +2668,192 @@ func isStrongResult(fmts []ytFormat) bool {
 // top video rung). True when nothing is probeable — the probe can only vouch
 // for direct googlevideo URLs.
 func (y *YoutubeChecker) probeFormats(fmts []ytFormat) bool {
-	for _, u := range pickProbeURLs(fmts) {
-		if !y.probeStreamURL(u) {
+	_, ok := y.verifyFormats(fmts)
+	return ok
+}
+
+// verifyFormats проверяет ТО, ЧТО РЕАЛЬНО УЕДЕТ ЗРИТЕЛЮ, и возвращает набор форматов,
+// пригодный к выдаче, — иногда подрезанный.
+//
+// Развилку задаёт `hasHLSAudio` в buildQualityMap: хватает ОДНОГО audio-only формата
+// по m3u8, чтобы из ответа выбросило все прямые googlevideo-ссылки и зритель получил
+// голые манифесты. Правило написано под бан нашего IP на основном CDN — тогда DASH
+// отвечает 403, а манифесты живут. Но 01.09 всё оказалось наоборот: прогрессив отдавал
+// 206 на обоих концах гигабайтного файла, а манифесты — 404. Прежняя проба смотрела на
+// прогрессив, видела 206 и объявляла результат здоровым, хотя выдача уходила в HLS.
+//
+// Поэтому решаем по факту, а не по наличию HLS-аудио:
+//
+//  1. HLS-аудио нет — обычная проба прямых ссылок;
+//  2. HLS-аудио есть, но есть и прогрессивное видео — сначала пробуем прогрессив. Качается
+//     — ВЫРЕЗАЕМ HLS-форматы, чтобы buildQualityMap не увёл выдачу с рабочего пути;
+//  3. прогрессив не качается (вот он, настоящий бан) — проверяем сами манифесты и
+//     оставляем HLS-режим. Бракуем ТОЛЬКО при 404/410: 403, таймаут или чужая геозона
+//     уликой смерти не считаем, иначе уйдём с последнего рабочего пути.
+func (y *YoutubeChecker) verifyFormats(fmts []ytFormat) ([]ytFormat, bool) {
+	if hlsOnlyFormats(fmts) {
+		if trimmed, ok := y.tryProgressive(fmts); ok {
+			return trimmed, true
+		}
+		for _, u := range pickHLSProbeURLs(fmts) {
+			if y.manifestGone(u) {
+				log.Warn().Str("stream", ytURLDesc(u)).
+					Msg("youtube: HLS-манифест мёртв (404) — результат клиента бракуем")
+				return fmts, false
+			}
+		}
+		return fmts, true
+	}
+	return fmts, y.probeDirect(fmts)
+}
+
+// tryProgressive — у набора есть и HLS-аудио, и прямые ссылки. Проверяем прямые: если
+// качаются, отдаём набор БЕЗ HLS-форматов (иначе одно HLS-аудио уведёт выдачу в режим
+// голых манифестов и выбросит 22 рабочих качества из-за четырёх).
+func (y *YoutubeChecker) tryProgressive(fmts []ytFormat) ([]ytFormat, bool) {
+	if len(pickProbeFormats(fmts)) == 0 {
+		return nil, false // прямых ссылок нет вовсе — проверять нечего
+	}
+	if !y.probeDirect(fmts) {
+		return nil, false
+	}
+	trimmed := make([]ytFormat, 0, len(fmts))
+	for _, f := range fmts {
+		if f.Protocol == "m3u8_native" {
+			continue
+		}
+		trimmed = append(trimmed, f)
+	}
+	log.Info().Int("было", len(fmts)).Int("стало", len(trimmed)).
+		Msg("youtube: прогрессив качается — вырезаем HLS-форматы, чтобы выдача не ушла на манифесты")
+	return trimmed, true
+}
+
+// probeDirect — прежняя проба прямых googlevideo-ссылок (общее аудио + верхняя видеодорожка).
+func (y *YoutubeChecker) probeDirect(fmts []ytFormat) bool {
+	sel := pickProbeFormats(fmts)
+	if len(sel) < 2 {
+		for _, f := range sel {
+			if !y.probeStreamURL(f.URL, f.FileSize) {
+				return false
+			}
+		}
+		return true
+	}
+	// Аудио и видео проверяем ОДНОВРЕМЕННО. Проверка та же, но раньше они шли по
+	// очереди, и вместе с двумя фазами внутри каждой пробы это давало четыре
+	// последовательных сетевых круга на стратегию. Замер на проде 2026-08-31:
+	// 5.1 пробы на резолв, медиана резолва 26.8 с при том, что один прогон
+	// yt-dlp занимает 3 с — то есть время уходило именно в ожидание проб.
+	res := make([]bool, len(sel))
+	var wg sync.WaitGroup
+	for i, f := range sel {
+		wg.Add(1)
+		go func(i int, f ytFormat) {
+			defer wg.Done()
+			res[i] = y.probeStreamURL(f.URL, f.FileSize)
+		}(i, f)
+	}
+	wg.Wait()
+	for _, ok := range res {
+		if !ok {
 			return false
 		}
 	}
 	return true
+}
+
+// pickHLSProbeURLs — манифесты, которые в HLS-режиме реально получит плеер: верхняя
+// видеодорожка и общее аудио. Именно их живучесть и решает, играет ролик или нет.
+func pickHLSProbeURLs(fmts []ytFormat) []string {
+	var out []string
+	var video ytFormat
+	for _, f := range fmts {
+		if f.URL == "" || !f.isVideoOnly() || f.Protocol != "m3u8_native" {
+			continue
+		}
+		if f.Height > video.Height {
+			video = f
+		}
+	}
+	if video.URL != "" {
+		out = append(out, video.URL)
+	}
+	if a := pickBestAudio(fmts); a.URL != "" && a.Protocol == "m3u8_native" {
+		out = append(out, a.URL)
+	}
+	return out
+}
+
+// manifestGone — сервер отвечает по этому манифесту «его нет» (404/410). Пробы
+// диапазонами тут не годятся: raceProbe ждёт строго 206, а плейлист отдаётся 200.
+// Возвращает true, только если ВСЕ маршруты дали 404/410 — один неудачный выход не
+// повод хоронить ссылку.
+func (y *YoutubeChecker) manifestGone(rawURL string) (gone bool) {
+	start := time.Now()
+	defer func() {
+		log.Debug().Bool("gone", gone).Str("stream", ytURLDesc(rawURL)).
+			Dur("elapsed", time.Since(start)).Msg("youtube: проба HLS-манифеста")
+	}()
+	attempts := y.buildStreamAttempts()
+	if len(attempts) == 0 {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+	defer cancel()
+
+	type verdict struct{ gone, answered bool }
+	resCh := make(chan verdict, len(attempts))
+	for _, a := range attempts {
+		go func(a streamAttempt) {
+			req, err := http.NewRequestWithContext(ctx, "GET", rawURL, nil)
+			if err != nil {
+				resCh <- verdict{}
+				return
+			}
+			ua, origin, referer := ytCDNHeaders(rawURL)
+			req.Header.Set("User-Agent", ua)
+			req.Header.Set("Origin", origin)
+			req.Header.Set("Referer", referer)
+			resp, err := a.client.Do(req)
+			if err != nil {
+				resCh <- verdict{}
+				return
+			}
+			defer resp.Body.Close()
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+			dead := resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone
+			resCh <- verdict{gone: dead, answered: true}
+		}(a)
+	}
+
+	answered, deadCount := 0, 0
+	for range attempts {
+		select {
+		case v := <-resCh:
+			if !v.answered {
+				continue
+			}
+			answered++
+			if !v.gone {
+				return false // хоть один маршрут видит манифест живым
+			}
+			deadCount++
+		case <-ctx.Done():
+			return false
+		}
+	}
+	return answered > 0 && deadCount == answered
+}
+
+// pickProbeURLs — URL-обёртка над pickProbeFormats для вызовов, которым размер не нужен.
+func pickProbeURLs(fmts []ytFormat) []string {
+	sel := pickProbeFormats(fmts)
+	out := make([]string, 0, len(sel))
+	for _, f := range sel {
+		out = append(out, f.URL)
+	}
+	return out
 }
 
 // pickProbeURLs returns the direct googlevideo URLs the mux will actually
@@ -1925,10 +2862,10 @@ func (y *YoutubeChecker) probeFormats(fmts []ytFormat) bool {
 // video URLs downloaded fine while its audio URLs 403'd, so probing just one
 // side declares a poisoned session healthy. m3u8 URLs are excluded (a ranged
 // GET of a playlist answers 200, which the probe would misread as poison).
-func pickProbeURLs(fmts []ytFormat) []string {
-	var urls []string
+func pickProbeFormats(fmts []ytFormat) []ytFormat {
+	var urls []ytFormat
 	if a := pickBestAudio(fmts); a.URL != "" && a.Protocol == "https" && !strings.Contains(a.URL, "m3u8") {
-		urls = append(urls, a.URL)
+		urls = append(urls, a)
 	}
 	var video ytFormat
 	for _, f := range fmts {
@@ -1943,7 +2880,7 @@ func pickProbeURLs(fmts []ytFormat) []string {
 		}
 	}
 	if video.URL != "" {
-		urls = append(urls, video.URL)
+		urls = append(urls, video)
 	}
 	return urls
 }
@@ -1965,7 +2902,8 @@ func (y *YoutubeChecker) extractFormats(videoID string) (formats []ytFormat, dur
 		formats   []ytFormat
 		duration  float64
 		usedProxy bool
-		priority  int // lower = better
+		priority  int        // lower = better
+		raw       []ytFormat // выдача клиента ДО verifyFormats: там tryProgressive вырезает HLS, а для длинного ролика он нужен
 	}
 
 	// Build strategy list (parallel execution, first viable result by priority wins).
@@ -2005,7 +2943,7 @@ func (y *YoutubeChecker) extractFormats(videoID string) (formats []ytFormat, dur
 	// в 403 на середине. mweb с bgutil-POT (pot= в URL) качается детерминированно
 	// целиком (чанк-тесты за окном 206). Когда POT доступен — mweb первым, дефолтный
 	// микс фолбэком; двухфазная probeStreamURL отбраковывает мигающие варианты.
-	if y.pluginDirs != "" && !y.fetchPotNever {
+	if y.potReady && !y.fetchPotNever {
 		strategies = []strategy{
 			{"mweb", proxy, 0},
 			{"", proxy, 1},
@@ -2056,22 +2994,18 @@ func (y *YoutubeChecker) extractFormats(videoID string) (formats []ytFormat, dur
 	// client (see the retry below).
 	var blockedStrats []strategy
 
-	allCooling := true
-	for _, s := range strategies {
-		label := s.client
-		if label == "" {
-			label = "default"
-		}
-		y.mu.RLock()
-		coolUntil, cooling := y.stratCooldown[label]
-		y.mu.RUnlock()
-		if !cooling || !time.Now().Before(coolUntil) {
-			allCooling = false
-			break
-		}
-	}
+	// Fail open when every client that can deliver a real quality ladder is cooling — not only
+	// when literally every client is.
+	//
+	// `android` is a 360p-only last resort, and it rarely cools down, so it used to keep the
+	// fail-open from ever firing: the moment default/mweb/tv were all parked on a probe flap,
+	// extraction quietly settled for progressive 360p. Prod 2026-08-27 was doing exactly that —
+	// android won 23 of 26 extractions while a hand-run of the default client on the same host
+	// returned a full 37-format ladder. A short cooldown is a hint, not a verdict; a 4K→360p
+	// cliff is worth one more attempt.
+	allCooling := y.everyLadderClientCooling(time.Now())
 	if allCooling {
-		log.Warn().Str("videoID", videoID).Msg("youtube: every client is in cooldown — ignoring cooldowns for this attempt (fail-open)")
+		log.Warn().Str("videoID", videoID).Msg("youtube: every full-ladder client is in cooldown — ignoring cooldowns for this attempt (fail-open)")
 	}
 
 	for _, s := range strategies {
@@ -2120,6 +3054,7 @@ func (y *YoutubeChecker) extractFormats(videoID string) (formats []ytFormat, dur
 		}
 		res := &extractResult{
 			formats:   fmts,
+			raw:       fmts,
 			duration:  dur,
 			usedProxy: s.proxy,
 			priority:  s.priority,
@@ -2138,7 +3073,8 @@ func (y *YoutubeChecker) extractFormats(videoID string) (formats []ytFormat, dur
 		// actually download before declaring a winner. No probeable direct URL
 		// (e.g. HLS-only result) → accept as-is: the probe can only vouch for
 		// direct googlevideo URLs.
-		if y.probeFormats(res.formats) {
+		if trimmed, ok := y.verifyFormats(res.formats); ok {
+			res.formats = trimmed
 			best = res
 			break
 		}
@@ -2155,10 +3091,13 @@ func (y *YoutubeChecker) extractFormats(videoID string) (formats []ytFormat, dur
 						fmts2 = mergeDefaultClientFormats(videoID, fmts2, hi)
 					}
 				}
-				res2 := &extractResult{formats: fmts2, duration: dur2, usedProxy: s.proxy, priority: s.priority}
-				if isStrongResult(res2.formats) && y.probeFormats(res2.formats) {
-					best = res2
-					break
+				res2 := &extractResult{formats: fmts2, raw: fmts2, duration: dur2, usedProxy: s.proxy, priority: s.priority}
+				if isStrongResult(res2.formats) {
+					if trimmed, ok := y.verifyFormats(res2.formats); ok {
+						res2.formats = trimmed
+						best = res2
+						break
+					}
 				}
 			}
 		}
@@ -2193,14 +3132,15 @@ func (y *YoutubeChecker) extractFormats(videoID string) (formats []ytFormat, dur
 					fmts = mergeDefaultClientFormats(videoID, fmts, hi)
 				}
 			}
-			res := &extractResult{formats: fmts, duration: dur, usedProxy: s.proxy, priority: s.priority}
+			res := &extractResult{formats: fmts, raw: fmts, duration: dur, usedProxy: s.proxy, priority: s.priority}
 			if !isStrongResult(res.formats) {
 				if weak == nil {
 					weak = res
 				}
 				continue
 			}
-			if y.probeFormats(res.formats) {
+			if trimmed, ok := y.verifyFormats(res.formats); ok {
+				res.formats = trimmed
 				best = res
 				break
 			}
@@ -2216,7 +3156,8 @@ func (y *YoutubeChecker) extractFormats(videoID string) (formats []ytFormat, dur
 	// the same routes and nothing would play either way; if the probe was
 	// wrong, playback still works).
 	if best == nil && weak != nil {
-		if y.probeFormats(weak.formats) {
+		if trimmed, ok := y.verifyFormats(weak.formats); ok {
+			weak.formats = trimmed
 			log.Warn().Str("videoID", videoID).Msg("youtube: no full-ladder strategy — using weak (progressive-only) result")
 			best = weak
 		} else if unproven == nil {
@@ -2245,8 +3186,49 @@ func (y *YoutubeChecker) extractFormats(videoID string) (formats []ytFormat, dur
 	if proxy {
 		proxyLabel = "+proxy"
 	}
-	stratLabels := map[int]string{0: "default" + proxyLabel, 1: "mweb" + proxyLabel, 2: "tv" + proxyLabel, 3: "android" + proxyLabel}
-	log.Debug().Str("videoID", videoID).Str("winner", stratLabels[best.priority]).Int("formats", len(best.formats)).Msg("youtube: extraction winner")
+	// Derive the winning client from the strategy list itself. The old hardcoded
+	// priority→label map assumed the default ordering and mislabelled the winner whenever
+	// the POT ordering put mweb first.
+	winner := ""
+	for _, st := range strategies {
+		if st.priority == best.priority {
+			winner = st.client
+			break
+		}
+	}
+	winnerLabel := winner
+	if winnerLabel == "" {
+		winnerLabel = "default"
+	}
+	// Remember it: a re-mint that asks the wrong client gets nothing back, the download
+	// dies at its first byte wall and the viewer sees a 500 about a minute in. Prod
+	// 2026-08-27: android was winning extraction while re-mint still asked default only.
+	// ★2026-09-04: длинный ролик — HLS вместо склейки. DASH-URL (и с POT) отдаёт
+	// ~60 с медиа и упирается в 403 «past window»; переминт двигает стену на минуту,
+	// зритель всё равно падает на 4:18. HLS с manifest.googlevideo.com стены не
+	// имеет (1080p, 415 МиБ / 10 мин, 0 отказов), а лестницу с HLS-аудио 233/234
+	// отдаёт только default-клиент — и её наличие включает HLS-only режим в
+	// buildQualityMap. mweb с POT побеждает первым и HLS не несёт, поэтому для
+	// длинного ролика дотягиваем default-экстракцию и подменяем ею победителя.
+	// Сначала смотрим в СЫРУЮ выдачу победителя: default-клиент несёт HLS сам, но
+	// tryProgressive внутри verifyFormats вырезает его, когда прогрессив качается
+	// (пробе хватает первых байт, стену на 60-й секунде она не видит). Вторая
+	// экстракция нужна только победителю без HLS вовсе (mweb).
+	if y.hlsMinDuration >= 0 && best.duration >= y.hlsMinDuration && !ytHasHLSAudio(best.formats) {
+		cand, src := best.raw, winnerLabel+" raw"
+		if !ytHasHLSAudio(cand) {
+			if hi, ok := noCookieFormats(); ok {
+				cand, src = hi, "default no-cookies"
+			}
+		}
+		if swapped, ok := preferHLSForLong(best.formats, cand, best.duration, y.hlsMinDuration); ok {
+			log.Info().Str("videoID", videoID).Str("winner", winnerLabel).Str("source", src).Float64("duration", best.duration).
+				Int("hls_formats", len(swapped)).Msg("youtube: long video — HLS ladder instead of DASH mux")
+			best.formats = swapped
+		}
+	}
+	y.rememberWinner(videoID, winner)
+	log.Debug().Str("videoID", videoID).Str("winner", winnerLabel+proxyLabel).Int("formats", len(best.formats)).Msg("youtube: extraction winner")
 
 	return best.formats, best.duration, best.usedProxy, true
 }
@@ -2324,9 +3306,7 @@ func (y *YoutubeChecker) runExtractNoCookies(videoID, ytURL string, useProxy boo
 	}
 	// baseArgs without cookies — JS runtime + plugin-dirs (POT обязателен с 2026-08-14,
 	// см. baseArgs; без него URL режутся тизерным окном CDN).
-	if y.pluginDirs != "" && !y.fetchPotNever {
-		args = append(args, "--plugin-dirs", y.pluginDirs)
-	}
+	args = y.appendPluginDirs(args)
 	if y.jsRuntime != "" {
 		args = append(args, "--js-runtimes", y.jsRuntime)
 	}
@@ -2410,22 +3390,19 @@ func (y *YoutubeChecker) runExtractDetailed(videoID, ytURL, playerClient string,
 		"--ignore-no-formats-error",
 		"--socket-timeout", "15",
 	}
-	// tv / android / android_vr / tv_simply / ios don't accept cookies —
-	// pass JS runtime only. yt-dlp would otherwise skip these clients silently
-	// with "client X does not support cookies". (plugin-dirs intentionally
-	// omitted everywhere — see baseArgs comment.)
-	switch playerClient {
-	case "tv", "android", "android_vr", "tv_simply", "ios":
-		// без кук, но плагины нужны и тут — POT-less URL упираются в тизерное окно CDN
-		if y.pluginDirs != "" && !y.fetchPotNever {
-			args = append(args, "--plugin-dirs", y.pluginDirs)
-		}
-		if y.jsRuntime != "" {
-			args = append(args, "--js-runtimes", y.jsRuntime)
-		}
-	default:
-		args = append(args, y.baseArgs()...)
-	}
+	// Куки отдаём ВСЕМ клиентам. Раньше tv/android/android_vr/tv_simply/ios шли
+	// без них, потому что yt-dlp когда-то молча пропускал такой клиент. Он этого
+	// больше не делает: клиенту, который куки не поддерживает, yt-dlp их просто не
+	// отправляет (поэтому запрет на куки в мобильных клиентах соблюдается сам собой),
+	// а tv их принимает и без них не работает вовсе.
+	//
+	// Замер на проде 2026-08-31, когда IP словил бот-чек:
+	//   tv БЕЗ кук   → «The page needs to be reloaded», 0 форматов;
+	//   tv С куками  → ссылка получена.
+	// Из-за старого исключения основной клиент оставался без единственного, что
+	// проводило его через проверку, извлечение скатывалось до android и получало
+	// «Sign in to confirm you're not a bot» — за 25 минут 11 провалов и ни одного mux.
+	args = append(args, y.baseArgs()...)
 	// PO Token policy — конфигурируемая ([youtube] fetch_pot), история двух инцидентов:
 	// 2026-08-03: POT-URL от bgutil были ядом (CDN 403-ил после первых запросов) → never.
 	// 2026-08-14: Google перевернул стол — БЕЗ POT CDN отдаёт только первые ~20 МиБ
@@ -2469,6 +3446,7 @@ func (y *YoutubeChecker) runExtractDetailed(videoID, ytURL, playerClient string,
 			stderrStr = stderrStr[len(stderrStr)-500:]
 		}
 		log.Warn().Err(err).Str("videoID", videoID).Str("client", clientLabel).Bool("proxy", useProxy).Str("stderr", stderrStr).Msg("youtube: extract attempt failed")
+		rememberExtractReason(videoID, stderrStr)
 		return nil, 0, false, ytAntiBotStderr(stderrStr)
 	}
 
@@ -2483,6 +3461,7 @@ func (y *YoutubeChecker) runExtractDetailed(videoID, ytURL, playerClient string,
 			stderrStr = stderrStr[len(stderrStr)-300:]
 		}
 		log.Warn().Err(err).Str("videoID", videoID).Str("client", clientLabel).Int("outLen", len(out)).Str("stderr", stderrStr).Msg("youtube: parse attempt failed")
+		rememberExtractReason(videoID, stderrStr)
 		return nil, 0, false, ytAntiBotStderr(stderrStr)
 	}
 
@@ -2492,6 +3471,7 @@ func (y *YoutubeChecker) runExtractDetailed(videoID, ytURL, playerClient string,
 			stderrStr = stderrStr[len(stderrStr)-1000:]
 		}
 		log.Warn().Str("videoID", videoID).Str("client", clientLabel).Bool("proxy", useProxy).Str("stderr", stderrStr).Msg("youtube: yt-dlp returned 0 formats")
+		rememberExtractReason(videoID, stderrStr)
 		return nil, 0, false, ytAntiBotStderr(stderrStr)
 	}
 
@@ -2574,26 +3554,95 @@ func ytImgProxyMaybe(host, raw string) string {
 // empty ⇒ direct. Without this, i.ytimg.com is unreachable on DPI-blocked hosts and previews
 // come back blank even though the (server-muxed) videos play fine.
 var (
+	ytImgMu          sync.Mutex
 	ytImgProxyAddr   string
-	ytImgClientOnce  sync.Once
+	ytImgClientAddr  string // выход, под который собран ytImgProxyClient
 	ytImgProxyClient *http.Client
 )
 
-func setYtImgProxyAddr(addr string) { ytImgProxyAddr = addr }
+func setYtImgProxyAddr(addr string) {
+	ytImgMu.Lock()
+	ytImgProxyAddr = addr
+	ytImgMu.Unlock()
+}
 
 // ytImgFetchClient returns the proxied uTLS client when a bypass is configured, else the
 // default client. Built lazily so a "proxy = none" server pays nothing.
+//
+// Клиент пересобирается при смене выхода. Раньше он строился один раз
+// (sync.Once) под адрес на момент ПЕРВОГО превью — обычно статический выход из
+// конфига, ещё до того как перебор (setActiveProxy) нашёл живой. Мёртвый выход
+// прибивался до следующего перезапуска: после рестарта 21.09.2026 20:28Z
+// /lite/youtube/img отдавал 377 × 502 с медианой ровно 10 с (таймаут) при
+// 84 × 200 из кэша.
 func ytImgFetchClient() *http.Client {
+	ytImgMu.Lock()
+	defer ytImgMu.Unlock()
 	if ytImgProxyAddr == "" {
 		return http.DefaultClient
 	}
-	ytImgClientOnce.Do(func() {
-		ytImgProxyClient = httpclient.NewTLSClientViaSOCKS5(ytImgProxyAddr, 10*time.Second)
-	})
+	if ytImgProxyClient == nil || ytImgClientAddr != ytImgProxyAddr {
+		// Таймаут самого клиента = бюджет попытки: uTLS-клиент через SOCKS не
+		// слушает контекст запроса и держал свои 10 с до провала (после правки
+		// с бюджетом 4 с медиана 200-ответов осталась ровно 10 с).
+		ytImgProxyClient = httpclient.NewTLSClientViaSOCKS5(ytImgProxyAddr, ytImgProxyBudget)
+		ytImgClientAddr = ytImgProxyAddr
+	}
 	if ytImgProxyClient == nil {
 		return http.DefaultClient
 	}
 	return ytImgProxyClient
+}
+
+const (
+	// Бюджет попытки через выход YouTube. Раньше запасной прямой запрос делил с
+	// ней один контекст на 10 с: мёртвый выход съедал всё, и «запасной» умирал
+	// на старте с deadline exceeded — 502 ровно через 10 с на каждое превью
+	// (после рестарта 21.09.2026: 70 × 502 против 4 × 200). Превью не привязано
+	// к адресу, прямой путь с main работает — ему свой бюджет.
+	ytImgProxyBudget  = 4 * time.Second
+	ytImgDirectBudget = 8 * time.Second
+)
+
+// ytImgFallbacks — сколько превью ушли напрямую после провала выхода (диагностика).
+var ytImgFallbacks atomic.Int64
+
+// ytImgProxyDownUntil — до какого момента (unix-нано) выход считаем мёртвым и
+// идём сразу напрямую: платить бюджет выхода за каждую картинку, пока он лежит,
+// незачем — превью не привязано к адресу.
+var ytImgProxyDownUntil atomic.Int64
+
+const ytImgProxyDownFor = time.Minute
+
+// ytImgFetch — превью через выход YouTube с коротким бюджетом, при провале —
+// напрямую; после провала минуту идём напрямую сразу. cancel вызывать после
+// чтения тела.
+func ytImgFetch(parent context.Context, imgURL string) (*http.Response, context.CancelFunc, error) {
+	one := func(c *http.Client, d time.Duration) (*http.Response, context.CancelFunc, error) {
+		ctx, cancel := context.WithTimeout(parent, d)
+		hreq, err := http.NewRequestWithContext(ctx, http.MethodGet, imgURL, nil)
+		if err != nil {
+			cancel()
+			return nil, nil, err
+		}
+		hreq.Header.Set("User-Agent", "Mozilla/5.0")
+		resp, err := c.Do(hreq)
+		if err != nil {
+			cancel()
+			return nil, nil, err
+		}
+		return resp, cancel, nil
+	}
+	c := ytImgFetchClient()
+	now := time.Now()
+	if c != http.DefaultClient && now.UnixNano() >= ytImgProxyDownUntil.Load() {
+		if resp, cancel, err := one(c, ytImgProxyBudget); err == nil {
+			return resp, cancel, nil
+		}
+		ytImgFallbacks.Add(1)
+		ytImgProxyDownUntil.Store(now.Add(ytImgProxyDownFor).UnixNano())
+	}
+	return one(http.DefaultClient, ytImgDirectBudget)
 }
 
 // YtImgProxyHandler proxies YouTube video thumbnails (i.ytimg.com) and channel/playlist avatars
@@ -2626,25 +3675,12 @@ func YtImgProxyHandler(w http.ResponseWriter, req *http.Request) {
 		imgURL = "https://i.ytimg.com/vi/" + videoID + "/hqdefault.jpg"
 	}
 
-	ctx, cancel := context.WithTimeout(req.Context(), 10*time.Second)
-	defer cancel()
-
-	hreq, _ := http.NewRequestWithContext(ctx, "GET", imgURL, nil)
-	hreq.Header.Set("User-Agent", "Mozilla/5.0")
-
-	client := ytImgFetchClient()
-	resp, err := client.Do(hreq)
-	if err != nil && client != http.DefaultClient {
-		// Proxy path failed (proxy down / not yet up) — last-resort direct fetch so a
-		// working direct route still serves the thumbnail.
-		hreq2, _ := http.NewRequestWithContext(ctx, "GET", imgURL, nil)
-		hreq2.Header.Set("User-Agent", "Mozilla/5.0")
-		resp, err = http.DefaultClient.Do(hreq2)
-	}
+	resp, cancel, err := ytImgFetch(req.Context(), imgURL)
 	if err != nil {
 		http.Error(w, "upstream error", http.StatusBadGateway)
 		return
 	}
+	defer cancel()
 	defer resp.Body.Close()
 
 	w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
@@ -2999,6 +4035,17 @@ func (y *YoutubeChecker) HandleMux(w http.ResponseWriter, req *http.Request) {
 	}
 
 	if entry.Err != nil {
+		// The mux died — but if it already produced segments, those are perfectly playable.
+		// Handing the viewer a 500 mid-playback throws away everything that WAS downloaded;
+		// serving the partial playlist with ENDLIST instead lets them watch on to wherever the
+		// download reached and then end cleanly. A retry for the full video is started
+		// separately by getOrStartMux.
+		if n := muxSegmentCount(entry.Dir); n > 0 {
+			log.Warn().Err(entry.Err).Str("key", key).Int("segments", n).
+				Msg("youtube: mux failed — serving the segments that did complete")
+			y.serveTruncatedPlaylist(w, req, entry)
+			return
+		}
 		log.Warn().Err(entry.Err).Str("key", key).Msg("youtube: mux failed")
 		http.Error(w, "mux failed: "+entry.Err.Error(), http.StatusInternalServerError)
 		return
@@ -3104,7 +4151,7 @@ func (y *YoutubeChecker) HandleMux(w http.ResponseWriter, req *http.Request) {
 	// We need to rewrite segment URLs to go through our handler.
 	// Wait for ffmpeg to generate some segments.
 	// The playlist is ready when entry.Ready is closed.
-	host := hostFromRequest(req)
+	host := ytHost(req)
 	baseURL := host + "/lite/youtube/mux/seg?key=" + key + "&seg="
 	initURL := host + "/lite/youtube/mux/init.mp4?key=" + key
 
@@ -3142,6 +4189,7 @@ func (y *YoutubeChecker) registerMasterPlaylist(host, videoID string, qr ytQuali
 			Bandwidth:  bw,
 			Codecs:     hlsCodecsString(pair.VCodec, pair.ACodec, pair.TransAudio),
 			VariantURL: variantURL,
+			VideoRange: pair.VideoRange,
 		})
 	}
 	if len(variants) < 2 {
@@ -3164,7 +4212,54 @@ func (y *YoutubeChecker) registerMasterPlaylist(host, videoID string, qr ytQuali
 	}
 	y.muxMu.Unlock()
 
-	return host + "/lite/youtube/mux/master.m3u8?key=" + masterKey
+	return host + "/lite/youtube/mux/master.m3u8?key=" + masterKey + "&v=" + url.QueryEscape(videoID)
+}
+
+// rebuildMaster пересобирает мастер после перезапуска: свежая экстракция → та же
+// карта качеств → тот же детерминированный ключ. Дорого, поэтому только на промах.
+func (y *YoutubeChecker) rebuildMaster(req *http.Request, links *proxylink.Manager, key string) (ytMasterEntry, bool) {
+	videoID := strings.TrimSpace(req.URL.Query().Get("v"))
+	if videoID == "" || links == nil {
+		return ytMasterEntry{}, false
+	}
+	formats, _, usedProxy, ok := y.getFormats(videoID)
+	if !ok || len(formats) == 0 {
+		log.Warn().Str("videoID", videoID).Msg("youtube: мастер пересобрать не вышло — форматов нет")
+		return ytMasterEntry{}, false
+	}
+	// buildQualityMap читает videoID из запроса и попутно регистрирует мастера.
+	q := req.URL.Query()
+	q.Set("videoID", videoID)
+	req2 := req.Clone(req.Context())
+	req2.URL.RawQuery = q.Encode()
+	y.buildQualityMap(req2, formats, links, ytProxyHeaders(), usedProxy)
+
+	y.muxMu.Lock()
+	entry, found := y.masterCache[key]
+	y.muxMu.Unlock()
+	if !found {
+		return ytMasterEntry{}, false
+	}
+	log.Info().Str("videoID", videoID).Msg("youtube: мастер-плейлист пересобран после перезапуска")
+	return entry, true
+}
+
+// hlsAudioCodec возвращает кодек звуковой дорожки для атрибута CODECS.
+//
+// У HLS-форматов YouTube (режим HLS-only) yt-dlp сплошь и рядом не заполняет
+// acodec, и в мастер уходило `CODECS="vp09.00.51.08"` — только видео, при
+// объявленной аудиогруппе. Плеер строит буферы MSE по этой строке: не зная кодека
+// звука, он не поднимает аудиодорожку, а с ней встаёт весь вариант — сегменты
+// исправно качаются, картинки нет.
+//
+// Запасное значение не выдумано: сегменты этой дорожки — ADTS AAC (проверено
+// ffprobe: заголовок ID3, поток aac), то есть mp4a.40.2.
+func hlsAudioCodec(a ytFormat) string {
+	c := strings.TrimSpace(a.ACodec)
+	if c == "" || c == "none" {
+		return "mp4a.40.2"
+	}
+	return c
 }
 
 // hlsCodecsString returns the CODECS attribute value for EXT-X-STREAM-INF.
@@ -3199,7 +4294,19 @@ func hlsCodecsString(vcodec, acodec string, transcodedToAAC bool) string {
 // handleMuxMaster serves the master HLS playlist with EXT-X-STREAM-INF for
 // each registered quality variant. hls.js reads it once and shows a level
 // picker; switching levels triggers requests to the per-quality m3u8 handler.
+// MuxMasterHandler returns the master-playlist handler bound to the proxy-link
+// manager: без него пересобрать мастер нельзя — ссылки внутри проксируются.
+func (y *YoutubeChecker) MuxMasterHandler(links *proxylink.Manager) http.HandlerFunc {
+	return func(w http.ResponseWriter, req *http.Request) { y.handleMuxMaster(w, req, links) }
+}
+
+// HandleMuxMaster serves the master playlist without rebuild support (совместимость
+// со старой регистрацией маршрута; предпочтительнее MuxMasterHandler).
 func (y *YoutubeChecker) HandleMuxMaster(w http.ResponseWriter, req *http.Request) {
+	y.handleMuxMaster(w, req, nil)
+}
+
+func (y *YoutubeChecker) handleMuxMaster(w http.ResponseWriter, req *http.Request, links *proxylink.Manager) {
 	key := strings.TrimSpace(req.URL.Query().Get("key"))
 	if key == "" {
 		http.Error(w, "missing key param", http.StatusBadRequest)
@@ -3210,8 +4317,15 @@ func (y *YoutubeChecker) HandleMuxMaster(w http.ResponseWriter, req *http.Reques
 	entry, ok := y.masterCache[key]
 	y.muxMu.Unlock()
 	if !ok || time.Now().After(entry.Expires) {
-		http.Error(w, "master playlist not found — video may have expired, please reload", http.StatusNotFound)
-		return
+		// Реестр живёт в памяти процесса: перезапуск сервиса стирает его, и зритель
+		// получал 404 посреди просмотра. Ключ детерминированный, а videoID лежит в
+		// самой ссылке — значит мастер можно собрать заново, а не отфутболивать.
+		if e2, ok2 := y.rebuildMaster(req, links, key); ok2 {
+			entry = e2
+		} else {
+			http.Error(w, "master playlist not found — video may have expired, please reload", http.StatusNotFound)
+			return
+		}
 	}
 
 	// Sort variants by height ascending so hls.js builds the level list in
@@ -3221,8 +4335,22 @@ func (y *YoutubeChecker) HandleMuxMaster(w http.ResponseWriter, req *http.Reques
 		return sortedVariants[i].Height < sortedVariants[j].Height
 	})
 
+	// Звуковая группа объявляется один раз на весь мастер: у всех вариантов
+	// HLS-only режима аудиодорожка общая.
+	audioURL := ""
+	for _, v := range sortedVariants {
+		if v.AudioURL != "" {
+			audioURL = v.AudioURL
+			break
+		}
+	}
+
 	var sb strings.Builder
 	sb.WriteString("#EXTM3U\n#EXT-X-VERSION:6\n#EXT-X-INDEPENDENT-SEGMENTS\n")
+	if audioURL != "" {
+		sb.WriteString(`#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="Audio",` +
+			`DEFAULT=YES,AUTOSELECT=YES,URI="` + audioURL + "\"\n")
+	}
 	for _, v := range sortedVariants {
 		sb.WriteString("#EXT-X-STREAM-INF:BANDWIDTH=")
 		sb.WriteString(strconv.Itoa(v.Bandwidth))
@@ -3236,6 +4364,16 @@ func (y *YoutubeChecker) HandleMuxMaster(w http.ResponseWriter, req *http.Reques
 			sb.WriteString(`,CODECS="`)
 			sb.WriteString(v.Codecs)
 			sb.WriteString(`"`)
+		}
+		// Без VIDEO-RANGE плеер считает поток SDR даже при av01…10 с bt2020 в CODECS,
+		// и HDR-конвейер телевизора не включается. SDR не пишем: атрибут появился в
+		// HLS позже, и старые плееры на незнакомом значении спотыкаются.
+		if v.VideoRange == "PQ" || v.VideoRange == "HLG" {
+			sb.WriteString(",VIDEO-RANGE=")
+			sb.WriteString(v.VideoRange)
+		}
+		if audioURL != "" {
+			sb.WriteString(`,AUDIO="aud"`)
 		}
 		sb.WriteString(`,NAME="`)
 		sb.WriteString(v.Label)
@@ -3416,7 +4554,28 @@ func (y *YoutubeChecker) getOrStartMux(key, videoURL, audioURL, vcodec, videoID 
 
 	// Return existing (in-progress or completed).
 	if entry, ok := y.muxCache[key]; ok {
-		return entry
+		// A job that FAILED must not be cached forever. ffmpeg dies when the download is
+		// truncated by an anti-bot burst — a transient condition — yet the failed entry was
+		// kept, so every later playlist request for that key returned 500 for the rest of the
+		// key's life. That is what the viewer experiences as «plays for a minute, then error»:
+		// the player re-fetches the growing EVENT playlist and gets a hard 500.
+		//
+		// Retry instead, but not in a hot loop: one attempt per ytMuxRetryAfter, and only a few
+		// in total, so a genuinely dead video cannot spin ffmpeg and yt-dlp forever.
+		if entry.Err != nil && entry.finished() && time.Since(entry.failedAt) >= ytMuxRetryAfter &&
+			entry.attempts < ytMuxMaxAttempts {
+			log.Info().Str("key", key).Int("attempt", entry.attempts+1).
+				Msg("youtube: mux failed earlier — starting a fresh attempt")
+			removeMuxDir(entry.Dir, "failed-retry")
+			delete(y.muxCache, key)
+			defer func(prev int) {
+				if e, ok := y.muxCache[key]; ok {
+					e.attempts = prev + 1
+				}
+			}(entry.attempts)
+		} else {
+			return entry
+		}
 	}
 
 	// Evict oldest if over limit.
@@ -3589,6 +4748,14 @@ func (y *YoutubeChecker) runMux(entry *ytMuxEntry, videoURL, audioURL string) {
 	//
 	// Side benefit: the racing strategies in pipeDownloadStream still help
 	// when DPI is present (Russian VPS) or when a CDN node is slow.
+	// HLS сюда доходить не должен: buildQualityMap отдаёт такие ссылки плееру
+	// напрямую. Если всё же дошёл — пусть идёт прежним путём через пайп: там он
+	// умрёт чисто («Invalid data found»), а не сегфолтом с дампом ядра, как это
+	// делает ffmpeg, когда HLS скармливают ему URL'ом.
+	if ytIsHLSManifest(videoURL) || ytIsHLSManifest(audioURL) {
+		log.Warn().Msg("youtube: HLS-манифест дошёл до склейки — так быть не должно")
+	}
+
 	var cmd *exec.Cmd
 	var pipeCleanup []func() // close write-ends after ffmpeg exits
 	videoR, videoW, err1 := os.Pipe()
@@ -3700,6 +4867,7 @@ func (y *YoutubeChecker) runMux(entry *ytMuxEntry, videoURL, audioURL string) {
 	// properly (goroutines get EPIPE) if ffmpeg exits while they're still writing.
 	if err := cmd.Start(); err != nil {
 		entry.Err = fmt.Errorf("ffmpeg start: %w", err)
+		entry.failedAt = time.Now()
 		y.setEntryExpires(entry, 2*time.Minute) // clean up failed dir quickly
 		log.Warn().Err(entry.Err).Msg("youtube: HLS mux — ffmpeg start failed")
 		for _, fn := range pipeCleanup {
@@ -3748,6 +4916,7 @@ func (y *YoutubeChecker) runMux(entry *ytMuxEntry, videoURL, audioURL string) {
 
 	if err := cmd.Wait(); err != nil {
 		entry.Err = fmt.Errorf("ffmpeg: %w: %s", err, stderr.String())
+		entry.failedAt = time.Now()
 		y.setEntryExpires(entry, 2*time.Minute) // clean up failed dir quickly
 		log.Warn().Err(entry.Err).Msg("youtube: HLS mux failed")
 		// Signal Ready in case first segment never appeared.
@@ -3772,6 +4941,7 @@ func (y *YoutubeChecker) runMux(entry *ytMuxEntry, videoURL, audioURL string) {
 	// an error and expire fast so a reload starts a fresh mux instead of replaying the stub.
 	if entry.truncated.Load() {
 		entry.Err = fmt.Errorf("mux truncated: stream download died mid-file (all routes failed)")
+		entry.failedAt = time.Now()
 		y.setEntryExpires(entry, 2*time.Minute)
 		log.Warn().Str("dir", entry.Dir).Msg("youtube: HLS mux truncated — marking failed")
 		return
@@ -3978,28 +5148,66 @@ func ytURLDesc(raw string) string {
 	return d
 }
 
-func (y *YoutubeChecker) probeStreamURL(streamURL string) (ok bool) {
+func (y *YoutubeChecker) probeStreamURL(streamURL string, fileSize int64) (ok bool) {
 	start := time.Now()
 	defer func() {
-		log.Debug().Bool("ok", ok).Str("stream", ytURLDesc(streamURL)).Dur("elapsed", time.Since(start)).Msg("youtube: stream URL probe")
+		log.Debug().Bool("ok", ok).Str("stream", ytURLDesc(streamURL)).
+			Int64("filesize", fileSize).Dur("elapsed", time.Since(start)).
+			Msg("youtube: stream URL probe")
 	}()
 	// Двухфазная проба. Первый килобайт ловит мёртвые URL/маршруты, но НЕ ловит
 	// «тизерное окно» (2026-08-14: POT-less URL отдаёт первые ~20 МиБ и 403-ит
 	// дальше — mux умирал на середине файла при зелёной пробе). Вторая фаза бьёт
 	// за окно: 206 = полный доступ, 416 = файл короче офсета (тоже ок), 403 = яд.
+	// Обе фазы запускаем СРАЗУ. Вторая нужна только когда прошла первая, но её
+	// результат всё равно ждать — а последовательный запуск удваивал задержку
+	// удачной пробы, то есть обычного случая. Ценой одного лишнего запроса по
+	// килобайту на неудачной первой фазе.
+	// Вторая фаза нужна ТОЛЬКО в POT-режиме через прокси, где окно коварно мигает.
+	// В прямом POT-less режиме окно нормальное и лечится переминтом на лету
+	// (свежая ссылка сбрасывает окно), поэтому упреждающе браковать URL по офсету
+	// НЕЛЬЗЯ: это гнало живой android_vr в кулдаун и роняло зрителя в 360p.
+	second := make(chan bool, 1)
+	if offset, allow416, skip := probeSecondPhase(fileSize); !y.fetchPotNever && !skip {
+		go func() {
+			second <- y.raceProbe(streamURL, fmt.Sprintf("bytes=%d-%d", offset, offset+1023), allow416)
+		}()
+	} else {
+		second <- true
+	}
 	if !y.raceProbe(streamURL, "bytes=0-1023", false) {
 		return false
 	}
-	// Вторая фаза (за тизерным окном) нужна ТОЛЬКО в POT-режиме через прокси, где окно
-	// коварно мигает. В прямом POT-less режиме окно нормальное и лечится переминтом на
-	// лету (свежая ссылка сбрасывает окно — проверено), поэтому упреждающе браковать URL
-	// по офсету НЕЛЬЗЯ: это гнало живой android_vr в кулдаун → фолбэк в 360p.
-	if y.fetchPotNever {
-		return true
-	}
-	const teaserProbeOffset = 24 << 20
-	return y.raceProbe(streamURL, fmt.Sprintf("bytes=%d-%d", teaserProbeOffset, teaserProbeOffset+1023), true)
+	return <-second
 }
+
+// probeSecondPhase выбирает точку второй фазы пробы. Вынесено отдельно, чтобы
+// правило «офсет обязан лежать ВНУТРИ файла» можно было проверить тестом.
+func probeSecondPhase(fileSize int64) (offset int64, allow416, skip bool) {
+	if fileSize <= 0 {
+		// Размер неизвестен: бить можно только вслепую, и 416 остаётся законным
+		// ответом («файл короче офсета»).
+		return int64(teaserProbeOffset), true, false
+	}
+	if fileSize <= probeTailGap {
+		return 0, false, true // файл целиком помещается в грейс-окно
+	}
+	// Бьём в САМЫЙ КОНЕЦ файла, а не в фиксированные 24 МиБ. Окно у разных
+	// клиентов разное (mweb режется на ~16 МиБ, tvhtml5/visionos переживают 24
+	// и падают дальше), поэтому единственная честная проверка «отдаётся ли
+	// формат целиком» — попросить его последний килобайт. Доступен конец —
+	// доступен и весь файл: окно всегда отсчитывается от начала.
+	return fileSize - probeTailGap, false, false
+}
+
+const (
+	// teaserProbeOffset — точка за «тизерным окном» googlevideo (замер 2026-08-30:
+	// DASH-форматы отдаются до ~16-18 МиБ, дальше 403 на любом маршруте и с любой
+	// свежей ссылкой).
+	teaserProbeOffset = 24 << 20
+	// probeTailGap — отступ от конца файла, чтобы проба заведомо попала ВНУТРЬ.
+	probeTailGap = 64 << 10
+)
 
 // raceProbe races every download route for one ranged request. allow416 —
 // для пробы за тизерным окном: Range Not Satisfiable значит лишь «файл короче»,
@@ -4054,6 +5262,179 @@ func (y *YoutubeChecker) raceProbe(streamURL, rangeHdr string, allow416 bool) bo
 	return false
 }
 
+// ytIsHLSManifest reports whether a stream URL is an HLS playlist rather than a
+// progressive byte range. Такие адреса нельзя качать по диапазонам — из них ffmpeg
+// должен читать сам.
+func ytIsHLSManifest(rawURL string) bool {
+	return strings.Contains(rawURL, "/api/manifest/hls") || strings.Contains(rawURL, ".m3u8")
+}
+
+// ── причина неудачного извлечения ──
+//
+// Раньше на ЛЮБОЙ провал зрителю показывали «Проверьте PO Token (pip install
+// bgutil-ytdlp-pot-provider)». Для возрастного ролика это прямая дезинформация:
+// POT в порядке, чинить нечего, а совет уводит в сторону. Поэтому запоминаем
+// stderr последней попытки и переводим его в человеческую причину.
+var extractReasons sync.Map // videoID → extractReason
+
+type extractReason struct {
+	stderr string
+	at     time.Time
+}
+
+func rememberExtractReason(videoID, stderr string) {
+	if videoID == "" {
+		return
+	}
+	// Клиенты пробуются по очереди, и последний обычно падает невнятнее первого
+	// («Requested format is not available» вместо «Video unavailable»). Уже
+	// распознанную причину не затираем нераспознанной.
+	if v, ok := extractReasons.Load(videoID); ok {
+		if prev, _ := v.(extractReason); time.Since(prev.at) < time.Minute &&
+			classifyExtractStderr(prev.stderr) != "" && classifyExtractStderr(stderr) == "" {
+			return
+		}
+	}
+	extractReasons.Store(videoID, extractReason{stderr: stderr, at: time.Now()})
+}
+
+// extractReasonFor возвращает текст для зрителя. Причина живёт недолго: ролик мог
+// стать доступным, а старое объяснение только запутает.
+func extractReasonFor(videoID string) string {
+	const fallback = "yt-dlp не смог извлечь форматы видео. Проверьте PO Token (pip install bgutil-ytdlp-pot-provider)"
+	v, ok := extractReasons.Load(videoID)
+	if !ok {
+		return fallback
+	}
+	r, _ := v.(extractReason)
+	if time.Since(r.at) > 5*time.Minute {
+		extractReasons.Delete(videoID)
+		return fallback
+	}
+	if msg := classifyExtractStderr(r.stderr); msg != "" {
+		return msg
+	}
+	return fallback
+}
+
+// classifyExtractStderr переводит stderr yt-dlp в причину для зрителя. Пустая
+// строка — причина не распознана.
+func classifyExtractStderr(stderr string) string {
+	l := strings.ToLower(stderr)
+	switch {
+	case strings.Contains(l, "confirm your age"), strings.Contains(l, "age-restricted"):
+		return "Видео с возрастным ограничением: YouTube отдаёт его только подтверждённому аккаунту. " +
+			"Нужны куки аккаунта, прошедшего проверку возраста."
+	case strings.Contains(l, "not a bot"), strings.Contains(l, "too many requests"):
+		return "YouTube требует подтверждения, что запрос не от робота (IP под ограничением). " +
+			"Обычно проходит само; если нет — сменить выход в [youtube] proxy."
+	case strings.Contains(l, "private video"):
+		return "Приватное видео — доступа нет."
+	case strings.Contains(l, "members-only"), strings.Contains(l, "join this channel"):
+		return "Видео только для спонсоров канала."
+	case strings.Contains(l, "video unavailable"), strings.Contains(l, "removed by the uploader"):
+		return "Видео недоступно: удалено или скрыто автором."
+	case strings.Contains(l, "not available in your country"), strings.Contains(l, "blocked it in your country"):
+		return "Видео заблокировано в стране сервера."
+	case strings.Contains(l, "live event will begin"), strings.Contains(l, "premieres in"):
+		return "Трансляция ещё не началась."
+	}
+	return ""
+}
+
+// ytProxyHeaders — заголовки, с которыми /proxy ходит на googlevideo. Вынесены из
+// stream(), потому что тем же набором пересобирает ссылки обработчик мастера.
+func ytProxyHeaders() map[string]string {
+	return map[string]string{
+		"Origin":     "https://www.youtube.com",
+		"Referer":    "https://www.youtube.com/",
+		"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+	}
+}
+
+// ytItagOf returns the itag encoded in a googlevideo URL, or 0.
+func ytItagOf(rawURL string) int {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return 0
+	}
+	n, err := strconv.Atoi(u.Query().Get("itag"))
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
+// sabrDownload качает дорожку через sabr-сервис ([youtube] sabr_url) и пишет её в
+// пайп ffmpeg. Возвращает true, если поток отдан (пусть даже оборванным на середине).
+//
+// Зачем вообще: обычная googlevideo-ссылка отдаёт ~16 МиБ и дальше отвечает 403 на
+// любой Range — ролик рвётся на четвёртой минуте. SABR — тот же протокол, которым
+// качает сам плеер YouTube: сессию можно переоткрыть с нужной позиции, а участки
+// тянуть параллельно (троттлинг у YouTube посессионный, поэтому 12 сессий дают
+// ×11 к скорости).
+//
+// Только видеодорожка. Аудио оставлено прежнему пути: во-первых, audio-only режим
+// SABR у вещателя нестабилен (сервер перестаёт слать сегменты через ~45 с), во-вторых,
+// у ролика бывает несколько аудиодорожек с ОДНИМ itag (дубляжи), и sabr-сервис выбрал
+// бы не ту, что взял yt-dlp, — зритель получил бы чужой язык. Аудио весит копейки,
+// и старый путь с ranged-докачкой его тянет без проблем.
+//
+// Провал ДО первого байта — не ошибка: возвращаем false и уходим на прежний путь,
+// как будто SABR не настраивали. После первого байта отката уже нет (в пайпе лежат
+// данные), поэтому обрыв помечается truncated ровно как у обычной загрузки.
+func (y *YoutubeChecker) sabrDownload(ctx context.Context, entry *ytMuxEntry, streamURL string, w *os.File, label string) bool {
+	if y.sabrURL == "" || label != "video" || entry == nil || entry.VideoID == "" {
+		return false
+	}
+	itag := ytItagOf(streamURL)
+	if itag == 0 {
+		return false // не googlevideo-ссылка (HLS-манифест, например) — не наш случай
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf(
+		"%s/video?id=%s&track=video&itag=%d", y.sabrURL, url.QueryEscape(entry.VideoID), itag), nil)
+	if err != nil {
+		return false
+	}
+	// Сервис локальный, но первый байт ждёт инициализации сессии SABR, поэтому
+	// таймаут только на заголовки — тело льётся сколько нужно.
+	cl := &http.Client{Timeout: 0, Transport: &http.Transport{ResponseHeaderTimeout: 90 * time.Second}}
+	resp, err := cl.Do(req)
+	if err != nil {
+		log.Warn().Err(err).Str("video", entry.VideoID).Msg("youtube: sabr недоступен — идём обычным путём")
+		return false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		log.Warn().Int("status", resp.StatusCode).Str("ответ", strings.TrimSpace(string(body))).
+			Str("video", entry.VideoID).Msg("youtube: sabr отказал — идём обычным путём")
+		return false
+	}
+
+	total := resp.ContentLength
+	t0 := time.Now()
+	written, cerr := io.Copy(w, resp.Body)
+	if written == 0 {
+		log.Warn().AnErr("err", cerr).Str("video", entry.VideoID).
+			Msg("youtube: sabr не отдал ни байта — идём обычным путём")
+		return false
+	}
+	if total > 0 && written < total {
+		entry.truncated.Store(true)
+	}
+	sec := time.Since(t0).Seconds()
+	ev := log.Info()
+	if cerr != nil && ctx.Err() == nil {
+		ev = log.Warn().Err(cerr)
+	}
+	ev.Int64("bytes", written).Int64("total", total).Int("itag", itag).
+		Str("скорость", fmt.Sprintf("%.2f МБ/с", float64(written)/1048576/max(sec, 0.001))).
+		Msg("youtube: sabr — видео скачано")
+	return true
+}
+
 // pipeDownloadStream downloads a YouTube stream URL and writes the response body
 // to the given os.File (pipe write-end). Closes w when done.
 //
@@ -4065,6 +5446,13 @@ func (y *YoutubeChecker) raceProbe(streamURL, rangeHdr string, allow416 bool) bo
 // Configure [proxy.vless] with "youtube" in balancers to enable it.
 func (y *YoutubeChecker) pipeDownloadStream(ctx context.Context, entry *ytMuxEntry, streamURL string, w *os.File, label string, remint func(string) string) {
 	defer w.Close()
+
+	// SABR — основной путь для видеодорожки, см. sabrDownload. Возвращает false,
+	// не записав ни байта, если сервис недоступен или не смог начать: тогда
+	// работает прежняя гонка стратегий, как будто SABR и не настраивали.
+	if y.sabrDownload(ctx, entry, streamURL, w, label) {
+		return
+	}
 
 	attempts := y.buildStreamAttempts()
 
@@ -4259,19 +5647,89 @@ func (y *YoutubeChecker) pipeDownloadStream(ctx context.Context, entry *ytMuxEnt
 		potTries := 0 // 403s on this offset before a re-mint (POT flap)
 		reminted := 0 // how many times we re-minted the URL this download
 		const potBeforeRemint = 2
-		// Кап переминтов держим низким: каждый = отдельная yt-dlp-экстракция через
-		// тот же прокси, а их всплеск ловит anti-bot 429 (и роняет ВСЕ клиенты в
-		// 15-мин кулдаун → всё падает в 360p). 6 × окно ~25МиБ ≈ 150МиБ покрывает
-		// подавляющее большинство роликов; сверх того — truncate, не бан.
-		const maxReminted = 6
+		// Re-mint budget derived from the FILE, not a constant.
+		//
+		// It used to be a flat 6. But a POT-less URL dies after a fixed number of BYTES (measured
+		// 2026-08-17: ~15 MiB on mweb, ~22 MiB on android_vr), so the number of re-mints a download
+		// needs grows with file size: a 134 MB video needs ~8 and got 6 → the download stopped
+		// mid-file, ffmpeg was handed a truncated stream and died with «Invalid NAL unit size».
+		// That was 37 mux failures in 10 minutes. Budget = what the file actually needs, plus slack,
+		// with a ceiling so a pathological case can't hammer the extractor forever.
+		// The budget is derived from the FLOOR, not from the current estimate. Deriving it from
+		// the estimate is self-defeating: an over-optimistic estimate both delays the proactive
+		// swap AND shrinks the budget for recovering from the wall it failed to predict — which
+		// is how prod ended up with truncated downloads and ffmpeg «partial file» / «Invalid NAL
+		// unit size». Being generous here is cheap: re-mints are rate-limited and shared between
+		// the two pipes, so the ceiling only has to stop a runaway loop.
+		maxReminted := int(total/ytWindowFloor) + 8
+		if maxReminted < 12 {
+			maxReminted = 12
+		}
+		if maxReminted > 80 {
+			maxReminted = 80
+		}
+		// Offset at which the current URL started serving — proactive re-mint uses it.
+		mintedAt := written
+		// When we last swapped the URL — feeds the rate limit below.
+		lastRemint := time.Time{}
+		// Consecutive failed re-mints; reset by any successful swap.
+		mintFails := 0
+		// Окно параллельных диапазонов. Ширина берётся из конфига ([youtube]
+		// parallel_chunks): память под окно — width×1 МиБ на каждый пайп, а пайпов
+		// вдвое больше числа mux-задач, поэтому потолок ставится осознанно.
+		pf := &ytPrefetch{width: y.parallelChunks(), url: streamURL, ci: ci, next: written}
+		defer pf.reset(0) // не оставлять висящих запросов, если вышли по ошибке
 		for written < total && ctx.Err() == nil {
-			start := written
-			end := start + ytChunkSize - 1
-			if end >= total {
-				end = total - 1
+			// Proactive re-mint: swap the URL just BEFORE it hits its byte window instead of
+			// discovering the wall with two 403s and a wait. The window size is learned at runtime
+			// (ytWindowEstimate), so this keeps working if YouTube changes it.
+			// The rate limit is the safety net that makes a wrong window estimate survivable.
+			// Every re-mint is a yt-dlp extraction; on 2026-08-17 a collapsed estimate (3.5 MiB)
+			// turned that into an extraction storm — «yt-dlp returned 0 formats» × 256 in ten
+			// minutes as YouTube's anti-bot kicked in, torn seams, dead muxes. Whatever the
+			// estimate says, one download re-mints at most this often; between swaps the reactive
+			// 403 path still carries the file.
+			if remint != nil && reminted < maxReminted && written-mintedAt >= ytWindowEstimate() &&
+				time.Since(lastRemint) >= ytRemintMinInterval {
+				if fresh := remint(streamURL); fresh != "" && fresh != streamURL {
+					lastRemint = time.Now()
+					streamURL = fresh
+					ua, origin, referer = ytCDNHeaders(streamURL)
+					mintedAt = written
+					reminted++
+					log.Debug().Int64("bytes", written).Int("remint", reminted).Str("label", label).
+						Msg("youtube: pipe download — proactive re-mint before the byte window")
+				} else {
+					// Extraction failed. Do NOT advance mintedAt — that pretends a swap happened,
+					// silences the proactive path for another full window and sails the download
+					// straight into the wall (prod 2026-08-24: 161 reactive re-mints against 56
+					// proactive ones, i.e. we were mostly paying for the wall we meant to avoid).
+					// Keep the threshold armed and simply retry after the rate limit.
+					lastRemint = time.Now()
+					log.Debug().Int64("bytes", written).Str("label", label).
+						Msg("youtube: pipe download — proactive re-mint unavailable, will retry")
+				}
 			}
-			cn, cerr := y.fetchChunk(ctx, clients[ci], streamURL, ua, origin, referer, start, end, w)
+			// Окно набирается заново, как только сменились ссылка или маршрут:
+			// куски, добытые прежними параметрами, доверия не заслуживают.
+			if pf.url != streamURL || pf.ci != ci {
+				pf.reset(written)
+				pf.url, pf.ci = streamURL, ci
+			}
+			// Не забегаем за байтовое окно текущей ссылки — иначе в 403 упрётся
+			// сразу всё окно, а не один запрос.
+			limit := total
+			if remint != nil {
+				if wall := mintedAt + ytWindowEstimate(); wall < limit {
+					limit = wall
+				}
+			}
+			pf.fill(ctx, y, clients[ci], streamURL, ua, origin, referer, limit, total)
+			cn, cerr := pf.take(ctx, w)
 			written += cn
+			if cerr != nil {
+				pf.reset(written) // хвост окна добыт тем же, что сейчас не сработало
+			}
 			if cn > 0 {
 				fails, cycles, potTries = 0, 0, 0 // made progress → reset every retry budget
 			}
@@ -4297,6 +5755,9 @@ func (y *YoutubeChecker) pipeDownloadStream(ctx context.Context, entry *ytMuxEnt
 				}
 				potTries = 0
 				if remint == nil || reminted >= maxReminted {
+					log.Warn().Int64("bytes", written).Int64("total", total).Str("label", label).
+						Int("remint", reminted).Int("budget", maxReminted).
+						Msg("youtube: pipe download — giving up: re-mint budget exhausted")
 					err = cerr
 					break
 				}
@@ -4308,9 +5769,35 @@ func (y *YoutubeChecker) pipeDownloadStream(ctx context.Context, entry *ytMuxEnt
 				fresh := remint(streamURL)
 				reminted++
 				if fresh == "" || fresh == streamURL {
+					// Extraction failed right when we needed it — YouTube's anti-bot comes and
+					// goes in bursts. Closing the pipe here truncates the file and ffmpeg exits
+					// with «partial file» / «Invalid NAL unit size», i.e. the viewer gets a hard
+					// 500. A pipe that merely PAUSES is far cheaper: the player keeps its buffer
+					// and usually never notices. So back off and try again before giving up.
+					mintFails++
+					if mintFails <= mintFailRetries {
+						// Hold the rate limit too, or the proactive block at the top of the loop
+						// fires its own extraction the moment we come back round.
+						lastRemint = time.Now()
+						log.Warn().Int64("bytes", written).Str("label", label).Int("attempt", mintFails).
+							Msg("youtube: pipe download — no fresh URL, backing off")
+						select {
+						case <-ctx.Done():
+						case <-time.After(time.Duration(mintFails) * 2500 * time.Millisecond):
+						}
+						continue
+					}
+					log.Warn().Int64("bytes", written).Int64("total", total).Str("label", label).
+						Int("remint", reminted).Msg("youtube: pipe download — giving up: no fresh URL")
 					err = cerr
 					break
 				}
+				mintFails = 0
+				// The 403 tells us how many bytes this URL actually served — feed it back so the
+				// proactive path swaps earlier next time and we stop paying for the wall.
+				ytLearnWindow(written - mintedAt)
+				mintedAt = written
+				lastRemint = time.Now()
 				log.Warn().Int64("bytes", written).Int64("total", total).Str("label", label).
 					Int("remint", reminted).Msg("youtube: pipe download — 403 past window, re-minted fresh URL")
 				streamURL = fresh
@@ -4355,39 +5842,159 @@ func (y *YoutubeChecker) pipeDownloadStream(ctx context.Context, entry *ytMuxEnt
 	}
 }
 
+// ---------------------------------------------------------------------------
+//  Параллельная докачка диапазонов
+// ---------------------------------------------------------------------------
+
+// ytParallelChunksDefault — во сколько потоков докачивать файл. Восемь: замер дал
+// 8.4 МБ/с на шести и 20 МБ/с на двенадцати против 2.1 на одном, а платим за это
+// памятью (width×1 МиБ на пайп, пайпов вдвое больше mux-задач: 8 → до 224 МиБ на
+// полностью забитом ytMuxMaxSize). Восемь — примерно 10-кратный запас над битрейтом
+// 1080p при вменяемом потолке памяти.
+const ytParallelChunksDefault = 8
+
+// ytChunkSlots — потолок ОДНОВРЕМЕННЫХ ranged-запросов по всем загрузкам сразу.
+// Без него ширина окна множится на число пайпов (ytMuxMaxSize×2 = 28) и даёт под
+// 224 запроса и столько же мегабайт буферов — а мы только что видели, чем YouTube
+// отвечает на всплеск активности с одного IP. 64 — вчетверо больше замеренной
+// точки насыщения (×12 дали 20 МБ/с), так что скорость это не ограничивает.
+var ytChunkSlots = make(chan struct{}, 64)
+
+// autoHeightCap — до какой высоты разрешено авто-качество. Потолок 1080p ставился,
+// когда докачка была последовательной (0.34-2 МБ/с) и 4K физически не успевал за
+// воспроизведением. С параллельной докачкой (8-20 МБ/с) 4K укладывается, но по
+// умолчанию потолок оставлен прежним: каждая склейка — это реальная закачка файла,
+// и переводить всех зрителей на 4K молча нельзя. Поднимается через
+// [youtube] max_auto_height = 2160.
+func (y *YoutubeChecker) autoHeightCap() int {
+	if y.maxAutoHeight > 0 {
+		return y.maxAutoHeight
+	}
+	return ytDefaultMuxHeight
+}
+
+func (y *YoutubeChecker) parallelChunks() int {
+	n := y.parChunks
+	if n <= 0 {
+		n = ytParallelChunksDefault
+	}
+	if n > 32 {
+		n = 32 // выше начинается уже не ускорение, а анти-бот
+	}
+	return n
+}
+
+// ytPrefetch — окно ranged-запросов, идущих ОДНОВРЕМЕННО, при строго упорядоченной
+// выдаче в пайп ffmpeg.
+//
+// Зачем. googlevideo душит каждое соединение по отдельности, поэтому один
+// последовательный поток упирается в ~2 МБ/с, а на длинном ролике — и в 0.3.
+// Замер на проде 2026-08-31 (1080p, через тот же маршрут, каким ходит lampac):
+//
+//	последовательно   2.09 МБ/с
+//	параллельно ×6    8.42 МБ/с
+//	параллельно ×12  20.26 МБ/с
+//
+// Мультиплексирования тут нет: клиенту нужен непрерывный файл, а не куски
+// вразнобой, поэтому чанки скачиваются вперёд в память, а отдаются строго по
+// порядку. Первый чанк стартует сразу, так что плеер начинает играть не дожидаясь
+// остальных.
+//
+// Окно набирается ТОЛЬКО в пределах байтового окна текущей ссылки (см. mintedAt в
+// вызывающем коде): забежать за него — значит нарваться на 403 всеми запросами
+// разом вместо одного и потратить впустую бюджет ретраев.
+type ytPrefetch struct {
+	width int
+	next  int64 // офсет, с которого набирается следующий чанк
+	jobs  []*ytChunkJob
+	url   string // параметры, на которых набрано окно; их смена обнуляет его
+	ci    int
+}
+
+type ytChunkJob struct {
+	start, end int64
+	buf        bytes.Buffer
+	n          int64
+	err        error
+	done       chan struct{}
+	cancel     context.CancelFunc
+}
+
+// reset бросает всё набранное и переставляет окно на offset. Вызывается при смене
+// ссылки/маршрута и после любой ошибки: продолжать с уже набранными кусками нельзя —
+// они добыты тем, что только что не сработало.
+func (p *ytPrefetch) reset(offset int64) {
+	for _, j := range p.jobs {
+		j.cancel()
+	}
+	p.jobs = nil
+	p.next = offset
+}
+
+// fill догоняет окно до width заданий, не заходя за limit.
+func (p *ytPrefetch) fill(ctx context.Context, y *YoutubeChecker, client *http.Client,
+	streamURL, ua, origin, referer string, limit, total int64) {
+	// Один чанк ставится ВСЕГДА, даже за limit: иначе, если оценка окна занижена,
+	// докачка встанет насмерть, так и не дав реактивному пути поймать 403 и
+	// поправить оценку. Ограничение сдерживает только забег вперёд.
+	for len(p.jobs) < p.width && p.next < total && (len(p.jobs) == 0 || p.next < limit) {
+		end := p.next + ytChunkSize - 1
+		if end >= total {
+			end = total - 1
+		}
+		jctx, cancel := context.WithCancel(ctx)
+		j := &ytChunkJob{start: p.next, end: end, done: make(chan struct{}), cancel: cancel}
+		p.jobs = append(p.jobs, j)
+		p.next = end + 1
+		go func() {
+			defer close(j.done)
+			select {
+			case ytChunkSlots <- struct{}{}:
+				defer func() { <-ytChunkSlots }()
+			case <-jctx.Done():
+				j.err = jctx.Err()
+				return
+			}
+			j.n, j.err = y.fetchChunk(jctx, client, streamURL, ua, origin, referer, j.start, j.end, &j.buf)
+		}()
+	}
+}
+
+// take отдаёт голову окна в w, дождавшись её. Возвращает (0, nil), когда окно пусто.
+func (p *ytPrefetch) take(ctx context.Context, w io.Writer) (int64, error) {
+	if len(p.jobs) == 0 {
+		return 0, nil
+	}
+	j := p.jobs[0]
+	select {
+	case <-j.done:
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+	p.jobs = p.jobs[1:]
+	j.cancel()
+	if j.err != nil {
+		return 0, j.err
+	}
+	// Записываем ТОЛЬКО целиком добранный чанк: половина куска в середине пайпа —
+	// это шов, на котором ffmpeg спотыкается «Invalid NAL unit size».
+	if j.n != j.end-j.start+1 {
+		return 0, fmt.Errorf("chunk %d-%d: получено %d из %d", j.start, j.end, j.n, j.end-j.start+1)
+	}
+	n, err := w.Write(j.buf.Bytes())
+	return int64(n), err
+}
+
 // remintFunc returns a closure that re-extracts a FRESH stream URL for the same
 // itag as `oldURL` — the fix for POT flaps that outlast the wait budget: the CDN
 // permanently 403s a given (URL, offset past the grace window), but a freshly
 // minted POT URL for the same itag downloads from where the old one died (byte
 // ranges are identical across URLs of one itag). Empty videoID or itag → no-op.
 func (y *YoutubeChecker) remintFunc(videoID string) func(oldURL string) string {
+	// The extraction itself lives in mintFreshURL, which collapses the video and audio
+	// pipes of one mux job (and any concurrent viewers) into a single yt-dlp run.
 	return func(oldURL string) string {
-		if videoID == "" {
-			return ""
-		}
-		itag := ytURLItag(oldURL)
-		if itag == "" {
-			return ""
-		}
-		ytURL := "https://www.youtube.com/watch?v=" + videoID
-		// POT-less режим (прямой маршрут): свежий android_vr URL сбрасывает окно —
-		// берём только default. POT-режим (прокси): mweb с POT, default фолбэком.
-		clients := []string{"mweb", ""}
-		if y.fetchPotNever {
-			clients = []string{""}
-		}
-		for _, client := range clients {
-			fmts, _, ok := y.runExtract(videoID, ytURL, client, y.curProxy() != "")
-			if !ok {
-				continue
-			}
-			for _, f := range fmts {
-				if f.URL != "" && ytURLItag(f.URL) == itag {
-					return f.URL
-				}
-			}
-		}
-		return ""
+		return y.mintFreshURL(videoID, oldURL)
 	}
 }
 
@@ -4447,6 +6054,12 @@ func (y *YoutubeChecker) fetchChunk(ctx context.Context, client *http.Client, st
 	}
 	if got := parseContentRangeStart(resp.Header.Get("Content-Range")); got >= 0 && got != start {
 		return 0, fmt.Errorf("chunk %d-%d: server returned range at %d", start, end, got)
+	}
+	// ★22.08: nil-writer = «скачать и выбросить» (самотест watchdog'а). Раньше io.Copy(nil, …)
+	// ронял ВЕСЬ процесс паникой, как только YouTube начинал отдавать честные 206 — 28 рестартов
+	// подряд каждые ~2 минуты (90с прогрев + первый чанк самотеста).
+	if w == nil {
+		w = io.Discard
 	}
 	return io.Copy(w, resp.Body)
 }
@@ -4513,6 +6126,7 @@ func (y *YoutubeChecker) muxCleanupLoop() {
 func (y *YoutubeChecker) muxCleanupOnce() {
 	now := time.Now()
 	var removed int
+	y.pruneMuxKeys(now)
 
 	// 1. Clean expired entries from muxCache.
 	y.muxMu.Lock()
@@ -4526,17 +6140,18 @@ func (y *YoutubeChecker) muxCleanupOnce() {
 		default:
 		}
 		if expired {
+			// The DIRECTORY goes (that is the disk cost). The KEY REGISTRY stays.
+			//
+			// Deleting the recipe together with the files is what produced 7765 hard 404s in two
+			// hours on prod: a player holds a `?key=…` URL, the quality map it came from lives 4h
+			// (ytCacheTTL) and the page may live longer still, but the mux dir expires after 30
+			// minutes — and with the mapping gone findOrStartMuxByKey can no longer even RESTART
+			// the mux, so every later request is a permanent «mux job not found». Keeping the
+			// mapping turns that dead end into a transparent re-mux (the code below already starts
+			// one whenever the key is known but no entry exists). The registry is a few strings per
+			// key and is bounded separately by pruneMuxKeys.
 			removeMuxDir(e.Dir, "cleanup-expired")
 			delete(y.muxCache, k)
-			// Clean up associated lookup maps.
-			for hk, ck := range y.muxKeys {
-				if ck == k {
-					delete(y.muxKeys, hk)
-					delete(y.muxVCodecs, hk)
-					delete(y.muxProxy, hk)
-					delete(y.muxTransA, hk)
-				}
-			}
 			removed++
 			continue
 		}
@@ -4717,7 +6332,7 @@ func (y *YoutubeChecker) HandleFeed(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	host := hostFromRequest(req)
+	host := ytHost(req)
 	requestedCat := strings.TrimSpace(req.URL.Query().Get("category"))
 	searchQuery := strings.TrimSpace(req.URL.Query().Get("search"))
 
@@ -4983,7 +6598,7 @@ func (y *YoutubeChecker) HandleFeedSubscriptions(w http.ResponseWriter, r *http.
 		return
 	}
 
-	host := hostFromRequest(r)
+	host := ytHost(r)
 	videos, err := api.GetSubscriptionsFeed(r.Context(), tgID)
 	if err != nil {
 		log.Warn().Err(err).Int64("tg_id", tgID).Msg("youtube: subscriptions feed error")
@@ -5023,7 +6638,7 @@ func (y *YoutubeChecker) HandleFeedPlaylists(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	host := hostFromRequest(r)
+	host := ytHost(r)
 	playlists, err := api.GetPlaylists(r.Context(), tgID)
 	if err != nil {
 		log.Warn().Err(err).Int64("tg_id", tgID).Msg("youtube: playlists error")
@@ -5067,7 +6682,7 @@ func (y *YoutubeChecker) HandleFeedPlaylist(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	host := hostFromRequest(r)
+	host := ytHost(r)
 	videos, err := api.GetPlaylistItems(r.Context(), tgID, playlistID)
 	if err != nil {
 		log.Warn().Err(err).Str("playlist", playlistID).Msg("youtube: playlist items error")

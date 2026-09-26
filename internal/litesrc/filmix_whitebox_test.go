@@ -42,20 +42,49 @@ func TestFilmixToHLSLegacyForm(t *testing.T) {
 // or not. The old pro auto-detect by the post "quality" field is gone: that
 // field now reports content quality ("2160" even anonymous).
 func TestFilmixLegacyQualityCap(t *testing.T) {
+	// token without pro: 720p cap.
 	f := &filmixChecker{}
 	for _, q := range []int{2160, 1440, 1080} {
-		if f.allowQuality(q, "protoken") {
-			t.Fatalf("legacy path must cap at 720p, allowed %d", q)
+		if f.allowQuality(q, "token") {
+			t.Fatalf("token without pro must cap at 720p, allowed %d", q)
 		}
 	}
 	if !f.allowQuality(720, "token") || !f.allowQuality(480, "token") {
 		t.Fatalf("≤720p with token must pass")
 	}
+	// anonymous: 480p only.
 	if f.allowQuality(720, "") {
 		t.Fatalf("anonymous must cap at 480p")
 	}
 	if !f.allowQuality(480, "") {
 		t.Fatalf("anonymous 480p must pass")
+	}
+	// pro token: every quality the rip has — legacy /s/ links stream real 4K
+	// files with a pro token (re-verified 2026-09-02, see allowQuality).
+	pro := &filmixChecker{pro: true}
+	for _, q := range []int{2160, 1440, 1080, 720, 480} {
+		if !pro.allowQuality(q, "protoken") {
+			t.Fatalf("pro token must allow %dp", q)
+		}
+	}
+	if pro.allowQuality(720, "") {
+		t.Fatalf("pro flag without a token is still anonymous (480p)")
+	}
+	// HEVC/HDR rows are premium-gated; a pro token has those rights too.
+	if pro.filmixHideUnplayable("Дубляж [HDR10+, 4K]", "https://x/s/h/hdr_018/a_[2160,,,,,].mp4") {
+		t.Fatal("pro token must not hide HDR/HEVC rows")
+	}
+	if !f.filmixHideUnplayable("HEVC 4K AC3", "https://x/s/h/hevc/a_[2160,,,,,].mp4") {
+		t.Fatal("without rights HEVC rows stay hidden")
+	}
+	// The movie stream builder emits every allowed quality the template lists.
+	m := filmixMovie{Link: "https://nl104.cdnsqu.com/s/HASH/uhd_mc/Dune_[2160,1440,1080,720,480,].mp4", Translation: "Дубляж"}
+	rows := pro.buildMovieStreams(m, "protoken", nil)
+	if len(rows) != 5 || rows[0]["quality"] != "2160p" || rows[0]["url"] != "https://nl104.cdnsqu.com/s/HASH/uhd_mc/Dune_2160.mp4" {
+		t.Fatalf("pro movie streams = %v", rows)
+	}
+	if rows := f.buildMovieStreams(m, "token", nil); len(rows) != 2 || rows[0]["quality"] != "720p" {
+		t.Fatalf("non-pro movie streams = %v", rows)
 	}
 }
 

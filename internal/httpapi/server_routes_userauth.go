@@ -53,6 +53,7 @@ func registerKitRoutes(router chi.Router, cfg config.Config, kitStore *kit.Store
 	router.Post("/api/kit/profile-owned/set-pin", kitProfileOwnedSetPINHandler(cfg))
 	router.Post("/api/kit/profile-owned/delete", kitProfileOwnedDeleteHandler(cfg))
 
+
 	// Browser Kit (standalone web UI, no TG bot required).
 	bkitStore := NewBKitSessionStore(cfg.Compat.RepoRoot)
 	bkitSessions = bkitStore       // set package-level var for kitAuthFromRequest
@@ -86,6 +87,8 @@ func registerTGAuthRoutes(router chi.Router, cfg config.Config, tgPending *tgaut
 		router.Get("/tg/auth/logout", tgAuthLogoutHandler())
 		router.Get("/tg/auth/status", tgAuthStatusHandler(tgTokenStore, tgPending, cfg.TelegramAuth.BotName, cubVal))
 		router.Get("/tg/auth/bind-device", tgAuthBindDeviceHandler(tgTokenStore))
+		// Аттестация v3: публичная часть ключа, созданного в AndroidKeyStore.
+		router.Post("/tg/auth/device-key", tgAuthDeviceKeyHandler(tgTokenStore))
 		router.Post("/tg/auth/promo", adminhttp.PromoRedeemHandler(promoStore, tgTokenStore, banStore))
 	}
 	// User info endpoint — works with or without TG auth (for SURS and similar plugins).

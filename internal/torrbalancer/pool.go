@@ -22,6 +22,22 @@ import (
 
 const defaultHealthTimeout = 8 * time.Second
 
+// listProbeTimeout — ОТДЕЛЬНЫЙ бюджет для POST /torrents list. Раньше он делил
+// контекст с /echo, а это несопоставимые по цене вызовы: echo отвечает за
+// миллисекунды, а list на нагруженном бэкенде с полутора сотнями раздач честно
+// идёт единицы секунд (замеры: 0.5–6.5 с на ihor1, до 10 с на ts1 под пиком).
+// С общим восьмисекундным бюджетом здоровый сервер уезжал в карантин просто
+// за то, что занят.
+const listProbeTimeout = 20 * time.Second
+
+// wedgeMissesToQuarantine — сколько подряд неудачных проб torrents-API нужно,
+// чтобы увести бэкенд из выдачи. С единицей один таймаут на пике стоил серверу
+// двух минут простоя, а зрителю — холодного старта на другом сервере посреди
+// просмотра: 18.09.2026 так набралось 38 карантинов за час на ЖИВЫХ машинах.
+// Устойчивый зомби Selectel-типа копит промахи подряд и доезжает до карантина
+// за один лишний цикл пробы (~30 с).
+const wedgeMissesToQuarantine = 2
+
 // Stream circuit-breaker tuning (see Backend.strikes).
 const (
 	// strikeWindow bounds how long a distinct-torrent strike stays counted.
@@ -29,6 +45,17 @@ const (
 	// quarantineDur is how long a tripped backend sits out of selection before
 	// the breaker half-opens and lets traffic test it again.
 	quarantineDur = 2 * time.Minute
+	// maxWedgeQuarantine caps the escalating wedge-quarantine (2→4→8→16→30 мин):
+	// хронический полу-зомби (Selectel-типа: /echo жив, /torrents висит неделями)
+	// не должен каждые 2 минуты полу-открываться и ловить живые add'ы юзеров.
+	maxWedgeQuarantine = 30 * time.Minute
+	// chronicWedgeStreak — столько wedge-квارантинов ПОДРЯД (пробы каждые ~30с →
+	// ~20 минут сплошного клина) переводят бэкенд в «хронические»: авто-лечение
+	// (/shutdown, SSH) прекращается — два цикла эскалации уже прошли и не помогли,
+	// дальнейшие рестарты только рвут стримы и шумят в TG. Раз в час — OnChronic.
+	chronicWedgeStreak = 40
+	// chronicNotifyEvery bounds OnChronic alerts for a permanently sick backend.
+	chronicNotifyEvery = time.Hour
 )
 
 // backendTarget is an immutable (host, authHdr) pair published atomically so
@@ -37,6 +64,11 @@ const (
 type backendTarget struct {
 	host    string
 	authHdr string
+	// Прямая отдача (DirectLink): публичный фронт бэкенда и секрет secure_link.
+	// Едут в том же атомарном снимке, что и host/authHdr, — горячий путь читает
+	// их без блокировки через DirectTarget().
+	directURL    string
+	directSecret string
 }
 
 // Backend is the runtime state of one TorrServer backend.
@@ -57,6 +89,11 @@ type Backend struct {
 	SSHPassword string
 	SSHCmd      string
 
+	// Прямая отдача зрителю (см. StoredBackend.DirectURL, DirectLink). Пусто =
+	// поток идёт через main. Горячий путь читает через DirectTarget().
+	DirectURL    string
+	DirectSecret string
+
 	authHdr string // precomputed Basic-Auth header; rebuilt in reconcileLocked
 	// target mirrors (host, authHdr), republished on every Reconcile. Read
 	// lock-free via Target() from the proxy hot path.
@@ -67,9 +104,16 @@ type Backend struct {
 	totalServed  atomic.Int64
 	totalFailed  atomic.Int64
 	torrentCount atomic.Int64 // last observed torrent count (best-effort)
-	lastLatency  atomic.Int64 // ms — last probe latency
-	lastCheck    atomic.Value // time.Time
-	lastError    atomic.Value // string
+
+	// Measured streaming throughput (see throughput.go). rateBits holds a
+	// float64 in its bit pattern so it can live in an atomic; tier is the
+	// coarse, hysteresis-guarded multiplier the pickers actually use.
+	rateBits    atomic.Uint64
+	rateSamples atomic.Int64
+	tier        atomic.Int64
+	lastLatency atomic.Int64 // ms — last probe latency
+	lastCheck   atomic.Value // time.Time
+	lastError   atomic.Value // string
 
 	// Passive stream circuit-breaker. The /echo health probe can't see a
 	// HALF-WEDGED TorrServer (prod 2026-07-16: /echo answered in ms while every
@@ -88,6 +132,16 @@ type Backend struct {
 	// lastHeal — unix nanos последней попытки автолечения (шатдаун/SSH).
 	// CAS-кулдаун, чтобы проба и прокси не устраивали рестарт-шторм.
 	lastHeal atomic.Int64
+
+	// wedgeMisses — подряд идущие НЕУДАЧНЫЕ пробы torrents-API, ещё не доросшие
+	// до карантина. Обнуляется любой успешной пробой (см. wedgeMissesToQuarantine).
+	wedgeMisses atomic.Int64
+	// wedgeStreak — подряд идущие wedge-карантины (torrents-API мёртв) без
+	// единой успешной пробы между ними. Двигает эскалацию длительности карантина
+	// и порог «хроник» chronicWedgeStreak; сбрасывается в markOK.
+	wedgeStreak atomic.Int64
+	// lastChronicNotify — unix nanos последнего OnChronic-алерта (CAS-троттлинг).
+	lastChronicNotify atomic.Int64
 
 	probeHistMu  sync.Mutex
 	probeHist    []bool
@@ -154,26 +208,41 @@ func (b *Backend) Target() (host, authHdr string) {
 	return b.Host, b.authHdr
 }
 
+// DirectTarget returns the backend's public TLS front and the secure_link
+// secret for direct-to-viewer streaming (both empty when the backend only
+// serves through main). Lock-free and race-safe with Reconcile, like Target().
+func (b *Backend) DirectTarget() (base, secret string) {
+	if t := b.target.Load(); t != nil {
+		return t.directURL, t.directSecret
+	}
+	return b.DirectURL, b.DirectSecret
+}
+
 // BackendStatus is a snapshot for the admin dashboard. Never exposes the password.
 type BackendStatus struct {
-	ID            string    `json:"id"`
-	Name          string    `json:"name"`
-	Host          string    `json:"host"`
-	Login         string    `json:"login,omitempty"`
-	HasAuth       bool      `json:"has_auth"`
-	Enabled       bool      `json:"enabled"`
-	Healthy       bool      `json:"healthy"`
-	Quarantined   bool      `json:"quarantined"`
-	ActiveConns   int64     `json:"active_conns"`
-	TotalServed   int64     `json:"total_served"`
-	TotalFailed   int64     `json:"total_failed"`
-	TorrentCount  int64     `json:"torrent_count"`
-	LastLatencyMs int64     `json:"last_latency_ms"`
-	Weight        int       `json:"weight"`
-	Notes         string    `json:"notes,omitempty"`
-	LastCheck     time.Time `json:"last_check"`
-	LastError     string    `json:"last_error,omitempty"`
-	UptimePct     float64   `json:"uptime_pct"`
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Host        string `json:"host"`
+	Login       string `json:"login,omitempty"`
+	HasAuth     bool   `json:"has_auth"`
+	Enabled     bool   `json:"enabled"`
+	Healthy     bool   `json:"healthy"`
+	Quarantined bool   `json:"quarantined"`
+	// Measured streaming rate and the routing multiplier derived from it.
+	// RateBytesPerSec is 0 until the backend has served a real stream.
+	RateBytesPerSec float64   `json:"rate_bytes_per_sec"`
+	SpeedTier       int       `json:"speed_tier"`
+	ActiveConns     int64     `json:"active_conns"`
+	TotalServed     int64     `json:"total_served"`
+	TotalFailed     int64     `json:"total_failed"`
+	TorrentCount    int64     `json:"torrent_count"`
+	LastLatencyMs   int64     `json:"last_latency_ms"`
+	Weight          int       `json:"weight"`
+	Notes           string    `json:"notes,omitempty"`
+	LastCheck       time.Time `json:"last_check"`
+	LastError       string    `json:"last_error,omitempty"`
+	UptimePct       float64   `json:"uptime_pct"`
+	WedgeStreak     int64     `json:"wedge_streak,omitempty"`
 
 	// SSH-управление: пароль наружу не отдаётся, только настройки + флаг.
 	HasSSH  bool   `json:"has_ssh"`
@@ -198,12 +267,20 @@ type Pool struct {
 	// (/echo fine, streams dead — restart helps) from a hard-down backend.
 	// Wired once at startup, before traffic.
 	OnZombie func(b *Backend, echoAlive bool)
+
+	// OnChronic fires (async, at most once per chronicNotifyEvery) when a
+	// backend's wedgeStreak crosses chronicWedgeStreak — рестарты не помогли,
+	// автолечение остановлено, машине нужен человек. Wired once at startup.
+	OnChronic func(b *Backend, streak int64)
 }
 
 // NewPool creates a pool backed by the given store.
 func NewPool(store *Store) *Pool {
 	p := &Pool{
-		client: httpclient.New(defaultHealthTimeout),
+		// Пробы ходят на наши TLS-фронты tsN.torr.example.com с настоящими сертификатами —
+		// проверяем их, иначе Basic-auth TorrServer уезжал бы кому угодно на пути.
+		// Локальные http-бэкенды нод (127.0.0.1:9080) это не задевает.
+		client: httpclient.NewVerifying(defaultHealthTimeout),
 		store:  store,
 	}
 	if store != nil {
@@ -251,7 +328,7 @@ func (p *Pool) reconcileLocked(snapshot []StoredBackend) {
 			w = 1
 		}
 		auth := buildAuthHdr(sb.Login, sb.Password)
-		tgt := &backendTarget{host: sb.Host, authHdr: auth}
+		tgt := &backendTarget{host: sb.Host, authHdr: auth, directURL: sb.DirectURL, directSecret: sb.DirectSecret}
 		if existing, ok := byID[sb.ID]; ok {
 			existing.Name = sb.Name
 			existing.Host = sb.Host
@@ -264,31 +341,63 @@ func (p *Pool) reconcileLocked(snapshot []StoredBackend) {
 			existing.SSHUser = sb.SSHUser
 			existing.SSHPassword = sb.SSHPassword
 			existing.SSHCmd = sb.SSHCmd
+			existing.DirectURL = sb.DirectURL
+			existing.DirectSecret = sb.DirectSecret
 			existing.authHdr = auth
 			existing.target.Store(tgt)
 			next = append(next, existing)
 			continue
 		}
 		b := &Backend{
-			ID:          sb.ID,
-			Name:        sb.Name,
-			Host:        sb.Host,
-			Login:       sb.Login,
-			Password:    sb.Password,
-			Weight:      w,
-			Enabled:     sb.Enabled,
-			SSHHost:     sb.SSHHost,
-			SSHPort:     sb.SSHPort,
-			SSHUser:     sb.SSHUser,
-			SSHPassword: sb.SSHPassword,
-			SSHCmd:      sb.SSHCmd,
-			authHdr:     auth,
+			ID:           sb.ID,
+			Name:         sb.Name,
+			Host:         sb.Host,
+			Login:        sb.Login,
+			Password:     sb.Password,
+			Weight:       w,
+			Enabled:      sb.Enabled,
+			SSHHost:      sb.SSHHost,
+			SSHPort:      sb.SSHPort,
+			SSHUser:      sb.SSHUser,
+			SSHPassword:  sb.SSHPassword,
+			SSHCmd:       sb.SSHCmd,
+			DirectURL:    sb.DirectURL,
+			DirectSecret: sb.DirectSecret,
+			authHdr:      auth,
 		}
 		b.healthy.Store(true) // optimistic until the first probe
 		b.target.Store(tgt)
 		next = append(next, b)
 	}
 	p.backends = next
+}
+
+// NewDetachedBackend builds a standalone Backend that belongs to no pool —
+// the shape a remote transcode box receives from the main server's
+// /transcoding/ts-pick oracle. It carries host + credentials (Target() and
+// the Login/Password fields both work) but no health state, so callers must
+// never feed it to Pool methods (MarkFailed, QuarantineWedged, …).
+func NewDetachedBackend(id, name, host, login, password string) *Backend {
+	host = strings.TrimRight(strings.TrimSpace(host), "/")
+	if strings.TrimSpace(id) == "" {
+		id = host
+	}
+	if strings.TrimSpace(name) == "" {
+		name = host
+	}
+	b := &Backend{
+		ID:       id,
+		Name:     name,
+		Host:     host,
+		Login:    login,
+		Password: password,
+		Weight:   1,
+		Enabled:  true,
+		authHdr:  buildAuthHdr(login, password),
+	}
+	b.healthy.Store(true)
+	b.target.Store(&backendTarget{host: host, authHdr: b.authHdr})
+	return b
 }
 
 // PickForHash returns the backend that should serve the torrent identified by
@@ -317,7 +426,11 @@ func (p *Pool) PickForHash(infohash string, allow func(backendID string) bool) *
 			if allow != nil && !allow(b.ID) {
 				continue
 			}
-			score := hrwScore(infohash, b.ID, b.Weight)
+			// effectiveWeight, not Weight: a backend that measurably streams
+			// faster should win proportionally more hashes. HRW is chosen
+			// precisely because changing a weight moves only the share that
+			// must move, keeping the rest of the torrents on their warm backend.
+			score := hrwScore(infohash, b.ID, b.effectiveWeight())
 			if best == nil || score > bestScore {
 				best = b
 				bestScore = score
@@ -350,7 +463,12 @@ func (p *Pool) PickPrimary(allow func(backendID string) bool) *Backend {
 				best = b
 				continue
 			}
-			bc, cc := best.activeConns.Load(), b.activeConns.Load()
+			// Load per unit of measured capability, not raw connections: two
+			// connections on a 10 MB/s backend are lighter than one on a
+			// throttled link. Ties still break on name so the choice stays
+			// deterministic.
+			bc := float64(best.activeConns.Load()) / float64(best.effectiveWeight())
+			cc := float64(b.activeConns.Load()) / float64(b.effectiveWeight())
 			if cc < bc || (cc == bc && strings.ToLower(b.Name) < strings.ToLower(best.Name)) {
 				best = b
 			}
@@ -597,31 +715,43 @@ func (p *Pool) Snapshot() []BackendStatus {
 	out := make([]BackendStatus, len(p.backends))
 	for i, b := range p.backends {
 		out[i] = BackendStatus{
-			ID:            b.ID,
-			Name:          b.Name,
-			Host:          b.Host,
-			Login:         b.Login,
-			HasAuth:       b.authHdr != "",
-			Enabled:       b.Enabled,
-			Healthy:       b.Available(), // admin badge reflects real availability (probe + quarantine)
-			Quarantined:   b.Quarantined(),
-			ActiveConns:   b.activeConns.Load(),
-			TotalServed:   b.totalServed.Load(),
-			TotalFailed:   b.totalFailed.Load(),
-			TorrentCount:  b.torrentCount.Load(),
-			LastLatencyMs: b.lastLatency.Load(),
-			Weight:        b.Weight,
-			LastCheck:     b.lastCheckTime(),
-			LastError:     b.lastErrorStr(),
-			UptimePct:     b.UptimePct(),
-			HasSSH:        b.HasSSH(),
-			SSHHost:       b.SSHHost,
-			SSHPort:       b.SSHPort,
-			SSHUser:       b.SSHUser,
-			SSHCmd:        b.SSHCmd,
+			ID:              b.ID,
+			Name:            b.Name,
+			Host:            b.Host,
+			Login:           b.Login,
+			HasAuth:         b.authHdr != "",
+			Enabled:         b.Enabled,
+			Healthy:         b.Available(), // admin badge reflects real availability (probe + quarantine)
+			Quarantined:     b.Quarantined(),
+			ActiveConns:     b.activeConns.Load(),
+			TotalServed:     b.totalServed.Load(),
+			TotalFailed:     b.totalFailed.Load(),
+			RateBytesPerSec: b.RateBytesPerSec(),
+			SpeedTier:       b.SpeedTier(),
+			TorrentCount:    b.torrentCount.Load(),
+			LastLatencyMs:   b.lastLatency.Load(),
+			Weight:          b.Weight,
+			LastCheck:       b.lastCheckTime(),
+			LastError:       b.lastErrorStr(),
+			UptimePct:       b.UptimePct(),
+			WedgeStreak:     b.wedgeStreak.Load(),
+			HasSSH:          b.HasSSH(),
+			SSHHost:         b.SSHHost,
+			SSHPort:         b.SSHPort,
+			SSHUser:         b.SSHUser,
+			SSHCmd:          b.SSHCmd,
 		}
 	}
 	return out
+}
+
+// ApplySettings подменяет настройки в памяти без записи на диск — пара к
+// Store.Reload, см. cluster.Pool.ApplySettings.
+func (p *Pool) ApplySettings(st Settings) {
+	st.normalize()
+	p.mu.Lock()
+	p.settings = st
+	p.mu.Unlock()
 }
 
 // CurrentSettings returns a copy of the active settings.
@@ -744,15 +874,24 @@ func (p *Pool) probe(ctx context.Context, b *Backend) {
 	// /echo за миллисекунды, ЛЮБОЙ POST /torrents висит до таймаута) неделями
 	// проходил echo-медосмотр и ловил add'ы → у клиентов «add http 502». Здоровье
 	// подтверждает только рабочий torrents-API.
-	count, terr := p.torrentsListCount(probeCtx, host, authHdr)
+	listCtx, listCancel := context.WithTimeout(ctx, listProbeTimeout)
+	count, terr := p.torrentsListCount(listCtx, host, authHdr)
+	listCancel()
 	if terr != nil {
 		reason := "полу-зомби: /echo отвечает, а /torrents не работает (" + terr.Error() + ")"
 		b.lastError.Store(reason)
 		fails := p.markFailed(b)
+		// Один промах — ещё не приговор: под пиком torrents-API живого бэкенда
+		// мигает. Уводим из выдачи только на втором подряд.
+		if misses := b.wedgeMisses.Add(1); misses < wedgeMissesToQuarantine {
+			log.Debug().Str("backend", host).Int64("misses", misses).
+				Msg("torrbalancer: torrents-API промахнулся, жду подтверждения")
+			return
+		}
 		// Карантин — сразу (безвреден: HRW просто уводит торренты на 2 мин), а
 		// вот авто-лечение (/shutdown, SSH) — только по УСТОЙЧИВОМУ зомби, порог
 		// вдвое строже unhealthy: под пиковой стрим-нагрузкой torrents-API живого
-		// бэкенда МИГАЕТ на десятки секунд (прод 2026-08-13, 144.31.111.97: curl
+		// бэкенда МИГАЕТ на десятки секунд (прод 2026-08-13, 203.0.113.97: curl
 		// list 3×10с подряд, затем 3×0.05с) — миганию рестарт стоил бы всех его
 		// стримов. Мигающий до 2×порога не дотягивает (recovered обнуляет счёт),
 		// перманентный клин Selectel-типа — дотягивает за ~4 минуты.
@@ -760,6 +899,7 @@ func (p *Pool) probe(ctx context.Context, b *Backend) {
 		return
 	}
 	b.torrentCount.Store(count)
+	b.wedgeMisses.Store(0)
 	b.lastError.Store("")
 	p.markOK(b)
 }
@@ -795,7 +935,7 @@ func (p *Pool) torrentsListCount(ctx context.Context, host, authHdr string) (int
 // probe loop) — used by the auto-heal escalation to verify a restart worked.
 func (p *Pool) TorrentsAPIAlive(b *Backend) bool {
 	host, authHdr := b.Target()
-	ctx, cancel := context.WithTimeout(context.Background(), defaultHealthTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), listProbeTimeout)
 	defer cancel()
 	_, err := p.torrentsListCount(ctx, host, authHdr)
 	return err == nil
@@ -830,15 +970,43 @@ func (p *Pool) QuarantineWedged(b *Backend, reason string) {
 }
 
 func (p *Pool) tripWedgeQuarantine(b *Backend, reason string, fireHeal bool) {
-	b.quarantineUntil.Store(time.Now().Add(quarantineDur).UnixNano())
-	log.Warn().Str("backend", b.Host).Str("reason", reason).Bool("heal", fireHeal).Dur("quarantine", quarantineDur).
+	streak := b.wedgeStreak.Add(1)
+	dur := wedgeQuarantineFor(streak)
+	b.quarantineUntil.Store(time.Now().Add(dur).UnixNano())
+	log.Warn().Str("backend", b.Host).Str("reason", reason).Bool("heal", fireHeal).
+		Int64("wedgeStreak", streak).Dur("quarantine", dur).
 		Msg("torrbalancer: backend quarantined (torrents API wedged)")
 	if !fireHeal {
+		return
+	}
+	if streak >= chronicWedgeStreak {
+		// Хроник: ~20 минут клина, /shutdown и SSH уже пробовались и не помогли.
+		// Дальше рестартовать бессмысленно и вредно — держим в карантине и раз в
+		// час зовём человека.
+		now := time.Now().UnixNano()
+		last := b.lastChronicNotify.Load()
+		if now-last >= int64(chronicNotifyEvery) && b.lastChronicNotify.CompareAndSwap(last, now) {
+			if cb := p.OnChronic; cb != nil {
+				go cb(b, streak)
+			}
+		}
 		return
 	}
 	if cb := p.OnZombie; cb != nil && p.TryBeginHeal(b) {
 		go cb(b, p.echoAlive(b))
 	}
+}
+
+// wedgeQuarantineFor maps the consecutive-wedge streak to a quarantine length:
+// 2, 4, 8, 16 минут, дальше — потолок maxWedgeQuarantine. Первый клин почти
+// бесплатен для здорового-но-мигающего бэкенда, хронику полу-открытие достаётся
+// всё реже.
+func wedgeQuarantineFor(streak int64) time.Duration {
+	dur := quarantineDur
+	for i := int64(1); i < streak && dur < maxWedgeQuarantine; i++ {
+		dur *= 2
+	}
+	return min(dur, maxWedgeQuarantine)
 }
 
 func (p *Pool) markFailed(b *Backend) int {
@@ -861,6 +1029,15 @@ func (p *Pool) markOK(b *Backend) {
 	defer p.mu.Unlock()
 	b.consecFails = 0
 	b.consecOK++
+	if s := b.wedgeStreak.Swap(0); s > 0 {
+		b.lastChronicNotify.Store(0)
+		// Клин кончился — torrents-API снова отвечает. Эскалированный хвост
+		// карантина (до 30 мин) здоровому уже не нужен: ужимаем до базовых 2 мин,
+		// стрим-брейкерный карантин короче этого не бывает и не пострадает.
+		if capNs := time.Now().Add(quarantineDur).UnixNano(); b.quarantineUntil.Load() > capNs {
+			b.quarantineUntil.Store(capNs)
+		}
+	}
 	if !b.healthy.Load() && b.consecOK >= p.settings.RecoverThreshold {
 		b.healthy.Store(true)
 		log.Info().Str("backend", b.Host).Msg("torrbalancer: backend recovered")

@@ -1,6 +1,7 @@
 package proxyapi
 
 import (
+	"net/http"
 	"strconv"
 	"strings"
 )
@@ -12,6 +13,20 @@ import (
 // the first frame — while Shaka on desktop/phone parses the same thing instantly. ~20 segments
 // ≈ 2 minutes at a typical 6s target: enough buffer, near-instant start at the live edge.
 const iptvLiveKeepSegments = 20
+
+// isIPTVPlugin reports whether a proxylink belongs to the IPTV player, whatever
+// route it needs. Каналы, за которыми надо ходить из страны вещателя, минтятся
+// с плагином "iptv-ru" (см. Channel.NeedsRegionRoute) — по сути тот же IPTV,
+// только другим маршрутом. Сравнение с одним лишь "iptv" молча лишало их всей
+// эфирной специфики: обрезки DVR-окна, безлимитного стрим-клиента (обрыв на
+// 35-й секунде), короткого TTL живого манифеста и анти-хотлинк заголовков.
+func isIPTVPlugin(plugin string) bool {
+	if strings.EqualFold(plugin, "iptv") {
+		return true
+	}
+	// "iptv-ru", "iptv-by", … — маршрутные варианты одного плеера.
+	return len(plugin) > 5 && strings.EqualFold(plugin[:5], "iptv-")
+}
 
 // segment-level tags that open/belong to a segment block (they apply to the NEXT URI line).
 var iptvSegTagPrefixes = []string{
@@ -153,4 +168,31 @@ func trimLiveDVR(src string, keep int) string {
 		}
 	}
 	return b.String()
+}
+
+// applyIPTVHeaderPolicy готовит заголовки запроса к вещателю. Заголовки,
+// которые канал попросил сам (#EXTVLCOPT/#EXTHTTP → meta.headers), не трогаем:
+// оператор знает про свой источник больше нас.
+func applyIPTVHeaderPolicy(h http.Header, metaHeaders map[string]string) {
+	forced := make(map[string]bool, len(metaHeaders))
+	for k := range metaHeaders {
+		forced[http.CanonicalHeaderKey(k)] = true
+	}
+	// Anti-hotlink у панелей: браузерные Referer/Origin/Cookie нашего домена
+	// (и маркер X-Lampac-Go) выдают «чужой» плеер — VLC их не шлёт, потому
+	// «в VLC работает, у нас 403».
+	for _, hk := range []string{"Referer", "Origin", "Cookie", "X-Lampac-Go", "Accept-Language"} {
+		if !forced[hk] {
+			h.Del(hk)
+		}
+	}
+	// Go дописывает "Accept-Encoding: gzip" сам, если заголовка нет, — и на
+	// ngenix (Ростелеком/Wink) именно он валит запрос: тот же URL с того же IP
+	// и с тем же UA отдаёт поток без него и 301 на заглушку rtk_block с ним.
+	// Со стороны зрителя это выглядит как «канал показывает заставку Wink».
+	// Ставим identity ЯВНО: сжимать нечего — сегменты уже упакованы, а
+	// плейлисты весят считаные килобайты.
+	if !forced["Accept-Encoding"] {
+		h.Set("Accept-Encoding", "identity")
+	}
 }

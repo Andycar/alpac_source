@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"lampac-go/internal/auth"
 	"lampac-go/internal/config"
 	"lampac-go/internal/httpclient"
 	"lampac-go/internal/tgauth"
@@ -93,15 +94,21 @@ func newTSProxy(cfg config.Config) *tsProxy {
 	// cold-torrent start (metadata + first pieces on a slow swarm); a backend
 	// that can't produce headers in 90s yields a clean error that ALSO feeds
 	// the pool's stream circuit-breaker (RecordStreamStrike in the caller).
-	streamClient := httpclient.NewNoRedirect(0)
-	streamTr := httpclient.SharedTransport.Clone() // never mutate the shared transport
+	// Все три клиента — с проверкой сертификата: бэкенды пула теперь TLS-фронты
+	// tsN.torr.example.com с настоящими LE-сертификатами, и в каждом запросе уезжает
+	// Basic-auth TorrServer. Глобальный strict_balancer_tls на проде выключен (чужие
+	// источники с битыми цепочками), поэтому проверка включается точечно здесь.
+	// Личные TorrServer'ы зрителей сюда не попадают: resolveTSBackend берёт хост
+	// только из пула или из [torrserver] url.
+	streamClient := httpclient.NewVerifyingNoRedirect(0)
+	streamTr := httpclient.VerifyingTransport()
 	streamTr.ResponseHeaderTimeout = 90 * time.Second
 	streamClient.Transport = streamTr
 
 	return &tsProxy{
-		client:       httpclient.NewNoRedirect(60 * time.Second),
+		client:       httpclient.NewVerifyingNoRedirect(60 * time.Second),
 		streamClient: streamClient,
-		apiClient:    httpclient.NewNoRedirect(15 * time.Second),
+		apiClient:    httpclient.NewVerifyingNoRedirect(15 * time.Second),
 		pool:         tsBalancerPoolRef,
 		upstream:     upstream,
 		authHdr:      authHdr,
@@ -286,6 +293,31 @@ func tsAPIHandler(cfg config.Config) http.HandlerFunc {
 			return
 		}
 
+		// Прямая отдача: у бэкенда есть свой TLS-фронт → отправляем зрителя туда
+		// подписанной ссылкой, и поток идёт бэкенд→зритель, минуя main (иначе каждый
+		// байт торрента пересекает main дважды — замер 2026-09-14: ~107 Мбит/с в обе
+		// стороны на уже согнутом канале). Только само медиа и только GET/HEAD:
+		// ?stat (file_stats как JSON) и ?m3u (переписанный плейлист) остаются через
+		// main — их читает наш код, а не плеер. Бэкенд без direct_url работает как
+		// прежде, так что переводить их можно по одному.
+		if proxy.pool != nil && backend != nil &&
+			(r.Method == http.MethodGet || r.Method == http.MethodHead) &&
+			tsPathIsStream(path) && !r.URL.Query().Has("stat") {
+			if base, secret := backend.DirectTarget(); base != "" && secret != "" {
+				st := proxy.pool.CurrentSettings()
+				expires := time.Now().Add(time.Duration(st.DirectTTLSec) * time.Second).Unix()
+				loc := torrbalancer.DirectLink(base, secret, path, r.URL.Query(), expires)
+				if st.DebugHeader {
+					w.Header().Set("X-Lampac-TS-Backend", backend.Name)
+				}
+				// Плеер идёт на другой origin — кэшировать редирект нельзя: подпись
+				// протухает, а бэкенд у торрента может смениться после карантина.
+				w.Header().Set("Cache-Control", "no-store")
+				http.Redirect(w, r, loc, http.StatusFound)
+				return
+			}
+		}
+
 		// Generic proxy
 		proxy.proxyPassthrough(w, r, path, host, authHdr, backend, infohash)
 	}
@@ -379,12 +411,14 @@ func tsAuthOK(r *http.Request) bool {
 // same user identity a cookie would. Without this, any client whose WebView
 // drops cookies gets 401 on /ts mutations despite being fully authed.
 func requestUserTokenFromAny(r *http.Request) string {
-	if c, err := r.Cookie("lampac_token"); err == nil {
-		if v := strings.TrimSpace(c.Value); v != "" {
-			return v
-		}
-	}
-	if v := strings.TrimSpace(r.URL.Query().Get("token")); v != "" {
+	// ★Общий разбор источников вместо одного `lampac_token`. Жалоба тестера
+	// 20.09.2026: после перезапуска Лампы «в статусе авторизация есть, а
+	// торрентов и IPTV нет». Причина ровно здесь: /ts/* и /api/iptv/* в
+	// обходном списке гейта и опознавали человека сами — по ОДНОЙ JS-видимой
+	// куке. На телевизоре при перезапуске вычищается именно она, а HttpOnly
+	// `_lampac_auth` и localStorage-якорь переживают: /lite/* продолжал
+	// работать через гейт, а эти две подсистемы видели аноним.
+	if v := auth.ExtractToken(r); v != "" {
 		return v
 	}
 	if tsTokenStoreRef != nil {
@@ -479,7 +513,7 @@ func (p *tsProxy) proxyPassthrough(w http.ResponseWriter, r *http.Request, path,
 	}
 
 	// Detect stream/play requests — these must not use conditional caching
-	isStream := strings.Contains(path, "/stream/") || strings.Contains(path, "/play/")
+	isStream := tsPathIsStream(path)
 
 	// Copy headers from client (except Authorization — we use our own)
 	for k, vals := range r.Header {
@@ -569,7 +603,41 @@ func (p *tsProxy) proxyPassthrough(w http.ResponseWriter, r *http.Request, path,
 		w.Header().Set("X-Lampac-TS-Backend", backend.Name)
 	}
 	w.WriteHeader(resp.StatusCode)
-	_, _ = io.Copy(w, resp.Body)
+	// Measure what the backend actually delivered. This is the only place the
+	// real rate is observable: /echo says nothing about the pipe behind it, and
+	// a throttled backend answers probes as fast as a healthy one.
+	copyStart := time.Now()
+	copied, _ := io.Copy(w, resp.Body)
+	if isStream && backend != nil && p.pool != nil {
+		p.pool.RecordThroughput(backend, copied, time.Since(copyStart))
+	}
+}
+
+// tsPathIsStream reports whether a proxied TorrServer path is a media stream.
+//
+// It used to be `strings.Contains(path, "/stream/")`, which requires a trailing
+// slash and therefore missed TorrServer's OTHER streaming form — the bare
+// `/stream?link=<hash>&index=1&play`. Measured on prod 2026-09-01: 1361 of 4600
+// stream requests in two hours took that form, and for every one of them the
+// proxy silently did the wrong thing four times over — it kept the client's
+// conditional-cache headers, used the timeout-bounded client instead of
+// streamClient (so long playback could be cut off mid-file), skipped the
+// stream circuit-breaker, and recorded no throughput sample, which left the
+// backend stuck on the neutral speed tier no matter how slowly it delivered.
+//
+// Matching is on path SEGMENTS so a file named "The.Player.mkv" is not mistaken
+// for a /play route.
+func tsPathIsStream(path string) bool {
+	if i := strings.IndexAny(path, "?#"); i >= 0 {
+		path = path[:i]
+	}
+	path = strings.TrimSuffix(path, "/")
+	for _, seg := range []string{"/stream", "/play"} {
+		if strings.HasSuffix(path, seg) || strings.Contains(path, seg+"/") {
+			return true
+		}
+	}
+	return false
 }
 
 // tsTokenStoreRef is a package-level reference to the TG token store,
@@ -591,6 +659,8 @@ func tsAccessMiddleware(next http.Handler) http.Handler {
 			// Basic uid:ts) so per-user/group bans hold for cookie-less clients.
 			token := requestUserTokenFromAny(r)
 			if token != "" && tsTokenStoreRef.IsTorrServerDisabled(token) {
+				log.Warn().Str("ip", clientIP(r)).Str("path", path).
+					Msg("ts: торренты выключены лично у этого пользователя")
 				http.Error(w, `{"error":"TorrServer access disabled for this user"}`, http.StatusForbidden)
 				return
 			}
@@ -600,6 +670,8 @@ func tsAccessMiddleware(next http.Handler) http.Handler {
 			if token != "" && groupStoreRef != nil && tgTokenStoreRef != nil {
 				groupID := tgTokenStoreRef.GetEffectiveGroup(token, currentPremiumGroupID())
 				if g, _ := groupStoreRef.Get(groupID); !g.TorrServer {
+					log.Warn().Str("ip", clientIP(r)).Str("path", path).Str("группа", groupID).
+						Msg("ts: торренты выключены у группы пользователя")
 					http.Error(w, `{"error":"TorrServer access disabled for your group"}`, http.StatusForbidden)
 					return
 				}

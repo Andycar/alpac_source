@@ -36,24 +36,17 @@ func main() {
 
 	zerolog.TimeFieldFormat = time.RFC3339
 
-	// Determine log level: env var LOG_LEVEL takes priority, then config.toml [observability] log_level.
-	logLevel := os.Getenv("LOG_LEVEL")
-	if logLevel == "" {
+	// Log level: env var LOG_LEVEL takes priority, then config.toml
+	// [observability] log_level. Server.Reload re-applies the same resolution,
+	// so the setting can be changed without a restart.
+	var cfgLogLevel string
+	if os.Getenv("LOG_LEVEL") == "" {
 		// Quick config load just to read log_level before full server init.
-		if preloadCfg, err := config.Load(); err == nil && preloadCfg.Observability.LogLevel != "" {
-			logLevel = preloadCfg.Observability.LogLevel
+		if preloadCfg, err := config.Load(); err == nil {
+			cfgLogLevel = preloadCfg.Observability.LogLevel
 		}
 	}
-	switch logLevel {
-	case "debug", "DEBUG":
-		zerolog.SetGlobalLevel(zerolog.DebugLevel)
-	case "warn", "WARN":
-		zerolog.SetGlobalLevel(zerolog.WarnLevel)
-	case "error", "ERROR":
-		zerolog.SetGlobalLevel(zerolog.ErrorLevel)
-	default:
-		zerolog.SetGlobalLevel(zerolog.InfoLevel)
-	}
+	zerolog.SetGlobalLevel(config.ResolveLogLevel(cfgLogLevel))
 
 	logRing := logbuf.New(10000)
 	logRing.StartCleanup()

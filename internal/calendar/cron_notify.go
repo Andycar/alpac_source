@@ -188,14 +188,56 @@ type tmdbMovieResponse struct {
 	ExternalIDs *struct {
 		ImdbID string `json:"imdb_id"`
 	} `json:"external_ids"`
+	ReleaseDates *struct {
+		Results []struct {
+			Country string `json:"iso_3166_1"`
+			Dates   []struct {
+				Type int    `json:"type"`
+				Date string `json:"release_date"`
+			} `json:"release_dates"`
+		} `json:"results"`
+	} `json:"release_dates"`
 }
+
+// digitalDate — самый ранний цифровой релиз (тип 4) в России или США. Цифра для нашего
+// зрителя американская: у крупных студий российского проката с 2022-го нет.
+func (mv tmdbMovieResponse) digitalDate() (time.Time, bool) {
+	var best time.Time
+	if mv.ReleaseDates == nil {
+		return best, false
+	}
+	for _, c := range mv.ReleaseDates.Results {
+		if c.Country != "RU" && c.Country != "US" {
+			continue
+		}
+		for _, d := range c.Dates {
+			if d.Type != 4 || len(d.Date) < 10 {
+				continue
+			}
+			t, err := time.Parse("2006-01-02", d.Date[:10])
+			if err == nil && (best.IsZero() || t.Before(best)) {
+				best = t
+			}
+		}
+	}
+	return best, !best.IsZero()
+}
+
+// digitalFreshDays — «вышел в цифре» шлём только по свежему релизу. Флаг появился позже
+// подписок: без этого окна первый же опрос после выкатки разослал бы новости про фильмы,
+// вышедшие в цифре полгода назад.
+const digitalFreshDays = 7
 
 // checkMovie announces the release and reports whether the film is actually out
 // — the caller uses that to decide whether drilling sources for new dubs is
 // worth anything yet.
+//
+// Вестей две: «вышел» (премьера) и «вышел в цифре» (можно смотреть в хорошем качестве —
+// это обещает кнопка «Напомнить о цифре» на экране «Скоро»). Если к моменту премьеры цифра
+// уже вышла, уходит одно сообщение, а не два подряд.
 func (c *Cron) checkMovie(ctx context.Context, sub Subscription) (released bool) {
-	if sub.ReleaseNotified {
-		return true // already announced, so it is certainly out
+	if sub.ReleaseNotified && sub.DigitalNotified {
+		return true // обе вести уже разосланы
 	}
 
 	q := url.Values{}
@@ -203,28 +245,17 @@ func (c *Cron) checkMovie(ctx context.Context, sub Subscription) (released bool)
 	if c.apiKey != "" {
 		q.Set("api_key", c.apiKey)
 	}
-	q.Set("append_to_response", "external_ids")
+	q.Set("append_to_response", "external_ids,release_dates")
 
 	fr, err := c.pool.FetchAPI(ctx, fmt.Sprintf("3/movie/%d", sub.TmdbID), q.Encode())
 	if err != nil || fr.Status != 200 {
 		log.Debug().Err(err).Int("tmdb_id", sub.TmdbID).Msg("calendar: TMDB movie fetch failed")
-		return false
+		return sub.ReleaseNotified
 	}
 
 	var mv tmdbMovieResponse
 	if err := json.Unmarshal(fr.Body, &mv); err != nil {
-		return false
-	}
-
-	// "Released" alone is not enough: TMDB flips it on the first festival or
-	// limited screening, often months before anything is watchable. Require the
-	// release date to have actually passed too.
-	if !strings.EqualFold(mv.Status, "Released") || mv.ReleaseDate == "" {
-		return false
-	}
-	d, err := time.Parse("2006-01-02", mv.ReleaseDate)
-	if err != nil || d.After(time.Now().UTC().Truncate(24*time.Hour)) {
-		return false
+		return sub.ReleaseNotified
 	}
 
 	title := mv.Title
@@ -235,31 +266,69 @@ func (c *Cron) checkMovie(ctx context.Context, sub Subscription) (released bool)
 	if poster == "" {
 		poster = sub.PosterPath
 	}
-
 	key := sub.Key()
-	subscribers := c.store.SubscribersOfKey(key)
-	if len(subscribers) == 0 {
+	today := time.Now().UTC().Truncate(24 * time.Hour)
+	digital, hasDigital := mv.digitalDate()
+	digitalOut := hasDigital && !digital.After(today)
+
+	if !sub.ReleaseNotified {
+		// "Released" alone is not enough: TMDB flips it on the first festival or
+		// limited screening, often months before anything is watchable. Require the
+		// release date to have actually passed too.
+		if !strings.EqualFold(mv.Status, "Released") || mv.ReleaseDate == "" {
+			return false
+		}
+		d, err := time.Parse("2006-01-02", mv.ReleaseDate)
+		if err != nil || d.After(today) {
+			return false
+		}
+		subscribers := c.store.SubscribersOfKey(key)
+		if len(subscribers) > 0 {
+			tgText := fmt.Sprintf("🎬 <b>%s</b>\nФильм вышел\n📅 %s", escapeHTML(title), formatDateRu(d))
+			text := "Фильм вышел — " + formatDateRu(d)
+			switch {
+			case digitalOut:
+				tgText = fmt.Sprintf("🎬 <b>%s</b>\nВышел в цифре — можно смотреть в хорошем качестве\n📅 %s", escapeHTML(title), formatDateRu(digital))
+				text = "Вышел в цифре — " + formatDateRu(digital)
+			case hasDigital:
+				tgText = fmt.Sprintf("🎬 <b>%s</b>\nВышел в кино\n📅 %s\nЦифровой релиз — %s: напомним, когда можно будет смотреть в хорошем качестве",
+					escapeHTML(title), formatDateRu(d), formatDateRu(digital))
+				text = "Вышел в кино — " + formatDateRu(d) + ". Цифровой релиз — " + formatDateRu(digital)
+			}
+			n := Notification{Kind: NotifyRelease, TmdbID: sub.TmdbID, MediaType: KindMovie, Title: title, Text: text, PosterPath: poster}
+			delivered := c.deliver(subscribers, n, tgText)
+			log.Info().Str("movie", title).Int("notified", delivered).Bool("digital", digitalOut).Msg("calendar: movie release notification sent")
+		}
+		// Mark regardless of delivery count: the release happened, and retrying
+		// forever would re-alert everyone each poll once one user muted both channels.
+		c.store.MarkReleaseNotified(key)
+		if digitalOut {
+			c.store.MarkDigitalNotified(key) // уже сказали «вышел в цифре» в том же сообщении
+		}
 		return true
 	}
 
-	tgText := fmt.Sprintf("🎬 <b>%s</b>\nФильм вышел\n📅 %s",
-		escapeHTML(title), formatDateRu(d))
-
-	n := Notification{
-		Kind:       NotifyRelease,
-		TmdbID:     sub.TmdbID,
-		MediaType:  KindMovie,
-		Title:      title,
-		Text:       "Фильм вышел — " + formatDateRu(d),
-		PosterPath: poster,
+	if sub.DigitalNotified || !digitalOut {
+		return true
 	}
-
-	delivered := c.deliver(subscribers, n, tgText)
-	// Mark regardless of delivery count: the release happened, and retrying
-	// forever would re-alert everyone each poll once one user muted both channels.
-	c.store.MarkReleaseNotified(key)
-
-	log.Info().Str("movie", title).Int("notified", delivered).Msg("calendar: movie release notification sent")
+	if today.Sub(digital) > digitalFreshDays*24*time.Hour {
+		c.store.MarkDigitalNotified(key) // давно в цифре — новость устарела, гасим молча
+		return true
+	}
+	var to []int64
+	for _, ss := range c.store.SubscribersOfKeySince(key) {
+		if ss.AddedAt.Before(digital.Add(24 * time.Hour)) {
+			to = append(to, ss.TelegramID)
+		}
+	}
+	if len(to) > 0 {
+		tgText := fmt.Sprintf("🎬 <b>%s</b>\nВышел в цифре — можно смотреть в хорошем качестве\n📅 %s", escapeHTML(title), formatDateRu(digital))
+		n := Notification{Kind: NotifyRelease, TmdbID: sub.TmdbID, MediaType: KindMovie, Title: title,
+			Text: "Вышел в цифре — " + formatDateRu(digital), PosterPath: poster}
+		delivered := c.deliver(to, n, tgText)
+		log.Info().Str("movie", title).Int("notified", delivered).Msg("calendar: movie digital release notification sent")
+	}
+	c.store.MarkDigitalNotified(key)
 	return true
 }
 
@@ -288,13 +357,16 @@ func (c *Cron) checkVoices(ctx context.Context, sub Subscription) {
 	}
 
 	key := sub.Key()
+	curS, curE := sub.LastSeason, sub.LastEpisode
 
 	// First poll after subscribing: record the baseline silently. Announcing
 	// everything that already exists is noise, not news. A stale VoicesRev counts
 	// as "no baseline" — the stored names came from a different resolve and are
-	// not comparable with these.
-	if len(sub.Voices) == 0 || sub.VoicesRev != VoicesRev {
-		c.store.UpdateVoices(key, current)
+	// not comparable with these. Смена серии — тоже «нет базы»: снимок от прошлой
+	// серии несравним с дорожками новой.
+	if len(sub.Voices) == 0 || sub.VoicesRev != VoicesRev ||
+		sub.VoicesSeason != curS || sub.VoicesEpisode != curE {
+		c.store.UpdateVoices(key, current, curS, curE)
 		return
 	}
 
@@ -309,10 +381,16 @@ func (c *Cron) checkVoices(ctx context.Context, sub Subscription) {
 		}
 	}
 
-	// Persist the new baseline first: if delivery panics or the process dies
-	// mid-fanout, the worst case is a missed alert rather than an endless loop
-	// re-announcing the same voice every poll.
-	c.store.UpdateVoices(key, current)
+	// ★База НАКОПИТЕЛЬНАЯ, а не «последний ответ». Список озвучек приходит сверлением
+	// балансеров, и от опроса к опросу отвечают разные — набор скачет. С перезаписью
+	// два набора объявляли друг друга по кругу: «Гангстерленд» 2026-09-10 прислал в
+	// 20:17 «DniproFilm, HDRezka Studio 18+, RHS», а через час — «1WIN Studio,
+	// NewComers, Red Head Sound, Амедиа, Яроцкий», и это одни и те же студии под
+	// разными именами. Отсюда 519 рассылок за неделю. Теперь «новая» — та, которой
+	// не было НИ РАЗУ для этой серии; пропавшая и вернувшаяся новостью не считается.
+	// Persist the baseline first: if delivery panics or the process dies mid-fanout,
+	// the worst case is a missed alert rather than an endless loop.
+	c.store.UpdateVoices(key, mergeVoices(sub.Voices, current), curS, curE)
 
 	if len(fresh) == 0 {
 		return
@@ -409,6 +487,32 @@ func voiceWanted(voice string, want []string) bool {
 // normalizeVoice makes voice comparison stable across cosmetic churn — sources
 // re-case and re-space the same studio name constantly, and each variant would
 // otherwise read as a brand-new translation.
+// mergeVoices — объединение «всё, что видели» и текущего ответа, без повторов по
+// нормализованному имени. Список ограничен: у популярного тайтла имён много, но
+// подписка не должна расти без предела.
+func mergeVoices(known, current []string) []string {
+	const maxVoices = 300
+	out := make([]string, 0, len(known)+len(current))
+	seen := make(map[string]struct{}, len(known)+len(current))
+	for _, list := range [][]string{known, current} {
+		for _, v := range list {
+			n := normalizeVoice(v)
+			if n == "" {
+				continue
+			}
+			if _, dup := seen[n]; dup {
+				continue
+			}
+			seen[n] = struct{}{}
+			out = append(out, v)
+			if len(out) >= maxVoices {
+				return out
+			}
+		}
+	}
+	return out
+}
+
 func normalizeVoice(v string) string {
 	return strings.Join(strings.Fields(strings.ToLower(strings.TrimSpace(v))), " ")
 }

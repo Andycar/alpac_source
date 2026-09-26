@@ -33,11 +33,45 @@
       if(backup){ _cachedUID = backup; ensureUIDStored(backup); return backup; }
     } catch(e){}
     // 4. Generate new
-    var uid = Math.random().toString(36).substr(2,8);
+    var uid = newUID();
     _cachedUID = uid;
     ensureUIDStored(uid);
     return uid;
   }
+  // newUID — идентификатор устройства. ★Раньше здесь стояло
+  // Math.random().toString(36).substr(2,8) — 8 символов из Math.random.
+  //
+  // Что измерено на прод-данных 20.09.2026: 88 значений uid поделены 329
+  // аккаунтами, у рекордсмена 70 владельцев на платформах от iPhone до
+  // Hisense; в базе попадаются и шестизначные uid. Случайным совпадением это
+  // быть не может: на 26 тысяч устройств ожидаемое число пар — доли единицы.
+  // Значит, идентификатор либо приезжает скопированным (чужой бэкап CUB, мод
+  // с чужим каталогом данных), либо Math.random на части телевизоров при
+  // холодном старте отдаёт одну и ту же последовательность. Какая из двух
+  // причин весит больше — не знаю; вторую чиню здесь, первую — на сервере
+  // (отказ восстанавливать сессию по uid, у которого несколько владельцев).
+  //
+  // Совпавший uid ломал вход: сервер находил по нему ЧУЖОЙ аккаунт, отпечаток
+  // не сходился, клиент получал QR-код и перегенерировал uid — и так по кругу.
+  // Берём 48 бит из crypto, с запасным путём для совсем старых движков.
+  // Длину нигде не проверяют, поэтому удлинение безопасно.
+  function newUID(){
+    var n = '';
+    try {
+      var c = window.crypto || window.msCrypto;
+      if(c && c.getRandomValues){
+        var a = new Uint8Array(6);
+        c.getRandomValues(a);
+        for(var i=0;i<a.length;i++) n += ('0'+a[i].toString(16)).slice(-2);
+      }
+    } catch(e){}
+    if(n.length < 12){
+      n = (Date.now().toString(36) + Math.random().toString(36).slice(2) +
+           Math.random().toString(36).slice(2)).slice(0,12);
+    }
+    return n.toLowerCase();
+  }
+
   function ensureUIDStored(uid){
     try { Lampa.Storage.set(LS_KEY, uid); } catch(e){}
     try { localStorage.setItem(LS_KEY, JSON.stringify(uid)); } catch(e){}
@@ -47,10 +81,45 @@
   // uid_conflict — typically after a cub-backup restore cloned this UID
   // from another device's account.
   function regenUID(){
-    var n = Math.random().toString(36).substr(2,8);
+    var n = newUID();
     _cachedUID = n;
     ensureUIDStored(n);
     return n;
+  }
+
+  // spreadToken — раздать полученный токен ВСЕМ потребителям на этом устройстве.
+  //
+  // ★Найдено 20.09.2026 по двум отчётам: «после перезапуска иконка профиля
+  // пропадает, но Статус говорит, что авторизован», и «торренты с IPTV только
+  // до перезапуска». Причина одна. Сервер при восстановлении сессии по якорю
+  // (отпечаток / стабильный отпечаток / CUB) ставит куки заголовком, НО
+  // Android WebView молча выбрасывает Set-Cookie из ответов XHR — сохраняет
+  // только из навигационных. Поэтому:
+  //   • /tg/auth/status отвечает «авторизован» — это видно прямо в ответе;
+  //   • а иконка профиля (whoami), IPTV и торренты смотрят в КУКУ и в
+  //     Lampa.Storage — и видят аноним.
+  // Плюс на части коробок localStorage не переживает перезапуск приложения: у
+  // одного из пострадавших на каждый запуск заводилась новая запись устройства
+  // (три «Android» за сутки с одного адреса) — значит и uid, и токен там
+  // пропадают.
+  //
+  // Раз Set-Cookie не доезжает, ставим куку сами из JS: на своём домене это
+  // работает всегда и не зависит ни от какого хранилища. Заодно зеркалим токен
+  // в Lampa.Storage — именно там его ищут account.js и iptv2.js.
+  function spreadToken(tok){
+    if(!tok) return;
+    try { localStorage.setItem('lampac_auth_token', tok); } catch(e){}
+    try {
+      Lampa.Storage.set('lampac_auth_token', tok);
+      Lampa.Storage.set('lampac_token', tok);
+      Lampa.Storage.set('alpac_token', tok);
+    } catch(e){}
+    try {
+      var year = 31536000;
+      var sec = location.protocol === 'https:' ? ';secure' : '';
+      document.cookie = 'lampac_token=' + encodeURIComponent(tok) + ';path=/;max-age=' + year + sec;
+      document.cookie = 'alpac_token=' + encodeURIComponent(tok) + ';path=/;max-age=' + year + sec;
+    } catch(e){}
   }
 
   function getCookie(name){
@@ -154,7 +223,10 @@
     p.push((navigator.userAgent||'').replace(/[\d.]+/g,'').slice(0,120)); // strip version numbers
     var base = p.join('|');
     var done = false;
-    var finish = function(nid){ if(done) return; done = true; cb(fnv1a(base + '|' + (nid||''))); };
+    // Without a native id the stable fp is a MODEL signature (every unit of the
+    // same TV/PC hashes alike) — not sent at all. With one it is prefixed "n:";
+    // the server restores an account only from prefixed values.
+    var finish = function(nid){ if(done) return; done = true; cb(nid ? 'n:' + fnv1a(base + '|' + nid) : ''); };
     var t = setTimeout(function(){ finish(''); }, 1200); // don't hang boot on a slow luna call
     getNativeId(function(nid){ clearTimeout(t); finish(nid); });
   }
@@ -216,7 +288,7 @@
             // UID was cloned (cub backup or otherwise) — generate fresh.
             uid = regenUID();
             if(r.authorized && r.token){
-              try { localStorage.setItem('lampac_auth_token', r.token); } catch(e){}
+              spreadToken(r.token);
               bindDevice(r.token, uid, fp, sfp);
             }
             return;
@@ -224,8 +296,14 @@
           if(r && r.authorized){
             // Persist token to the durable anchor (survives Tizen cookie wipe)
             // and bind the device (uid + both fingerprints) for recovery.
-            if(r.token){ try { localStorage.setItem('lampac_auth_token', r.token); } catch(e){} }
+            if(r.token) spreadToken(r.token);
             bindDevice(r.token, uid, fp, sfp);
+          }
+          if(r && r.revoked){
+            // The owner unbound THIS device in the bot — forget the stored token
+            // so we stop presenting it on every boot; the QR card is the way back.
+            try { localStorage.removeItem('lampac_auth_token'); } catch(e){}
+            try { Lampa.Storage.set('lampac_token',''); Lampa.Storage.set('alpac_token',''); Lampa.Storage.set('lampac_auth_token',''); } catch(e){}
           }
           // Not authorized — do nothing. Source list is gated server-side and
           // online.js shows the QR auth card on /lite/*.

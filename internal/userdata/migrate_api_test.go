@@ -33,6 +33,13 @@ func parseMigrateResp(t *testing.T, body []byte) map[string]any {
 	return m
 }
 
+// allowPrivateMigrate пускает migrateClient на 127.0.0.1 — там слушает httptest.
+func allowPrivateMigrate(t *testing.T) {
+	t.Helper()
+	migrateAllowPrivate = true
+	t.Cleanup(func() { migrateAllowPrivate = false })
+}
+
 func setupMigrateEnv(t *testing.T) string {
 	root := t.TempDir()
 	t.Setenv("LAMPAC_GO_HOME", root)
@@ -334,6 +341,7 @@ func TestMigrateFromServer_Bookmarks(t *testing.T) {
 	origValidator := validateServerURL
 	validateServerURL = func(raw string) error { return nil }
 	t.Cleanup(func() { validateServerURL = origValidator })
+	allowPrivateMigrate(t)
 
 	// Start a mock "old lampac" server
 	mux := http.NewServeMux()

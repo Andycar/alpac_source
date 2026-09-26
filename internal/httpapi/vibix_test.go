@@ -50,7 +50,7 @@ func TestVibixChecksearch(t *testing.T) {
 
 	cfg := config.Config{
 		Online: config.OnlineConfig{
-			Vibix: config.HostTokenSource{Host: upstream.URL, Token: ""},
+			Vibix: config.VibixSource{Host: upstream.URL, Token: ""},
 		},
 	}
 
@@ -86,7 +86,7 @@ func TestVibixMovieRjson(t *testing.T) {
 
 	cfg := config.Config{
 		Online: config.OnlineConfig{
-			Vibix: config.HostTokenSource{Host: upstream.URL, Token: "token123"},
+			Vibix: config.VibixSource{Host: upstream.URL, Token: "token123"},
 		},
 	}
 
@@ -137,7 +137,7 @@ func TestVibixMovieRjsonLegacy(t *testing.T) {
 
 	cfg := config.Config{
 		Online: config.OnlineConfig{
-			Vibix: config.HostTokenSource{Host: upstream.URL, Token: "token123"},
+			Vibix: config.VibixSource{Host: upstream.URL, Token: "token123"},
 		},
 	}
 
@@ -181,7 +181,7 @@ func TestVibixSerialRjson(t *testing.T) {
 
 	cfg := config.Config{
 		Online: config.OnlineConfig{
-			Vibix: config.HostTokenSource{Host: upstream.URL, Token: "token123"},
+			Vibix: config.VibixSource{Host: upstream.URL, Token: "token123"},
 		},
 	}
 
@@ -240,7 +240,7 @@ func TestVibixCapiMovieDeferred(t *testing.T) {
 
 	cfg := config.Config{
 		Online: config.OnlineConfig{
-			Vibix: config.HostTokenSource{Host: upstream.URL, Token: "token123"},
+			Vibix: config.VibixSource{Host: upstream.URL, Token: "token123"},
 		},
 	}
 
@@ -279,5 +279,92 @@ func TestVibixCapiMovieDeferred(t *testing.T) {
 	}
 	if !names["LostFilm"] || !names["Дубляж MovieDalen"] {
 		t.Fatalf("missing expected voices: %v", names)
+	}
+}
+
+// TestVibixIframeMovieCapi: with iframe_mode on and a client that advertised
+// iframe=1, a movie drill returns a single iframe:// embed-page marker (the vibix
+// player runs client-side under our publisher id) instead of the server-resolved
+// stream — so it monetizes.
+func TestVibixIframeMovieCapi(t *testing.T) {
+	vibixTestDirectTransport(t)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/v1/publisher/videos/kp/123") {
+			_, _ = w.Write([]byte(`{"type":"movie","quality":"FullHD","embed_code":"data-publisher-id=\"678652620\" data-type=\"movie\" data-id=\"4433\"","voiceovers":[{"id":1,"name":"LostFilm"}]}`))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer upstream.Close()
+
+	cfg := config.Config{
+		Online: config.OnlineConfig{
+			Vibix: config.VibixSource{Host: upstream.URL, Token: "token123", IframeMode: true},
+		},
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet,
+		"http://lampac.local/lite/vibix?rjson=true&kinopoisk_id=123&title=Film&iframe=1", nil)
+	req = req.WithContext(capiWithResolve(req.Context()))
+	authedHandler(liteSourceHandler(cfg, nil, nil)).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d body=%s", rec.Code, rec.Body.String())
+	}
+	var payload struct {
+		Type string           `json:"type"`
+		Data []map[string]any `json:"data"`
+	}
+	if err := stdjson.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("unmarshal: %v body=%s", err, rec.Body.String())
+	}
+	if payload.Type != "movie" || len(payload.Data) != 1 {
+		t.Fatalf("expected single iframe voice, got type=%q data=%d: %s", payload.Type, len(payload.Data), rec.Body.String())
+	}
+	qmap, ok := payload.Data[0]["quality"].(map[string]any)
+	if !ok || len(qmap) == 0 {
+		t.Fatalf("missing quality map: %#v", payload.Data[0])
+	}
+	u := fmt.Sprint(qmap["auto"])
+	if !strings.HasPrefix(u, "iframe://") || !strings.Contains(u, "/vibix_embed/") {
+		t.Fatalf("expected iframe:// embed url, got %s", u)
+	}
+}
+
+// TestVibixIframeModeWithoutCapability: iframe_mode on but the client did NOT
+// advertise iframe=1 → fall back to the server-resolved deferred stream (never
+// hand a non-embedding client an unplayable iframe page).
+func TestVibixIframeModeWithoutCapability(t *testing.T) {
+	vibixTestDirectTransport(t)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/v1/publisher/videos/kp/123") {
+			_, _ = w.Write([]byte(`{"type":"movie","quality":"FullHD","embed_code":"data-publisher-id=\"678652620\" data-type=\"movie\" data-id=\"4433\"","voiceovers":[{"id":1,"name":"LostFilm"}]}`))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer upstream.Close()
+
+	cfg := config.Config{
+		Online: config.OnlineConfig{
+			Vibix: config.VibixSource{Host: upstream.URL, Token: "token123", IframeMode: true},
+		},
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet,
+		"http://lampac.local/lite/vibix?rjson=true&kinopoisk_id=123&title=Film", nil) // no iframe=1
+	req = req.WithContext(capiWithResolve(req.Context()))
+	authedHandler(liteSourceHandler(cfg, nil, nil)).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d body=%s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "iframe://") {
+		t.Fatalf("iframe marker leaked to non-iframe client: %s", rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "/lite/vibix/stream.m3u8") {
+		t.Fatalf("expected server-resolve fallback, got: %s", rec.Body.String())
 	}
 }

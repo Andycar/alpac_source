@@ -57,6 +57,28 @@ var kinopubDefaultHosts = []string{
 // kinopubHostIdx is the process-wide sticky mirror index (mod len(hosts)).
 var kinopubHostIdx atomic.Int32
 
+// kinopubDownUntil — unix-нано: до этого момента API считаем недоступным целиком.
+// Когда мертвы ВСЕ зеркала (сеть/выход), каждый запрос прокручивал полный круг с
+// таймаутом на каждом (337 кругов за два часа 22.09.2026, дрилл пуст у половины
+// карточек) — предохранитель отвечает «нет» сразу и даёт кругу повториться
+// не чаще раза в kinopubBreakerFor.
+var kinopubDownUntil atomic.Int64
+
+const kinopubBreakerFor = 45 * time.Second
+
+// kinopubBreakerOpen — API временно не спрашиваем.
+func kinopubBreakerOpen() bool {
+	return time.Now().UnixNano() < kinopubDownUntil.Load()
+}
+
+// kinopubTripBreaker — полный круг по зеркалам без ответа: замолкаем на kinopubBreakerFor.
+func kinopubTripBreaker(hosts int) {
+	until := time.Now().Add(kinopubBreakerFor)
+	if prev := kinopubDownUntil.Swap(until.UnixNano()); prev < time.Now().UnixNano() {
+		log.Warn().Int("mirrors", hosts).Dur("for", kinopubBreakerFor).Msg("kinopub: все зеркала не отвечают — пауза")
+	}
+}
+
 // errKinopubTransport marks a transport-level failure (dial/TLS/timeout) —
 // the only class of error that rotates the mirror.
 var errKinopubTransport = errors.New("kinopub: transport error")

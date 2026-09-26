@@ -1,12 +1,20 @@
 package iptv
 
 import (
+	"compress/gzip"
 	"context"
+	"crypto/md5"
+	"encoding/hex"
+	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+
+	"lampac-go/internal/httpclient"
 
 	"github.com/rs/zerolog/log"
 )
@@ -23,36 +31,50 @@ type EPGEngine struct {
 	channels   map[string]EPGChannel   // xmltvID → channel metadata
 	programs   map[string][]EPGProgram // xmltvID → sorted by Start
 	nameToIcon map[string]string       // lowercased display-name → icon URL
-	loadedAt   time.Time
-	lastStatus EPGStatus // diagnostics from the last refresh (exposed via Status())
+	// nameToID — нормализованное имя канала → xmltv-id, У КОТОРОГО ЕСТЬ программы.
+	// Нужен каналам без tvg-id: панели часто не отдают tvg-id вовсе, а склейка с
+	// латиничным донором («Russia 1» ≠ «Россия 1») их не проставляет — без этого
+	// индекса у такого канала гид пуст навсегда.
+	nameToID map[string]string
+	// translitToID — тот же индекс, но по транслитерированному ключу: связывает
+	// «Rodnoe Kino» из плейлиста с «Родное кино» из XMLTV (см. translitKey).
+	translitToID map[string]string
+	loadedAt     time.Time
+	lastStatus   EPGStatus // diagnostics from the last refresh (exposed via Status())
 
 	urls           []string
 	updateInterval time.Duration
 	store          *Store // for extracting playlist-level EPG URLs
 	httpClient     *http.Client
 	cancel         context.CancelFunc
+	// cacheDir — дисковый кэш скачанных XMLTV ({iptv}/epg_cache/<md5(url)>.xml.gz):
+	// источник упал или сервер стартовал офлайн — гид поднимается из кэша.
+	// Пусто (нет store) — кэширование выключено.
+	cacheDir string
 }
 
 // EPGSourceStatus is the per-source outcome of the last refresh (diagnostics).
 type EPGSourceStatus struct {
-	URL      string `json:"url"`      // host + path tail only (never the full query — may carry a key)
-	OK       bool   `json:"ok"`       // fetched + parsed without error
-	Status   int    `json:"status"`   // HTTP status code (0 = never connected)
-	Channels int    `json:"channels"` // <channel> entries parsed from this source
-	Programs int    `json:"programs"` // <programme> entries kept (post-filter, post-window)
+	URL      string `json:"url"`             // host + path tail only (never the full query — may carry a key)
+	OK       bool   `json:"ok"`              // fetched + parsed without error
+	Status   int    `json:"status"`          // HTTP status code (0 = never connected)
+	Channels int    `json:"channels"`        // <channel> entries parsed from this source
+	Programs int    `json:"programs"`        // <programme> entries kept (post-filter, post-window)
+	Stale    bool   `json:"stale,omitempty"` // источник недоступен — данные подняты из дискового кэша
 	Err      string `json:"err,omitempty"`
 }
 
 // EPGStatus is a browser-readable snapshot of the EPG engine's last refresh — surfaced at
 // GET /api/iptv/epg/status so an empty guide can be diagnosed without server log access.
 type EPGStatus struct {
-	Channels      int               `json:"channels"`       // total channels currently held
-	Programs      int               `json:"programs"`       // total programmes currently held
-	LoadedAt      time.Time         `json:"loaded_at"`      // when the current data was committed
-	KnownTvgIDs   int               `json:"known_tvg_ids"`  // playlist tvg-ids used as the load filter
-	MatchedTvgIDs int               `json:"matched_tvg_ids"` // how many of those actually got programmes
-	Filtered      bool              `json:"filtered"`       // tvg-id filter was applied this refresh
-	SelfHealed    bool              `json:"self_healed"`    // filter dropped everything → reloaded unfiltered
+	Channels      int               `json:"channels"`                // total channels currently held
+	Programs      int               `json:"programs"`                // total programmes currently held
+	LoadedAt      time.Time         `json:"loaded_at"`               // when the current data was committed
+	KnownTvgIDs   int               `json:"known_tvg_ids"`           // playlist tvg-ids used as the load filter
+	MatchedTvgIDs int               `json:"matched_tvg_ids"`         // how many of those actually got programmes
+	Filtered      bool              `json:"filtered"`                // tvg-id filter was applied this refresh
+	SelfHealed    bool              `json:"self_healed"`             // filter dropped everything → reloaded unfiltered
+	KeptPrevious  bool              `json:"kept_previous,omitempty"` // все источники упали — держим прошлый гид
 	Sources       []EPGSourceStatus `json:"sources"`
 }
 
@@ -67,16 +89,21 @@ func NewEPGEngine(store *Store, cfg EPGConfig) *EPGEngine {
 	if cfg.UpdateInterval <= 0 {
 		cfg.UpdateInterval = 6 * time.Hour
 	}
-	return &EPGEngine{
+	e := &EPGEngine{
 		channels:       make(map[string]EPGChannel),
 		programs:       make(map[string][]EPGProgram),
 		urls:           cfg.URLs,
 		updateInterval: cfg.UpdateInterval,
 		store:          store,
-		httpClient: &http.Client{
-			Timeout: 120 * time.Second,
-		},
+		// Тот же прокси-балансер, что у плейлистов/стримов: XMLTV-фиды бывают
+		// закрыты для дата-центров ровно так же, как и потоки.
+		httpClient: httpclient.NewForBalancerDynamic(iptvBalancer, 120*time.Second),
 	}
+	if store != nil {
+		e.cacheDir = filepath.Join(store.dir, "epg_cache")
+		_ = os.MkdirAll(e.cacheDir, 0755)
+	}
+	return e
 }
 
 // Start begins the background EPG update loop.
@@ -210,6 +237,74 @@ func (e *EPGEngine) GetChannel(xmltvID string) (EPGChannel, bool) {
 	return ch, ok
 }
 
+// ResolveIDByName maps a channel NAME to an XMLTV id that actually carries
+// programmes. Empty when nothing matches. Используется как фолбэк для каналов
+// без tvg-id.
+func (e *EPGEngine) ResolveIDByName(name string) string {
+	key := normChannelName(name)
+	if key == "" {
+		return ""
+	}
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if id := e.nameToID[key]; id != "" {
+		return id
+	}
+	// Вторая попытка — без уточнения в круглых скобках: «41 Регион (Камчатка)»,
+	// «Россия 1 (Москва)». Именно второй, а не в общей нормализации: у орбит и
+	// регионов расписание РАЗНОЕ, и точное совпадение с уточнением обязано
+	// выигрывать. Сюда доходят только те, кому иначе не досталось бы гида вовсе.
+	if bare := normChannelName(parenSuffixRe.ReplaceAllString(name, " ")); bare != "" && bare != key {
+		if id := e.nameToID[bare]; id != "" {
+			return id
+		}
+	}
+	// Третья попытка — через транслит: имя латиницей против кириллицы в XMLTV.
+	if tk := translitKey(name); tk != "" {
+		if id := e.translitToID[tk]; id != "" {
+			return id
+		}
+		if bare := translitKey(parenSuffixRe.ReplaceAllString(name, " ")); bare != "" && bare != tk {
+			return e.translitToID[bare]
+		}
+	}
+	return ""
+}
+
+// SeedForTest наполняет движок готовыми данными, минуя загрузку XMLTV.
+// Только для тестов: разбор фидов сюда не относится, а проверять порядок
+// разрешения канала нужно на предсказуемом наборе.
+func (e *EPGEngine) SeedForTest(programs map[string][]EPGProgram, nameToID map[string]string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.programs = programs
+	e.nameToID = make(map[string]string, len(nameToID))
+	e.translitToID = make(map[string]string, len(nameToID))
+	for name, id := range nameToID {
+		e.nameToID[normChannelName(name)] = id
+		if tk := translitKey(name); tk != "" {
+			if _, exists := e.translitToID[tk]; !exists {
+				e.translitToID[tk] = id
+			}
+		}
+	}
+}
+
+// HasPrograms сообщает, есть ли у этого xmltv-id хоть одна передача.
+//
+// Нужен, чтобы отличить РАБОЧИЙ tvg-id от мусорного. Плейлисты сплошь пишут в
+// tvg-id само имя канала («41 Регион (Камчатка)»): поле непустое, XMLTV его не
+// знает, и резолв, доверившись непустому значению, возвращал заведомо пустой
+// гид вместо того, чтобы поискать канал по имени.
+func (e *EPGEngine) HasPrograms(xmltvID string) bool {
+	if xmltvID == "" {
+		return false
+	}
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return len(e.programs[xmltvID]) > 0
+}
+
 // GetIconByName looks up a channel icon by display name (case-insensitive).
 func (e *EPGEngine) GetIconByName(name string) string {
 	e.mu.RLock()
@@ -262,6 +357,10 @@ func (e *EPGEngine) findCurrentIdx(progs []EPGProgram, t time.Time) int {
 //  Internal: refresh from sources
 // ---------------------------------------------------------------------------
 
+// Refresh forces a synchronous reload of all EPG sources (the background loop
+// calls the same code on its ticker). Экспортировано для админки и тестов.
+func (e *EPGEngine) Refresh() { e.refresh() }
+
 func (e *EPGEngine) refresh() {
 	// Collect all EPG URLs: static config + playlist-level x-tvg-url.
 	// `pinned` are sources we must never drop: operator [iptv] epg_urls + the CURATED GLOBAL
@@ -310,6 +409,14 @@ func (e *EPGEngine) refresh() {
 	knownChannelIDs := e.collectKnownChannelIDs()
 	stringsPool := newEPGStringPool()
 
+	// Подсказки для алиасинга чужих id-схем: нормализованное имя канала → наш
+	// tvg-id. XMLTV-источники с собственными id (числа edem, слаги iptvx) без
+	// этого не матчатся ни с одним каналом плейлистов/реестра.
+	var nameHints map[string]string
+	if e.store != nil {
+		nameHints = e.store.EPGNameHints()
+	}
+
 	// Window: keep programs from -1 day to +2 days. Forward was +3d but now/next + the
 	// forward timeline never need 3 days of schedule; -1d keeps catchup's recent slots.
 	windowStart := time.Now().UTC().Add(-24 * time.Hour)
@@ -321,14 +428,16 @@ func (e *EPGEngine) refresh() {
 		chs := make(map[string]EPGChannel)
 		progs := make(map[string][]EPGProgram)
 		srcs := make([]EPGSourceStatus, 0, len(urls))
+		aliases := make(map[string]string) // чужой xmltv-id → наш tvg-id (по имени)
 		for url := range urls {
-			srcs = append(srcs, e.loadSource(url, windowStart, windowEnd, filter, stringsPool, chs, progs))
+			srcs = append(srcs, e.loadSource(url, windowStart, windowEnd, filter, nameHints, aliases, stringsPool, chs, progs))
 		}
 		// Sort each channel's programmes by Start, then cap per channel: a backstop against a
 		// pathological source publishing thousands of micro-programmes for one channel.
 		total := 0
 		for id := range progs {
 			sort.Slice(progs[id], func(i, j int) bool { return progs[id][i].Start.Before(progs[id][j].Start) })
+			progs[id] = dedupePrograms(progs[id])
 			if len(progs[id]) > epgMaxProgramsPerChannel {
 				progs[id] = progs[id][:epgMaxProgramsPerChannel]
 			}
@@ -361,15 +470,31 @@ func (e *EPGEngine) refresh() {
 
 	// Build name→icon index from all display names.
 	newNameToIcon := make(map[string]string, len(newChannels)*3)
+	// …и name→id, но ТОЛЬКО по каналам, у которых реально есть программы: иначе
+	// фолбэк уводил бы на пустой одноимённый канал вместо работающего.
+	newNameToID := make(map[string]string, len(newChannels))
+	newTranslitToID := make(map[string]string, len(newChannels))
 	for _, ch := range newChannels {
-		if ch.Icon == "" {
-			continue
-		}
 		for _, name := range ch.AltNames {
-			key := strings.ToLower(strings.TrimSpace(name))
-			if key != "" {
-				if _, exists := newNameToIcon[key]; !exists {
-					newNameToIcon[key] = ch.Icon
+			if ch.Icon != "" {
+				key := strings.ToLower(strings.TrimSpace(name))
+				if key != "" {
+					if _, exists := newNameToIcon[key]; !exists {
+						newNameToIcon[key] = ch.Icon
+					}
+				}
+			}
+			if len(newPrograms[ch.ID]) == 0 {
+				continue
+			}
+			if k := normChannelName(name); k != "" {
+				if _, exists := newNameToID[k]; !exists {
+					newNameToID[k] = ch.ID
+				}
+			}
+			if tk := translitKey(name); tk != "" {
+				if _, exists := newTranslitToID[tk]; !exists {
+					newTranslitToID[tk] = ch.ID
 				}
 			}
 		}
@@ -386,16 +511,83 @@ func (e *EPGEngine) refresh() {
 		Sources:       sources,
 	}
 
+	// Все источники упали (сеть/апстримы легли разом, и кэша нет) — НЕ затираем
+	// живой гид пустотой: старые программы на пару часов полезнее пустого экрана.
+	anyOK := false
+	for _, s := range sources {
+		if s.OK {
+			anyOK = true
+			break
+		}
+	}
+
 	e.mu.Lock()
+	if !anyOK && totalProgs == 0 && len(e.programs) > 0 {
+		status.KeptPrevious = true
+		status.Channels = len(e.channels)
+		prev := 0
+		for _, p := range e.programs {
+			prev += len(p)
+		}
+		status.Programs = prev
+		status.LoadedAt = e.loadedAt // данные не менялись — время оставляем честное
+		e.lastStatus = status
+		e.mu.Unlock()
+		log.Warn().Int("sources", len(sources)).Msg("epg: every source failed — keeping previous guide")
+		return
+	}
 	e.channels = newChannels
 	e.programs = newPrograms
 	e.nameToIcon = newNameToIcon
+	e.nameToID = newNameToID
+	e.translitToID = newTranslitToID
 	e.loadedAt = status.LoadedAt
 	e.lastStatus = status
 	e.mu.Unlock()
 
 	log.Info().Int("channels", len(newChannels)).Int("programs", totalProgs).Int("matched_channels", matched).
 		Int("known_tvg_ids", len(knownChannelIDs)).Bool("self_healed", selfHealed).Int("logo_names", len(newNameToIcon)).Msg("epg: loaded")
+}
+
+// dedupePrograms выкидывает повторы одной и той же передачи. Один канал приходит из НЕСКОЛЬКИХ
+// XMLTV-источников (плюс алиасы по tvg-id), и раньше каждая копия просто дописывалась в список:
+// на проде у канала оказывалось по 4 одинаковых передачи из 112 записей, то есть 84 лишних.
+//
+// Чем это было видно: в двумерной сетке телегида блоки рисовались друг поверх друга и выглядели
+// вчетверо ярче задуманного (замер: белый на 55% вместо 10%), в списке архива каждая передача
+// повторялась четыре раза, а движок держал в памяти втрое-вчетверо больше нужного (2,5 млн
+// записей). Список уже отсортирован по началу, поэтому дубли идут подряд — хватает одного прохода.
+//
+// Совпадением считаем начало+конец+название: один и тот же слот с РАЗНЫМ названием в разных
+// источниках — это не дубль, а расхождение данных, и выбрасывать вторую версию нельзя.
+func dedupePrograms(progs []EPGProgram) []EPGProgram {
+	if len(progs) < 2 {
+		return progs
+	}
+	out := progs[:1]
+	for _, p := range progs[1:] {
+		last := out[len(out)-1]
+		if p.Start.Equal(last.Start) && p.Stop.Equal(last.Stop) && p.Title == last.Title {
+			// Описание бывает заполнено только в одном из источников — оставляем непустое.
+			if last.Description == "" && p.Description != "" {
+				out[len(out)-1].Description = p.Description
+			}
+			if last.Icon == "" && p.Icon != "" {
+				out[len(out)-1].Icon = p.Icon
+			}
+			continue
+		}
+		// Пересечение по времени — тоже склейка источников, только с РАЗНЫМИ названиями: у
+		// молдавских каналов один и тот же слот приходил на румынском и на русском. В эфире
+		// две передачи одновременно не идут, поэтому вторую версию отбрасываем — иначе в сетке
+		// телегида два блока рисуются друг поверх друга и текст превращается в кашу.
+		// Стык встык (Stop == Start) пересечением НЕ считается: это нормальная сетка вещания.
+		if p.Start.Before(last.Stop) {
+			continue
+		}
+		out = append(out, p)
+	}
+	return out
 }
 
 func (e *EPGEngine) collectKnownChannelIDs() map[string]struct{} {
@@ -413,42 +605,53 @@ func (e *EPGEngine) collectKnownChannelIDs() map[string]struct{} {
 		}
 	}
 	e.store.mu.RUnlock()
+	// Каналы реестра: tvg-id закреплённых руками каналов может не встречаться
+	// ни в одном донорском плейлисте — без него фильтр загрузки EPG оставил бы
+	// такой канал без программы.
+	if e.store.registry != nil {
+		for _, id := range e.store.registry.TvgIDs() {
+			ids[id] = struct{}{}
+		}
+	}
 	if len(ids) == 0 {
 		return nil
 	}
 	return ids
 }
 
-func (e *EPGEngine) loadSource(url string, windowStart, windowEnd time.Time, knownChannelIDs map[string]struct{}, stringsPool *epgStringPool,
+func (e *EPGEngine) loadSource(url string, windowStart, windowEnd time.Time, knownChannelIDs map[string]struct{},
+	nameHints map[string]string, aliases map[string]string, stringsPool *epgStringPool,
 	channels map[string]EPGChannel, programs map[string][]EPGProgram) EPGSourceStatus {
 
 	st := EPGSourceStatus{URL: truncURL(url)}
 
-	resp, err := e.httpClient.Get(url)
-	if err != nil {
-		log.Error().Err(err).Str("url", truncURL(url)).Msg("epg: fetch failed")
-		st.Err = "fetch: " + err.Error()
-		return st
-	}
-	defer resp.Body.Close()
-
-	st.Status = resp.StatusCode
-	if resp.StatusCode != 200 {
-		log.Error().Int("status", resp.StatusCode).Str("url", truncURL(url)).Msg("epg: fetch non-200")
-		st.Err = "http status"
-		return st
-	}
-
-	// Detect gzip from URL or Content-Type.
-	isGzip := strings.HasSuffix(url, ".gz") ||
-		strings.HasSuffix(url, ".gzip") ||
-		strings.Contains(resp.Header.Get("Content-Type"), "gzip")
-
 	channelCb := func(ch EPGChannel) {
-		if ch.ID != "" {
-			ch = normalizeEPGChannel(ch, stringsPool)
-			channels[ch.ID] = ch
-			st.Channels++
+		if ch.ID == "" {
+			return
+		}
+		ch = normalizeEPGChannel(ch, stringsPool)
+		channels[ch.ID] = ch
+		st.Channels++
+		// Алиасинг по имени: XMLTV-канал с чужим id, но знакомым display-name,
+		// дополнительно регистрируется под НАШИМ tvg-id — иконки и программы
+		// становятся доступны по id, которым оперирует клиент. В XMLTV каналы
+		// идут раньше программ, так что алиас успевает до programCb.
+		if len(nameHints) > 0 {
+			for _, n := range ch.AltNames {
+				want, ok := nameHints[normChannelName(n)]
+				if !ok || want == ch.ID {
+					continue
+				}
+				if _, taken := aliases[ch.ID]; !taken {
+					aliases[ch.ID] = want
+				}
+				if _, exists := channels[want]; !exists {
+					alias := ch
+					alias.ID = want
+					channels[want] = alias
+				}
+				break
+			}
 		}
 	}
 
@@ -459,7 +662,9 @@ func (e *EPGEngine) loadSource(url string, windowStart, windowEnd time.Time, kno
 		}
 		if knownChannelIDs != nil {
 			if _, ok := knownChannelIDs[channelID]; !ok {
-				return false
+				if _, aliased := aliases[channelID]; !aliased {
+					return false
+				}
 			}
 		}
 		return epgProgramInWindow(prog, windowStart, windowEnd)
@@ -472,21 +677,145 @@ func (e *EPGEngine) loadSource(url string, windowStart, windowEnd time.Time, kno
 		prog = normalizeEPGProgram(prog, stringsPool)
 		programs[prog.ChannelID] = append(programs[prog.ChannelID], prog)
 		st.Programs++
+		// Дублируем программу под нашим tvg-id: клиент спрашивает /epg/now
+		// ровно по нему. Оригинальный id тоже остаётся — по нему ходят
+		// пользовательские плейлисты с «родными» tvg-id этого источника.
+		if want, ok := aliases[prog.ChannelID]; ok && want != prog.ChannelID {
+			aliasProg := prog
+			aliasProg.ChannelID = want
+			programs[want] = append(programs[want], aliasProg)
+		}
+	}
+
+	resp, err := e.httpClient.Get(url)
+	if err != nil {
+		log.Error().Err(err).Str("url", truncURL(url)).Msg("epg: fetch failed")
+		st.Err = "fetch: " + err.Error()
+		e.loadFromCache(url, &st, channelCb, programFilter, programCb)
+		return st
+	}
+	defer resp.Body.Close()
+
+	st.Status = resp.StatusCode
+	if resp.StatusCode != 200 {
+		log.Error().Int("status", resp.StatusCode).Str("url", truncURL(url)).Msg("epg: fetch non-200")
+		st.Err = "http status"
+		e.loadFromCache(url, &st, channelCb, programFilter, programCb)
+		return st
+	}
+
+	// Detect gzip from URL or Content-Type.
+	isGzip := strings.HasSuffix(url, ".gz") ||
+		strings.HasSuffix(url, ".gzip") ||
+		strings.Contains(resp.Header.Get("Content-Type"), "gzip")
+
+	// Зеркалим скачиваемое в дисковый кэш ПРЯМО во время разбора: отдельного
+	// повторного скачивания нет, а упавший в следующий раз источник поднимется
+	// из этого файла.
+	var body io.Reader = resp.Body
+	commit := func(bool) {}
+	if e.cacheDir != "" {
+		if r, c, terr := e.teeToCache(url, resp.Body, isGzip); terr == nil {
+			body, commit = r, c
+		}
 	}
 
 	if isGzip {
-		err = ParseXMLTVGzipFiltered(resp.Body, channelCb, programFilter, programCb)
+		err = ParseXMLTVGzipFiltered(body, channelCb, programFilter, programCb)
 	} else {
-		err = ParseXMLTVFiltered(resp.Body, channelCb, programFilter, programCb)
+		err = ParseXMLTVFiltered(body, channelCb, programFilter, programCb)
 	}
 
 	if err != nil {
+		commit(false)
 		log.Error().Err(err).Str("url", truncURL(url)).Msg("epg: parse error")
 		st.Err = "parse: " + err.Error()
+		// Кэш пробуем только если из живого ответа НИЧЕГО не легло в maps —
+		// поверх частичного разбора он надублировал бы программы.
+		if st.Channels == 0 && st.Programs == 0 {
+			e.loadFromCache(url, &st, channelCb, programFilter, programCb)
+		}
 		return st
 	}
+	commit(true)
 	st.OK = true
 	return st
+}
+
+// ---------------------------------------------------------------------------
+//  Дисковый кэш XMLTV — источник упал, гид остался
+// ---------------------------------------------------------------------------
+
+// epgCacheMaxAge — старше этого кэш не поднимаем: окно программ -1д..+2д, в
+// четырёхдневном файле ещё есть чем наполнить «сейчас», дальше — пусто.
+const epgCacheMaxAge = 4 * 24 * time.Hour
+
+func (e *EPGEngine) cachePathFor(url string) string {
+	h := md5.Sum([]byte(url))
+	return filepath.Join(e.cacheDir, hex.EncodeToString(h[:8])+".xml.gz")
+}
+
+// teeToCache mirrors everything read from src into a temp file (gzipping plain
+// XML so the cache is always .xml.gz) and returns the wrapped reader plus a
+// commit: commit(true) publishes the file atomically, commit(false) discards.
+func (e *EPGEngine) teeToCache(url string, src io.Reader, srcIsGzip bool) (io.Reader, func(ok bool), error) {
+	tmp, err := os.CreateTemp(e.cacheDir, "dl-*")
+	if err != nil {
+		return nil, nil, err
+	}
+	var w io.Writer = tmp
+	var gz *gzip.Writer
+	if !srcIsGzip {
+		gz = gzip.NewWriter(tmp)
+		w = gz
+	}
+	target := e.cachePathFor(url)
+	done := false
+	commit := func(ok bool) {
+		if done {
+			return
+		}
+		done = true
+		if gz != nil {
+			_ = gz.Close()
+		}
+		_ = tmp.Close()
+		if !ok {
+			_ = os.Remove(tmp.Name())
+			return
+		}
+		if err := os.Rename(tmp.Name(), target); err != nil {
+			_ = os.Remove(tmp.Name())
+		}
+	}
+	return io.TeeReader(src, w), commit, nil
+}
+
+// loadFromCache parses the last cached download of this source (if fresh
+// enough) through the SAME callbacks the live path uses. Success → st.OK with
+// st.Stale so /epg/status shows the guide is running on cached data.
+func (e *EPGEngine) loadFromCache(url string, st *EPGSourceStatus, channelCb func(EPGChannel), programFilter func(EPGProgram) bool, programCb func(EPGProgram)) {
+	if e.cacheDir == "" {
+		return
+	}
+	path := e.cachePathFor(url)
+	fi, err := os.Stat(path)
+	if err != nil || time.Since(fi.ModTime()) > epgCacheMaxAge {
+		return
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	if perr := ParseXMLTVGzipFiltered(f, channelCb, programFilter, programCb); perr != nil {
+		log.Warn().Err(perr).Str("url", truncURL(url)).Msg("epg: disk cache unreadable")
+		return
+	}
+	st.OK = true
+	st.Stale = true
+	log.Warn().Str("url", truncURL(url)).Int("programs", st.Programs).
+		Msg("epg: source down — guide served from disk cache")
 }
 
 func epgProgramInWindow(prog EPGProgram, windowStart, windowEnd time.Time) bool {

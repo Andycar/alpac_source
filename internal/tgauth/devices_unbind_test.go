@@ -1,6 +1,9 @@
 package tgauth
 
 import (
+	"encoding/json"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 )
@@ -111,5 +114,61 @@ func TestUnbindAllButtonOnlyWithSeveralDevices(t *testing.T) {
 	}
 	if text == "" {
 		t.Error("empty device list text")
+	}
+}
+
+// Telegram rejected the whole keyboard («reply markup is too long») once an
+// account had ~40 devices — the button in the bot went silent. Pages keep the
+// markup bounded and the navigation stays consistent at both ends.
+func TestDevicesViewPaginates(t *testing.T) {
+	s, token := deviceStore(t)
+	for i := 0; i < 44; i++ {
+		addDev(t, s, token, fmt.Sprintf("dev-%02d", i), fmt.Sprintf("TV %d", i))
+	}
+	tok, _ := s.Lookup(token)
+	tr := T(LangRU)
+
+	text, kb := devicesViewPage(tok, tr, 0)
+	deviceRows := 0
+	var nav []tgInlineKeyboardButton
+	for _, row := range kb.InlineKeyboard {
+		if len(row) == 2 && strings.HasPrefix(row[0].CallbackData, "rename:") {
+			deviceRows++
+		}
+		if len(row) > 0 && strings.HasPrefix(row[0].CallbackData, "devpage:") {
+			nav = row
+		}
+	}
+	if deviceRows != devicesPageSize {
+		t.Fatalf("page 0 device rows = %d, want %d", deviceRows, devicesPageSize)
+	}
+	if len(nav) != 2 || nav[1].CallbackData != "devpage:"+token+":1" {
+		t.Fatalf("page 0 nav = %+v, want [indicator, next→1]", nav)
+	}
+	if !strings.Contains(text, "1–8 / 44") {
+		t.Fatalf("page 0 header missing range: %q", text[:min(120, len(text))])
+	}
+
+	// Last page: partial, has ◀️ but no ▶️; an out-of-range page clamps to it.
+	_, kb = devicesViewPage(tok, tr, 99)
+	deviceRows = 0
+	nav = nil
+	for _, row := range kb.InlineKeyboard {
+		if len(row) == 2 && strings.HasPrefix(row[0].CallbackData, "rename:") {
+			deviceRows++
+		}
+		if len(row) > 0 && strings.HasPrefix(row[0].CallbackData, "devpage:") {
+			nav = row
+		}
+	}
+	if deviceRows != 4 {
+		t.Fatalf("last page device rows = %d, want 4", deviceRows)
+	}
+	if len(nav) != 2 || nav[0].CallbackData != "devpage:"+token+":4" || !strings.Contains(nav[1].Text, "6 / 6") {
+		t.Fatalf("last page nav = %+v, want [prev→4, 6 / 6]", nav)
+	}
+	// Whole markup stays far below Telegram's ~10 KB ceiling.
+	if b, _ := json.Marshal(kb); len(b) > 4000 {
+		t.Fatalf("page markup %d bytes — too close to the Telegram limit", len(b))
 	}
 }

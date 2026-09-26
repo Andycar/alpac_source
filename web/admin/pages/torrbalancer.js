@@ -203,11 +203,14 @@ function backendCard(b) {
         <div class="cn-m"><div class="cn-m-l">Uptime</div><div class="cn-m-v">${formatPct(b.uptime_pct)}</div></div>
         <div class="cn-m"><div class="cn-m-l">Торренты</div><div class="cn-m-v">${b.torrent_count || 0}</div></div>
         <div class="cn-m"><div class="cn-m-l">Активн.</div><div class="cn-m-v">${b.active_conns || 0}</div></div>
+        <div class="cn-m" title="Скорость отдачи, замеренная на реальных потоках. Пока замера нет, сервер идёт по разведочной ступени.">
+          <div class="cn-m-l">Канал</div><div class="cn-m-v">${formatRate(b.rate_bytes_per_sec)}</div>
+        </div>
       </div>
       ${b.last_error ? html`<div class="cn-err">⚠ ${b.last_error}</div>` : ''}
       ${b.notes ? html`<div class="cn-notes">${b.notes}</div>` : ''}
       <div class="cn-foot">
-        <span class="cn-weight">вес: <b>${b.weight ?? 1}</b> · served ${shortNum(b.total_served || 0)}</span>
+        <span class="cn-weight" title=${weightHint(b)}>вес: <b>${b.weight ?? 1}</b>${tierSuffix(b)} · served ${shortNum(b.total_served || 0)}</span>
         <div class="cn-acts">
           <l-button size="sm" variant="ghost" @click=${async () => { try { await act('probe', { id: b.id }, 'Проверено'); await load(); paint(); } catch (e) {} }}>Probe</l-button>
           ${b.has_ssh ? html`<l-button size="sm" variant="ghost" title="Перезапустить машину по SSH" @click=${async () => {
@@ -377,6 +380,38 @@ async function saveBackend() {
 }
 
 // ----- helpers -----
+
+/**
+ * Скорость отдачи, замеренная на живых потоках (rate_bytes_per_sec). «—» значит, что сервер ещё
+ * ни разу не отдавал поток: это НЕ ноль и не приговор, просто мерить пока нечего.
+ */
+function formatRate(bps) {
+  if (!bps || bps <= 0) return html`<span style="opacity:.55">—</span>`;
+  const mb = bps / 1048576;
+  return html`${mb >= 10 ? Math.round(mb) : mb.toFixed(1)}<small>МБ/с</small>`;
+}
+
+/**
+ * Долю раздач решает НЕ настроенный вес сам по себе, а вес × ступень скорости. Ступень берётся из
+ * замеров: нет замера — разведочная 4, <500 КБ/с — 1, <2 МБ/с — 2, <8 МБ/с — 4, выше — 8.
+ * Без этой подписи оператор менял вес и не понимал, почему сильный сервер простаивает.
+ */
+function tierSuffix(b) {
+  const tier = b.speed_tier || 0;
+  if (!tier) return '';
+  const eff = (b.weight ?? 1) * tier;
+  const explore = !b.rate_bytes_per_sec || b.rate_bytes_per_sec <= 0;
+  return html` <span style="opacity:.7">×${tier}${explore ? ' (разведка)' : ''} = <b>${eff}</b></span>`;
+}
+
+function weightHint(b) {
+  const tier = b.speed_tier || 0;
+  const eff = (b.weight ?? 1) * tier;
+  return `Доля раздач считается как вес × ступень скорости = ${b.weight ?? 1} × ${tier} = ${eff}.` +
+    (!b.rate_bytes_per_sec || b.rate_bytes_per_sec <= 0
+      ? ' Замеров ещё нет — сервер идёт по разведочной ступени, первый же поток поставит его на место.'
+      : ` Ступень получена из замеренных ${(b.rate_bytes_per_sec / 1048576).toFixed(1)} МБ/с.`);
+}
 
 function formatPct(p) {
   if (!Number.isFinite(p)) return '—';

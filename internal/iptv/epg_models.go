@@ -10,7 +10,7 @@ import "time"
 type EPGProgram struct {
 	Start       time.Time `json:"start"`
 	Stop        time.Time `json:"stop"`
-	ChannelID   string    `json:"channel_id"`   // XMLTV channel attribute
+	ChannelID   string    `json:"channel_id"` // XMLTV channel attribute
 	Title       string    `json:"title"`
 	Description string    `json:"desc,omitempty"`
 	Category    string    `json:"category,omitempty"`

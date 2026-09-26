@@ -66,6 +66,11 @@ type Result struct {
 	SegmentBytes int    `json:"segment_bytes,omitempty"`
 	SegmentURL   string `json:"segment_url,omitempty"`
 
+	// Window — подпись живого окна (media-sequence + последний сегмент) на
+	// момент пробы. Пустая, если плейлист не медийный. Сравнение подписей
+	// РАЗНЫХ проб одного канала — дешёвый детект заморозки: см. WindowSig.
+	Window string `json:"window,omitempty"`
+
 	// Stale is set by ProbeLive when a live window stopped advancing — the
 	// channel that answers 200 forever while showing a frozen frame.
 	Stale bool `json:"stale,omitempty"`
@@ -153,6 +158,11 @@ func Probe(ctx context.Context, manifestURL string, fetch Fetch) Result {
 	res.Live = media.Live
 	res.Segments = media.Count
 	res.Stage = StageSegment
+	// Подпись текущего окна — из УЖЕ скачанного манифеста, даром. Одна проба не
+	// скажет, движется ли эфир; но вызывающий может сравнить подпись с прошлым
+	// циклом и поймать замороженный канал без второго запроса и паузы, как в
+	// ProbeLive.
+	res.Window = WindowSig(text)
 
 	// An empty media playlist is a real failure mode, not an edge case: it is
 	// what a source returns when its session died but its web server did not.
@@ -239,6 +249,21 @@ func Stale(first, second string) bool {
 		return false
 	}
 	return u1 == u2
+}
+
+// WindowSig collapses a media playlist to a compact signature of its window:
+// media-sequence + last segment. Two probes of the same channel taken far
+// enough apart must differ — a live window that has not moved is a frozen
+// channel. Callers keep the signature (a few bytes), not the manifest.
+//
+// Пустая строка = судить не о чем (не медиа-плейлист / нет ни sequence, ни
+// сегментов); вызывающий обязан трактовать это как «неизвестно», а не «мёртв».
+func WindowSig(text string) string {
+	seq, last := windowOf(text)
+	if seq < 0 && last == "" {
+		return ""
+	}
+	return strconv.Itoa(seq) + "|" + last
 }
 
 func windowOf(text string) (seq int, last string) {

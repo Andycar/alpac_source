@@ -266,8 +266,19 @@ func (k *KinobaseChecker) checkSearchQuality(ctx context.Context, title, origina
 	if title == "" {
 		return false, ""
 	}
-	items, _, ok := k.Search(ctx, title, originalTitle, atoiOrZero(year))
+	items, exact, ok := k.Search(ctx, title, originalTitle, atoiOrZero(year))
 	if !ok || len(items) == 0 {
+		return false, ""
+	}
+	// Availability must mean «this card plays», not «the search returned rows».
+	//
+	// Reporting true on any hit lit the badge white in Lampa while opening the
+	// source said «поиск не дал результатов»: kinobase's search page is flaky
+	// (614 of 701 probes found no items at all), so a lucky probe cached a
+	// positive for 10 minutes — positives live ten times longer than negatives
+	// — and the click that followed hit an empty search. Requiring `exact`
+	// matches what index() can actually resolve into a playable card.
+	if exact == "" {
 		return false, ""
 	}
 
@@ -295,8 +306,9 @@ func (k *KinobaseChecker) checkSearchQuality(ctx context.Context, title, origina
 			best = item.Quality
 		}
 	}
-	// No exact card matched (fuzzy/similar results still count as available) —
-	// report availability without inventing a quality for someone else's card.
+	// Available: an exact card exists (checked above). `best` stays empty when
+	// the matching row carried no quality badge — report availability without
+	// inventing a quality for someone else's card.
 	return true, best
 }
 

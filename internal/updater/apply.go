@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"time"
 
 	"github.com/rs/zerolog/log"
@@ -28,6 +29,93 @@ var diskFree = freeDiskBytes
 // ErrNoRollback is returned by Rollback when no previous binary is kept.
 var ErrNoRollback = errors.New("updater: nothing to rollback to")
 
+// execPath — путь, по которому бинарник ДОЛЖЕН лежать, независимо от того, из
+// какого файла его сейчас запустили.
+//
+// Activate переименовывает работающий файл в "<exe>.old" и кладёт на его место
+// новый. Но на Linux os.Executable() читает /proc/self/exe, а он ходит за
+// инодой: сразу после этого переименования он отдаёт уже "<exe>.old". Restart
+// брал ИМЕННО его и перезапускал процесс из бэкапа — то есть из той самой
+// сборки, которую только что заменили. Новый бинарник по "<exe>" не запускался
+// никогда, а следующее обновление повторяло фокус на уровень глубже.
+//
+// Что это давало на проде (найдено 2026-09-11): в логе каждый раз бодрое
+// "cluster update: installed, restarting", сервис active, а работающая сборка
+// на обеих нодах не менялась с 9 сентября. Рядом накопилось по 24–25 файлов
+// вида lampac-go.old.old.old… — около 2.5 ГБ мусора на ноду.
+//
+// Разматываем цепочку ".old" до первого пути, который реально существует:
+// это чинит уже испорченные машины (после установки фикса они сами вернутся на
+// канонический путь) и не ломает бинарник, который НАРОЧНО назван "foo.old".
+func execPath() (string, error) {
+	exe, err := os.Executable()
+	if err != nil {
+		return "", fmt.Errorf("executable: %w", err)
+	}
+	// Резолвим симлинки, чтобы менять настоящий файл, а не ярлык-лаунчер.
+	if rp, rerr := filepath.EvalSymlinks(exe); rerr == nil {
+		exe = rp
+	}
+	return stripBackupSuffix(exe, func(p string) bool {
+		_, serr := os.Stat(p)
+		return serr == nil
+	}), nil
+}
+
+// stripBackupSuffix снимает хвост из ".old". Кандидаты перебираются от САМОГО
+// КОРОТКОГО и возвращается первый существующий — шагать по одному ".old" нельзя:
+// в цепочке бывают дыры (промежуточный бэкап подчистили руками или он не влез
+// на диск), и пошаговая размотка застревала на первой же дырке, так и не дойдя
+// до канонического пути. Если не существует ни один — отдаём путь как есть,
+// чтобы не переименовать бинарник, который НАРОЧНО называется "foo.old".
+//
+// Вынесено отдельно от execPath, чтобы проверялось тестом без подмены
+// /proc/self/exe.
+func stripBackupSuffix(path string, exists func(string) bool) string {
+	base := path
+	for strings.HasSuffix(base, ".old") {
+		base = strings.TrimSuffix(base, ".old")
+	}
+	for cand := base; len(cand) <= len(path); cand += ".old" {
+		if cand != path && exists(cand) {
+			return cand
+		}
+	}
+	return path
+}
+
+// runningPath — файл, из которого реально исполняется процесс (с разрешёнными
+// симлинками). Отличается от execPath на машине, испорченной старой
+// цепочкой ".old": там процесс живёт в бэкапе, и удалять его нельзя.
+func runningPath() string {
+	running, _ := os.Executable()
+	if rp, rerr := filepath.EvalSymlinks(running); rerr == nil {
+		running = rp
+	}
+	return running
+}
+
+// pruneBackupChain убирает залежи "<exe>.old.old…", оставшиеся от той самой
+// поломки. Трогаем только цепочку глубже одного шага: "<exe>.old" — это
+// актуальный откат, а running — файл, из которого сейчас исполняется процесс
+// (после починки это уже не встретится, но на испорченной машине встретится
+// ровно один раз, и убивать его на всякий случай не будем).
+func pruneBackupChain(exe, running string) {
+	for depth, path := 2, exe+".old.old"; depth < 64; depth, path = depth+1, path+".old" {
+		if path == running {
+			continue
+		}
+		fi, err := os.Stat(path)
+		if err != nil {
+			continue
+		}
+		if os.Remove(path) == nil {
+			log.Warn().Str("path", path).Int64("freed_bytes", fi.Size()).
+				Msg("updater: removed leftover backup from the old rename-chain bug")
+		}
+	}
+}
+
 // DownloadResult describes a freshly staged binary ready to be activated.
 type DownloadResult struct {
 	StagedPath string // path to "<exe>.new" with the downloaded bytes
@@ -43,14 +131,19 @@ type DownloadResult struct {
 // token authorizes downloads from password-protected channels. The caller
 // is expected to call Activate next.
 func DownloadAsset(url, wantSHA string, wantSize int64, token string) (*DownloadResult, error) {
-	exe, err := os.Executable()
+	exe, err := execPath()
 	if err != nil {
-		return nil, fmt.Errorf("executable: %w", err)
+		return nil, err
 	}
-	// Resolve symlinks so we replace the real file, not a launcher symlink.
-	if rp, err := filepath.EvalSymlinks(exe); err == nil {
-		exe = rp
-	}
+
+	// Уборка залежей ".old.old…" ДО скачивания, а не только в Activate.
+	// На испорченной машине это разрывает замкнутый круг: обновление падало
+	// раньше активации («create staged: … File name too long» на цепочке в 61
+	// звено — упор в NAME_MAX), уборщик жил только в Activate, и мусор
+	// оставался навсегда. Заодно освобождает место до проверки диска: на ноде
+	// такая цепочка занимала 6 ГБ, а ensureDiskSpace умеет пожертвовать лишь
+	// одним "<exe>.old".
+	pruneBackupChain(exe, runningPath())
 
 	staged := exe + ".new"
 	_ = os.Remove(staged) // leftover from a previous failed attempt
@@ -158,13 +251,11 @@ func humanBytes(n uint64) string {
 // Activate atomically replaces the running binary with the staged one and
 // keeps the old binary as "<exe>.old" for rollback. Call this BEFORE Restart.
 func Activate(staged string) (backup string, err error) {
-	exe, err := os.Executable()
+	exe, err := execPath()
 	if err != nil {
-		return "", fmt.Errorf("executable: %w", err)
+		return "", err
 	}
-	if rp, err := filepath.EvalSymlinks(exe); err == nil {
-		exe = rp
-	}
+	pruneBackupChain(exe, runningPath())
 
 	backup = exe + ".old"
 	_ = os.Remove(backup)
@@ -188,12 +279,9 @@ func Activate(staged string) (backup string, err error) {
 // build failed to start on the next boot; the supervisor can flip an
 // environment variable and invoke this helper.
 func Rollback() error {
-	exe, err := os.Executable()
+	exe, err := execPath()
 	if err != nil {
 		return err
-	}
-	if rp, err := filepath.EvalSymlinks(exe); err == nil {
-		exe = rp
 	}
 	backup := exe + ".old"
 	if _, err := os.Stat(backup); err != nil {
@@ -219,12 +307,12 @@ func Rollback() error {
 // This function does NOT return on success — the process either replaces
 // itself or exits.
 func Restart() error {
-	exe, err := os.Executable()
+	// Именно execPath, а не os.Executable: после Activate последний показывает
+	// бэкап, и процесс перезапускался из ЗАМЕНЁННОЙ сборки. Подробности — в
+	// комментарии к execPath.
+	exe, err := execPath()
 	if err != nil {
 		return err
-	}
-	if rp, err := filepath.EvalSymlinks(exe); err == nil {
-		exe = rp
 	}
 	args := append([]string{exe}, os.Args[1:]...)
 	return platformRestart(exe, args)
